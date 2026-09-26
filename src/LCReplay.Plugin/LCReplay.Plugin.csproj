@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>LCReplay</AssemblyName>
+    <RootNamespace>LCReplay.Plugin</RootNamespace>
+    <Description>Local gameplay recorder and isolated free-camera replay for Lethal Company.</Description>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <Import Project="../../local.props" Condition="Exists('../../local.props')" />
+  <PropertyGroup>
+    <GameManagedPath Condition="'$(GameManagedPath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Lethal Company\Lethal Company_Data\Managed</GameManagedPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../LCReplay.Core/LCReplay.Core.csproj" />
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" PrivateAssets="all" />
+    <PackageReference Include="UnityEngine.Modules" Version="2022.3.9" PrivateAssets="all" />
+    <Reference Include="UnityEngine.UI"><HintPath>$(GameManagedPath)/UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Unity.TextMeshPro"><HintPath>$(GameManagedPath)/Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <ReplayTestFramework Condition="'$(ReplayTestFramework)' == ''">net8.0</ReplayTestFramework>
+    <TargetFramework>$(ReplayTestFramework)</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/LCReplay.Core/LCReplay.Core.csproj" />
+  </ItemGroup>
+</Project>

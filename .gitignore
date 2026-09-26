@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+artifacts/
+*.lcr
+!tools/LCReplay.Cli/examples/synthetic-demo.lcr
+*.partial
+*.user
+local.props
+tools/.cache/
