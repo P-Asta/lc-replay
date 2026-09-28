@@ -1,3 +1,105 @@
+# 0.23.0
+
+- Reconstruct Unity particle effects with their installed source renderer, material, atlas, mesh and vertex streams instead of combining different effects into a generic white billboard. New frame data retains emitter identity, velocity, lifetime and 3D size/rotation; turret tracers replay their firing loop so short-lived bullets are not missed between samples.
+- Keep native line/beam materials and capture animated renderers even when the live player's room culler hides them. Refresh effect resources across replay-world changes and wait for installed moon assets before resolving native materials.
+- Reuse installed material normal/mask maps and shader state, prioritize surface properties during capture, preserve linear data textures and reconstruct mesh tangents to reduce incorrect gloss and missing surface detail.
+- Record the mine entrance's special room bounds separately from its start tile, matching the game's indoor culling classification without filling the space between them.
+- Stream and parallelize bounded file decoding, reuse validated world payloads between windows, skip redundant texture decoding and remove the fixed 24-object-per-frame build ceiling. Retain all installed-scene surface references so later world updates can reveal additional recorded scenery.
+- Source-specific particles and special entrance bounds require a new recording. Older recordings remain readable; GPU VisualEffect insect swarms still use the existing approximation.
+
+# 0.22.2
+
+- Show replay runs, quota groups and day recordings in the order they were saved, with the earliest recording at the top of the archive.
+- Use start time and stable tie-breakers without changing multipart playback order.
+
+# 0.22.1
+
+- Replace the transparent crimson replay backgrounds with fully opaque red archive, playback, settings and dialog surfaces inspired by LethalConfig's in-game menu.
+- Use flat red buttons with orange pixel-font labels, and let the main-menu Replay entry retain the game's own Settings-button styling and hover animation.
+
+# 0.22.0
+
+- Restyle the main-menu Replay entry, F9 archive, playback dock and timeline, Settings/Details windows, loading and delete dialogs, recording indicator and diagnostic labels around Imperium's default crimson/orange window theme.
+- Give archive columns independent translucent frames with title bars, tighten recording rows and controls, and keep the selected recording and destructive action visually distinct.
+- Keep the UI self-contained with native Unity controls; use an already loaded Imperium font when available, otherwise fall back to the game's pixel-style font.
+
+# 0.21.0
+
+- Reduce 4× playback frame churn by reusing timeline interpolation lookups, avoiding redundant entity and renderer activation and transform writes, and skipping linear audio seeks while high-speed audio is muted.
+- Coalesce timeline dragging, debounce jumps across world or file-window boundaries, keep the previous bounded playback window in memory, and restore sparse visual state directly on backward seeks.
+- Spread replay-world teardown across frames and reject distant geometry before the follow camera tests recorded triangles for obstructions.
+
+# 0.20.0
+
+- Re-spatialize world sound effects at the replay spectator camera while retaining true music/UI sources as global audio. New recordings store that distinction explicitly.
+- Record sparse visibility changes for captured static scenery and installed moon-scene renderers, and keep destroyed moving renderers inactive. Carry visual changes across bounded playback windows and backward seeks.
+- Record spray-paint decals as sparse projector events, including pool reuse, color, pose, and ship-relative placement. Playback uses the installed game's decal material where available, with a simple projected fallback.
+- Preserve emission properties on HDRP tile materials, include more room and area lights, and add bounded glow lighting for emissive rooms without an active captured fixture.
+- Restyle the native archive and playback controls with a compact charcoal-and-amber game palette, lighter framing, clearer metadata and less visual clutter.
+
+# 0.19.0
+
+- Put an X beside each recording, quota and run in the F9 archive. Folder X deletes its recordings after one confirmation; Play stays at the far right of the bottom bar, while Refresh, Folder and Close sit above the list.
+- Track the HangarShipDoor animator's renderers as moving exterior geometry, including their poses relative to the moving ship anchor. Fresh recordings can now replay the door's full motion instead of freezing at its initial mesh pose.
+- Prefer a transparent HDRP material already loaded by the game for replay particle alpha blending, and recover luminance masks from opaque black-backed particle sprites. Circuit Bees and locust approximations use small shaded meshes rather than alpha-ignoring white billboards.
+
+# 0.18.0
+
+- Add Delete to the F9 replay library, with a recording-specific confirmation showing date, file count and size. Delete only the selected replay's data and sidecars, refuse active files and paths outside the archive, and refresh the list afterward.
+- Clarify the archive's selection and actions with numbered columns, a wider details pane, visible file sizes, a prominent Play action and a distinct Delete action. Esc and F9 dismiss the confirmation before closing the archive.
+
+# 0.17.0
+
+- Draw looping and short-lived particles with transparent HDRP-compatible materials. Prefer captured alpha maps and fall back to a soft transparent texture, avoiding opaque white billboards for rain, lightning and other effects.
+- Show native progress bars while indexing, reading the first replay section and constructing the replay scene. Spread texture/material and geometry construction across frames instead of blocking the first viewer frame.
+- Load a smaller first playback window, cache a sidecar index for complete older recordings, and keep the reconstructed scene across windows that refer to the same world capture.
+
+# 0.16.0
+
+- Keep recorded interior tiles, their lights and local effects visible when Disable culling is enabled, even when the spectator moves outside.
+- Add a persistent Player sounds replay switch that mutes tagged player and held-item audio; recordings without source ownership tags show an older-recording notice.
+- Sample readable `DecompressOnLoad` clips from Unity-virtualized distant AudioSources and one-shot effects in bounded batches, retaining their recorded positions for spectator-relative playback. Streaming, compressed and non-AudioSource effects remain outside this path.
+
+# 0.15.0
+
+- Defer the first archive until quota data is initialized and derive the deadline file from remaining time, avoiding a premature `0/2.lcr` when the first day is `130/3.lcr`.
+- Classify generated props and entity meshes against room bounds when they are not parented to a dungeon tile; include every generated tile in spectator room detection and extend interior light visibility.
+- Capture geometry added after the initial map scan for items, bodies, hazards, dropships and mineshaft elevators, as well as enemies. Track dropship and elevator controllers explicitly.
+- Record bounded LineRenderer paths for lasers, beams and ropes; preserve bones on skinned hazard/mechanism meshes, sample turret muzzle particles while firing and render bee swarms with transparent particles and approximate lightning.
+- Include non-voice player sound sources by default and spatialize their effects at the recorded player position.
+
+# 0.14.0
+
+- Capture per-source sound position and distance settings; replay sound effects from the spectator camera while keeping 2D music global. Older mono recordings continue to play.
+- Render short particle bursts with a transparent soft texture instead of opaque white quads.
+- Preserve animated enemy skin root bones and raise the skeletal capture limit to 512 so larger creatures can animate in replay.
+- Add small incremental geometry captures for enemies that spawn after the moon snapshot, avoiding a full map rescan for each new creature.
+- Record generated mansion shelves, bookcases, doors and other independently moving scene renderers, including initial hidden state and later motion.
+
+# 0.13.1
+
+- Move replay audio compression and base64 conversion off Unity's audio callback to a bounded worker. Audio callbacks now copy a small PCM block and return without compressing or writing replay events.
+- Flush short sound effects when their source stops or is destroyed, and discard destroyed tap entries so long sessions can keep capturing new sources.
+
+# 0.13.0
+
+- Keep each daily recording open through temporary quota/deadline display changes, including entering generated rooms; finalize it after the actual return to orbit.
+- Capture dynamic light color temperature and use a brighter ship-cabin spectator light while reducing replay fog indoors. Add a persistent playback option to disable interior tile culling.
+- Preserve high-detail generated tile meshes when the live camera has disabled their LOD; render bounded Unity particle bursts and visible fallback shapes for unmeshed hazards.
+- Record observed game effects, known player effects and music as bounded mono ADPCM blocks. Voice chat and unknown player-attached sources are opt-in through `CaptureVoiceChat`.
+- Allow the replay archive and free-camera viewer while connected to a game, locking and restoring local movement/look input and isolating replay scenes from the active recorder.
+
+# 0.12.1
+
+- Prevent automatic saving from stopping when a moon scene contains renderer or terrain paths longer than the 256-character record limit, duplicate paths, or more than 4,096 references. Such surfaces fall back to embedded geometry; the writer also reports the specific invalid-path condition if one reaches validation.
+
+# 0.12.0
+
+- Store stable references to built-in moon-scene renderers and Unity Terrain instead of repeatedly serializing their meshes and textures. Playback loads the matching installed game scene as inert visual scenery, preserving original ground, rocks and materials. Generated rooms and moving objects remain recorded as bounded snapshots.
+- Record the level ID, map seed, dungeon seed and dungeon-flow ID alongside the scene references. These values identify generation settings; playback does not rerun the procedural dungeon generator.
+- Prioritize generated ground and rock geometry when a scene cannot supply it. After landing, update sky/fog without saving another full copy of the unchanged map.
+- Require the same game version when replaying recordings that depend on installed moon-scene assets; report a missing/mismatched scene clearly.
+
 # 0.11.0
 
 - Save each quota/deadline day in one `quota/day.lcr` file instead of rotating numbered `.lcr` parts. A repeated deadline uses a collision-safe suffix. Preserve older multipart archives and allow F8 to add a checkpoint without splitting the file.

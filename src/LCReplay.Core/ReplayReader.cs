@@ -33,7 +33,8 @@ namespace LCReplay.Core
         }
 
         /// <summary>Reads complete records. A physically truncated final record is discarded with a warning.</summary>
-        public static ReplaySession Read(string path, ReplayReadLimits? limits = null, CancellationToken cancellationToken = default)
+        public static ReplaySession Read(string path, ReplayReadLimits? limits = null, CancellationToken cancellationToken = default,
+            Action<double>? progress = null)
         {
             limits = limits ?? new ReplayReadLimits();
             ReplayValidation.Limits(limits);
@@ -83,9 +84,10 @@ namespace LCReplay.Core
                         break;
                     }
                     ReplayRecord record;
+                    if ((count & 63) == 0) progress?.Invoke(Math.Min(1, (double)input.Position / fileLength));
                     try
                     {
-                        record = ReplayFormat.Decode(payload, expandedLength);
+                        record = ReplayFormat.Decode(payload, expandedLength, cancellationToken);
                         ReplayValidation.Record(record, limits);
                     }
                     catch (InvalidDataException e)
@@ -131,6 +133,7 @@ namespace LCReplay.Core
             if (!session.IsComplete) session.Warnings.Add("Recording has no end marker; recovered data may omit its final moments.");
             session.Events = session.Events.OrderBy(item => item.Time).ToList();
             session.Worlds = session.Worlds.OrderBy(item => item.Time).ToList();
+            progress?.Invoke(1);
             return session;
         }
 

@@ -32,7 +32,44 @@ namespace LCReplay.Core
         public double Time { get; set; }
         public List<EntitySnapshot> Entities { get; set; } = new List<EntitySnapshot>();
         public List<AnchorPose> Anchors { get; set; } = new List<AnchorPose>();
+        public List<RenderPose> SceneRenderers { get; set; } = new List<RenderPose>();
+        public List<ParticlePose> Particles { get; set; } = new List<ParticlePose>();
+        public List<ParticleStyleSnapshot> ParticleStyles { get; set; } = new List<ParticleStyleSnapshot>();
+        public List<LinePose> Lines { get; set; } = new List<LinePose>();
         public Dictionary<string, string> State { get; set; } = new Dictionary<string, string>();
+    }
+
+    /// <summary>One observed particle from a short-lived Unity ParticleSystem.</summary>
+    public sealed class ParticlePose
+    {
+        public string EmitterId { get; set; } = "";
+        public Vec3 Position { get; set; }
+        public Vec3 Velocity { get; set; }
+        public Vec3 Size3D { get; set; }
+        public Vec3 Rotation3D { get; set; }
+        public float Lifetime { get; set; } = 1f;
+        public float RemainingLifetime { get; set; } = 1f;
+        public uint RandomSeed { get; set; }
+        public float Size { get; set; }
+        public float Rotation { get; set; }
+        public float[] Color { get; set; } = new[] { 1f, 1f, 1f, 1f };
+        public bool IsInterior { get; set; }
+    }
+
+    /// <summary>A bounded world-space LineRenderer sample (lasers, ropes and beams).</summary>
+    public sealed class LinePose
+    {
+        public string Id { get; set; } = "";
+        public string MaterialName { get; set; } = "";
+        public string ShaderName { get; set; } = "";
+        public int TextureMode { get; set; }
+        public int Alignment { get; set; }
+        public float[] Positions { get; set; } = System.Array.Empty<float>();
+        public float[] StartColor { get; set; } = new[] { 1f, 1f, 1f, 1f };
+        public float[] EndColor { get; set; } = new[] { 1f, 1f, 1f, 1f };
+        public float StartWidth { get; set; }
+        public float EndWidth { get; set; }
+        public bool IsInterior { get; set; }
     }
 
     /// <summary>World-space pose of a moving environment root, such as the ship elevator.</summary>
@@ -109,6 +146,17 @@ namespace LCReplay.Core
         public string Scene { get; set; } = "";
         public string CaptureSetId { get; set; } = "";
         public string Layer { get; set; } = "";
+        // Built-in scene renderers can be loaded from the installed matching game.
+        // Procedural and moving objects remain embedded below.
+        public string AssetScene { get; set; } = "";
+        public string AssetGameVersion { get; set; } = "";
+        public int AssetBuildIndex { get; set; } = -1;
+        public int MapSeed { get; set; }
+        public int LevelId { get; set; } = -1;
+        public int DungeonSeed { get; set; }
+        public int DungeonFlow { get; set; } = -1;
+        public List<string> AssetRendererPaths { get; set; } = new List<string>();
+        public List<string> AssetTerrainPaths { get; set; } = new List<string>();
         public List<GeometrySnapshot> Geometry { get; set; } = new List<GeometrySnapshot>();
         public List<TextureSnapshot> Textures { get; set; } = new List<TextureSnapshot>();
         public List<MaterialSnapshot> Materials { get; set; } = new List<MaterialSnapshot>();
@@ -122,6 +170,13 @@ namespace LCReplay.Core
     public sealed class RoomSnapshot
     {
         public string Id { get; set; } = "";
+        public Vec3 Center { get; set; }
+        public Vec3 Size { get; set; }
+        public List<RoomVolumeSnapshot> AdditionalVolumes { get; set; } = new List<RoomVolumeSnapshot>();
+    }
+
+    public sealed class RoomVolumeSnapshot
+    {
         public Vec3 Center { get; set; }
         public Vec3 Size { get; set; }
     }
@@ -156,6 +211,8 @@ namespace LCReplay.Core
         public Vec3 Position { get; set; }
         public Quat Rotation { get; set; } = Quat.Identity;
         public float[] Color { get; set; } = new[] { 1f, 1f, 1f, 1f };
+        public bool UseColorTemperature { get; set; }
+        public float ColorTemperature { get; set; } = 6500f;
         public float Intensity { get; set; } = 1f;
         public float Range { get; set; } = 10f;
         public float SpotAngle { get; set; } = 30f;
@@ -168,6 +225,7 @@ namespace LCReplay.Core
         public string Name { get; set; } = "";
         public string EntityId { get; set; } = "";
         public string MaterialId { get; set; } = "";
+        public ParticleStyleSnapshot? Style { get; set; }
         public bool IsInterior { get; set; }
         public string RoomId { get; set; } = "";
         public Vec3 Position { get; set; }
@@ -178,6 +236,31 @@ namespace LCReplay.Core
         public float Speed { get; set; }
         public float Size { get; set; } = 0.1f;
         public float Radius { get; set; } = 0.1f;
+    }
+
+    /// <summary>Identity and renderer state of the original effect; never a generic white billboard.</summary>
+    public sealed class ParticleStyleSnapshot
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string ParentName { get; set; } = "";
+        public string MaterialName { get; set; } = "";
+        public string ShaderName { get; set; } = "";
+        public string MeshName { get; set; } = "";
+        public bool Simulate { get; set; }
+        public bool IsInterior { get; set; }
+        public Vec3 Position { get; set; }
+        public Quat Rotation { get; set; } = Quat.Identity;
+        public float Time { get; set; }
+        public uint RandomSeed { get; set; }
+        public int RenderMode { get; set; }
+        public int Alignment { get; set; }
+        public int[] VertexStreams { get; set; } = System.Array.Empty<int>();
+        public float LengthScale { get; set; } = 2f;
+        public float VelocityScale { get; set; }
+        public float CameraVelocityScale { get; set; }
+        public Vec3 Scale { get; set; } = Vec3.One;
+        public Vec3 Pivot { get; set; }
     }
 
     public sealed class LocalFogSnapshot
@@ -214,6 +297,9 @@ namespace LCReplay.Core
         public string Id { get; set; } = "";
         public int Width { get; set; }
         public int Height { get; set; }
+        // Older captures encoded every PNG through an sRGB target. False retains
+        // that interpretation; new normal/mask maps keep their linear channels.
+        public bool Linear { get; set; }
         public byte[] Png { get; set; } = new byte[0];
     }
 
@@ -261,6 +347,9 @@ namespace LCReplay.Core
         public string MeshSourceId { get; set; } = "";
         public bool IsInterior { get; set; }
         public string RoomId { get; set; } = "";
+        // Optional pose stream for moving furniture and doors in generated tiles.
+        public bool IsMovingSceneRenderer { get; set; }
+        public bool Active { get; set; } = true;
         // Optional natural-object LOD pair, selected by the replay camera.
         public string LodGroupId { get; set; } = "";
         public int LodLevel { get; set; }
@@ -274,6 +363,7 @@ namespace LCReplay.Core
         public List<int[]> SubmeshTriangles { get; set; } = new List<int[]>();
         public List<string> MaterialIds { get; set; } = new List<string>();
         public List<string> BonePaths { get; set; } = new List<string>();
+        public string RootBonePath { get; set; } = "";
         public float[] BindPoses { get; set; } = new float[0];
         public int[] BoneIndices { get; set; } = new int[0];
         public float[] BoneWeights { get; set; } = new float[0];

@@ -112,6 +112,7 @@ namespace LCReplay.Core
             if (set.Length > 96) throw new InvalidDataException("Capture-set index identifier is too long.");
             indexWriter.Write((byte)set.Length);
             indexWriter.Write(set);
+            indexWriter.Write((byte)(record.Kind == "event" && record.Event?.Category == "visual" ? 1 : 0));
         }
 
         public void Dispose()

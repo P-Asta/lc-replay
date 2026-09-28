@@ -166,7 +166,7 @@ namespace LCReplay.Plugin.Capture
             {
                 var bones = renderer.bones;
                 var bind = mesh.bindposes;
-                if (bones.Length == 0 || bones.Length > 128 || bind.Length != bones.Length ||
+                if (bones.Length == 0 || bones.Length > 512 || bind.Length != bones.Length ||
                     bones.Any(bone => !bone || (bone != entityRoot && !bone.IsChildOf(entityRoot)))) return false;
                 var paths = bones.Select(bone => EntityTracker.RelativePath(entityRoot, bone)).ToList();
                 if (paths.Any(path => path.Length > 4096)) return false;
@@ -187,6 +187,9 @@ namespace LCReplay.Plugin.Capture
                 for (int i = 0; i < bind.Length; i++) for (int j = 0; j < 16; j++) matrices[i * 16 + j] = bind[i][j];
                 if (matrices.Any(value => !GameAccess.Finite(value))) return false;
                 target.BonePaths = paths; target.BindPoses = matrices; target.BoneIndices = indices; target.BoneWeights = values;
+                var rootBone = renderer.rootBone;
+                if (rootBone && (rootBone == entityRoot || rootBone.IsChildOf(entityRoot)))
+                    target.RootBonePath = EntityTracker.RelativePath(entityRoot, rootBone);
                 return true;
             }
             catch { return false; }

@@ -33,6 +33,10 @@ var suite = new (string Name, Action Run)[]
     ("Full recording playback keeps the readable span around a corrupt sibling", LoadedRecordingCorruptSibling),
     ("Full recording playback never silently bridges missing part numbers", LoadedRecordingMissingPart),
     ("Truncated final segments recover while selected corruption and cancellation propagate", LoadedRecordingRecovery),
+    ("Deleting one replay removes only its own data and sidecars", DeleteRecording),
+    ("Active and escaped replay paths cannot be deleted", DeleteRecordingSafety),
+    ("Folder deletion removes its recordings while preserving other quotas", DeleteRecordingFolder),
+    ("Folder deletion refuses an active member before changing any file", DeleteRecordingFolderSafety),
 };
 int failures = 0;
 foreach (var test in suite)
@@ -62,6 +66,8 @@ static void Hierarchy() => WithTemp(root =>
     Check(index.Warnings.Count == 0 && index.Runs.Count == 1, "one run, no warnings");
     var found = index.Runs.Single();
     Check(found.Sessions.Count == 2 && found.Sessions.Sum(s => s.Days.Count) == 3, "session/day counts");
+    Check(found.Sessions.Select(s => s.Id).SequenceEqual(new[] { first.Id, second.Id }), "oldest saved session appears first");
+    Check(found.Sessions[0].Days.Select(d => d.Id).SequenceEqual(new[] { day1.Id, day2.Id }), "saved days appear from top to bottom");
     Check(found.Sessions.All(s => s.Status == "complete"), "closed sessions");
     Check(found.DurationSeconds == 60 && found.Bytes > 0, "tree aggregate duration and size");
     var recorded = found.Sessions.Single(s => s.Id == first.Id).Days.Single(d => d.DayNumber == 1);
@@ -93,6 +99,8 @@ static void UniquePaths() => WithTemp(root =>
     var archive = new ReplayArchive(root);
     var one = archive.BeginRun(Now()); var two = archive.BeginRun(Now());
     Check(one.DirectoryPath != two.DirectoryPath, "same-second launch uniqueness");
+    var later = archive.BeginRun(Now().AddMinutes(1));
+    Check(archive.Scan().Runs.Last().Id == later.Id, "newer saved run appears below earlier runs");
     var lobby = archive.BeginSession(one, Now(), "Lobby", "host");
     var reconnect = archive.BeginSession(one, Now(), "Lobby", "host");
     Check(lobby.DirectoryPath != reconnect.DirectoryPath && reconnect.SessionNumber == 2, "reconnection identity");
@@ -413,6 +421,7 @@ static void QuotaHierarchy() => WithTemp(root =>
         && !Directory.EnumerateDirectories(run.DirectoryPath, "Day-*", SearchOption.AllDirectories).Any(), "new recordings do not create session or day folders");
     var index = archive.Scan(); var saved = index.Runs.Single().Sessions.Single();
     Check(index.Warnings.Count == 0 && saved.IsQuotaGroup && saved.Days.Count == 3, "quota index round trip");
+    Check(saved.Days.Select(day => day.DeadlineDaysRemaining).SequenceEqual(new int?[] { 3, 2, 1 }), "quota recordings display in save order");
     Check(saved.Days.Select(day => day.DeadlineDaysRemaining).OrderBy(value => value).SequenceEqual(new int?[] { 1, 2, 3 }), "all remaining deadlines preserved");
     Check(saved.Days.All(day => day.QuotaRemaining == 130 && day.QuotaTarget == 150 && day.QuotaFulfilled == 20 && day.DeadlineDaysTotal == 4 && day.QuotaCycle == 2), "quota metadata round trip");
     var header = ReplayReader.ReadHeader(clips[0].Segments[0].FilePath);
@@ -572,6 +581,102 @@ static void LoadedRecordingRecovery() => WithTemp(root =>
 });
 
 static IEnumerable<ArchiveSegment> AllSegments(ArchiveIndex index) => index.Runs.SelectMany(r => r.Sessions).SelectMany(s => s.Days).SelectMany(d => d.Segments);
+static void DeleteRecording() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now());
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var group = archive.BeginQuota(run, Now(), quota, "host");
+    var first = archive.BeginQuotaDay(group, 1, Now(), "Titan", quota);
+    var firstPart = archive.AllocateSegment(first, 1); Write(archive, firstPart, 4); archive.EndDay(first, "saved");
+    var indexPath = Path.ChangeExtension(firstPart.FilePath, ".lci");
+    File.WriteAllText(indexPath, "sidecar");
+    quota.DeadlineDaysRemaining = 2;
+    var second = archive.BeginQuotaDay(group, 2, Now().AddMinutes(1), "Assurance", quota);
+    var secondPart = archive.AllocateSegment(second, 1); Write(archive, secondPart, 5); archive.EndDay(second, "saved");
+    var selected = archive.Scan().Runs.Single().Sessions.Single().Days.Single(value => value.Id == first.Id);
+    Check(archive.DeleteRecording(selected) == 1, "one physical replay removed");
+    Check(!File.Exists(firstPart.FilePath) && !File.Exists(indexPath) &&
+        !File.Exists(Path.ChangeExtension(firstPart.FilePath, ".json")) &&
+        !File.Exists(Path.Combine(group.DirectoryPath, first.RecordingStem + ".day.json")), "only selected replay metadata removed");
+    Check(File.Exists(secondPart.FilePath) && File.Exists(Path.Combine(group.DirectoryPath, "quota.json")), "neighbor and shared quota metadata kept");
+    Check(archive.Scan().Runs.Single().Sessions.Single().Days.Single().Id == second.Id, "removed day does not reappear after scan");
+
+    var legacy = archive.BeginSession(run, Now(), "Legacy", "host");
+    var legacyDay = archive.BeginDay(legacy, 1, Now(), "Titan");
+    Write(archive, archive.AllocateSegment(legacyDay, 1), 2);
+    Write(archive, archive.AllocateSegment(legacyDay, 2), 3);
+    archive.EndDay(legacyDay, "saved");
+    var legacySelected = archive.Scan().Runs.Single().Sessions.Single(value => value.Id == legacy.Id).Days.Single();
+    Check(archive.DeleteRecording(legacySelected) == 2, "legacy multipart day removed as one recording");
+    Check(!Directory.Exists(legacyDay.DirectoryPath), "empty legacy day folder removed");
+    Check(File.Exists(secondPart.FilePath), "quota neighbor survives legacy deletion");
+});
+
+static void DeleteRecordingSafety() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now());
+    var session = archive.BeginSession(run, Now(), "Active", "host");
+    var day = archive.BeginDay(session, 1, Now(), "Titan");
+    var active = archive.AllocateSegment(day, 1);
+    RawReplay(active.FilePath, new ReplayHeader { SessionId = active.SessionId, StartedUtc = active.StartedUtc.ToString("O"), Metadata = active.Metadata });
+    var scanned = archive.Scan().Runs.Single().Sessions.Single().Days.Single();
+    Expect<InvalidOperationException>(() => archive.DeleteRecording(scanned));
+    Check(File.Exists(active.FilePath), "active file remains");
+    var outside = Path.Combine(Path.GetDirectoryName(root)!, "unrelated-" + Guid.NewGuid().ToString("N") + ".lcr");
+    scanned.Segments[0].FilePath = outside;
+    Expect<IOException>(() => archive.DeleteRecording(scanned));
+    Check(File.Exists(active.FilePath), "invalid request does not alter active file");
+    var looseFile = Path.Combine(root, "loose.lcr");
+    RawReplay(looseFile, new ReplayHeader { SessionId = "loose", StartedUtc = Now().ToString("O") });
+    var looseDay = new ReplayArchive(root + Path.DirectorySeparatorChar).Scan().Runs
+        .Single(value => value.Id == "legacy").Sessions.Single().Days.Single();
+    Check(new ReplayArchive(root + Path.DirectorySeparatorChar).DeleteRecording(looseDay) == 1,
+        "root-level legacy replay can be removed");
+    Check(Directory.Exists(root), "archive root remains after deleting its last loose replay");
+});
+
+static void DeleteRecordingFolder() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now());
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var firstGroup = archive.BeginQuota(run, Now(), quota, "host");
+    var first = archive.BeginQuotaDay(firstGroup, 1, Now(), "Titan", quota);
+    var firstFile = archive.AllocateSegment(first, 1); Write(archive, firstFile, 4); archive.EndDay(first, "saved");
+    quota.DeadlineDaysRemaining = 2;
+    var empty = archive.BeginQuotaDay(firstGroup, 2, Now().AddMinutes(1), "Titan", quota);
+    archive.EndDay(empty, "preparing"); archive.EndSession(firstGroup);
+    quota.Target = 260; quota.DeadlineDaysRemaining = 3;
+    var otherGroup = archive.BeginQuota(run, Now().AddMinutes(2), quota, "host");
+    var other = archive.BeginQuotaDay(otherGroup, 3, Now().AddMinutes(2), "Assurance", quota);
+    var otherFile = archive.AllocateSegment(other, 1); Write(archive, otherFile, 5);
+    archive.EndDay(other, "saved"); archive.EndSession(otherGroup); archive.EndRun(run);
+    var group = archive.Scan().Runs.Single().Sessions.Single(value => value.Id == firstGroup.Id);
+    Check(archive.DeleteRecordings(group.Days) == 1, "one recorded replay removed from quota folder");
+    Check(!Directory.Exists(firstGroup.DirectoryPath), "empty quota folder and its metadata removed");
+    Check(File.Exists(otherFile.FilePath), "other quota preserved");
+    Check(archive.Scan().Runs.Single().Sessions.Single().Id == otherGroup.Id, "deleted quota no longer appears");
+
+    var remaining = archive.Scan().Runs.Single().Sessions.Single().Days.ToArray();
+    Check(archive.DeleteRecordings(remaining) == 1, "last recording removed");
+    Check(!Directory.Exists(run.DirectoryPath) && Directory.Exists(root), "empty run folder removed but archive root retained");
+});
+
+static void DeleteRecordingFolderSafety() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now());
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var group = archive.BeginQuota(run, Now(), quota, "host");
+    var previous = archive.BeginQuotaDay(group, 1, Now(), "Titan", quota);
+    var previousFile = archive.AllocateSegment(previous, 1); Write(archive, previousFile, 3);
+    archive.EndDay(previous, "saved");
+    quota.DeadlineDaysRemaining = 2;
+    var current = archive.BeginQuotaDay(group, 2, Now().AddMinutes(1), "Titan", quota);
+    var active = archive.AllocateSegment(current, 1);
+    RawReplay(active.FilePath, new ReplayHeader { SessionId = active.SessionId, StartedUtc = active.StartedUtc.ToString("O"), Metadata = active.Metadata });
+    var scanned = archive.Scan().Runs.Single().Sessions.Single();
+    Expect<InvalidOperationException>(() => archive.DeleteRecordings(scanned.Days));
+    Check(File.Exists(previousFile.FilePath) && File.Exists(active.FilePath), "batch preflight preserves every file");
+});
 static DateTimeOffset Now() => DateTimeOffset.Parse("2026-09-23T12:00:00Z");
 static void Write(ReplayArchive archive, ArchiveSegment segment, double duration)
 {

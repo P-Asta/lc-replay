@@ -3,6 +3,20 @@ using System.Text;
 using LCReplay.Core;
 using Newtonsoft.Json;
 
+if (args.Length == 2 && args[0] == "--inspect-audio")
+{
+    var recording = ReplayReader.Read(args[1]);
+    var audio = recording.Events.Where(evt => evt.Category == "audio" && evt.Name == "source-block").ToArray();
+    foreach (var group in audio.GroupBy(evt => evt.Data.GetValueOrDefault("source", "?")))
+    {
+        var peak = group.Select(evt => ReplayAudioCodec.Decode(Convert.FromBase64String(evt.Data["adpcm"]),
+            int.Parse(evt.Data["samples"])).Max(sample => Math.Abs(sample))).Max();
+        Console.WriteLine($"source={group.Key} blocks={group.Count()} peak={peak:F4} first={group.First().Time:F2} last={group.Last().Time:F2}");
+    }
+    Console.WriteLine($"audio blocks={audio.Length} particle frames={recording.Frames.Count(frame => frame.Particles.Count != 0)}");
+    return 0;
+}
+
 var suite = new (string Name, Action Run)[]
 {
     ("Round trip captures frames, world, events and metadata", RoundTrip),
@@ -11,8 +25,10 @@ var suite = new (string Name, Action Run)[]
     ("Bounded writer drains every accepted record", QueueCompletion),
     ("Invalid writer input exposes Error and leaves readable prefix", WriterFailure),
     ("Timeline seeks and applies discrete lifecycle boundaries", Timeline),
+    ("Playback sampler matches independent samples across rapid forward and backward seeks", PlaybackSampler),
     ("Quaternion interpolation follows the shortest normalized arc", Quaternion),
     ("Moving door renderers interpolate local transforms and discrete visibility", RendererPoses),
+    ("Moving scene furniture interpolates world poses and preserves hidden baselines", MovingSceneRenderers),
     ("Textured multi-material skinned geometry survives recording and reading", AppearanceRoundTrip),
     ("Legacy recordings without appearance fields retain their defaults", LegacyAppearance),
     ("Texture headers, dimensions and cumulative byte budgets are bounded", TextureValidation),
@@ -25,6 +41,10 @@ var suite = new (string Name, Action Run)[]
     ("Moving ship anchors interpolate and captured lights survive round trips", MovingEnvironment),
     ("Sky, fog, rooms and shader properties round trip with bounded validation", EnvironmentAndMaterials),
     ("Instanced vegetation, particle emitters and local fog round trip with bounded validation", ProceduralVisuals),
+    ("Installed moon scene references and generation settings are bounded and round trip", SceneAssetReferences),
+    ("Short-lived particle poses survive seek and reject invalid sizes", ShortLivedParticles),
+    ("Laser and rope lines survive seek while malformed paths are rejected", LineRenderers),
+    ("Bounded mono audio blocks retain a waveform without accepting truncated data", AudioBlocks),
 };
 int failures = 0;
 foreach (var test in suite)
@@ -66,6 +86,45 @@ static void RoundTrip()
     });
 }
 
+static void SceneAssetReferences()
+{
+    WithTemp(dir =>
+    {
+        var file = Path.Combine(dir, "scene-assets.lcr");
+        var world = new WorldSnapshot
+        {
+            Scene = "Level1Experimentation", CaptureSetId = "capture-1", Layer = "exterior",
+            AssetScene = "Level1Experimentation", AssetGameVersion = "81", AssetBuildIndex = 5,
+            MapSeed = 123456, LevelId = 0, DungeonSeed = 98765, DungeonFlow = 2,
+            AssetRendererPaths = new() { "0/1/2:MeshRenderer:0" },
+            AssetTerrainPaths = new() { "0/3:Terrain:0" }
+        };
+        using (var writer = new ReplayWriter(file, Header()))
+            Check(writer.TryWrite(new ReplayRecord { Kind = "world", World = world }), "scene-reference world accepted");
+        var loaded = ReplayReader.Read(file).Worlds.Single().World!;
+        Check(loaded.AssetScene == world.AssetScene && loaded.AssetBuildIndex == 5 &&
+            loaded.MapSeed == 123456 && loaded.DungeonSeed == 98765 && loaded.DungeonFlow == 2 &&
+            loaded.AssetRendererPaths.Single() == world.AssetRendererPaths.Single(), "scene references round trip");
+        void Reject(Action<WorldSnapshot> mutate)
+        {
+            var invalid = new WorldSnapshot
+            {
+                Layer = "exterior", CaptureSetId = "capture-1", AssetScene = "Level1Experimentation",
+                AssetGameVersion = "81", AssetBuildIndex = 5,
+                AssetRendererPaths = new() { "0/1:MeshRenderer:0" }
+            };
+            mutate(invalid);
+            Raw(file, new ReplayRecord { Kind = "header", Header = Header() },
+                new ReplayRecord { Kind = "world", World = invalid });
+            Expect<InvalidDataException>(() => ReplayReader.Read(file));
+        }
+        Reject(value => value.AssetRendererPaths.Add(value.AssetRendererPaths[0]));
+        Reject(value => value.AssetScene = "");
+        Reject(value => value.AssetBuildIndex = -1);
+        Reject(value => value.AssetRendererPaths[0] = new string('x', 257));
+    });
+}
+
 static void MovingEnvironment()
 {
     WithTemp(dir =>
@@ -77,7 +136,9 @@ static void MovingEnvironment()
             Geometry = new() { new GeometrySnapshot { Id = "ship", AnchorId = "ship-elevator",
                 Vertices = new float[] { 0, 0, 0, 1, 0, 0, 0, 1, 0 }, Triangles = new[] { 0, 1, 2 } } },
             Lights = new() { new LightSnapshot { Id = "lamp", AnchorId = "ship-elevator", Type = "Point",
-                Position = new Vec3(0, 2, 0), Intensity = 80, Range = 12, Shadows = true } }
+                Position = new Vec3(0, 2, 0), Color = new[] { .2f, .4f, .9f, 1f },
+                UseColorTemperature = true, ColorTemperature = 3200f,
+                Intensity = 80, Range = 12, Shadows = true } }
         };
         var first = new ReplayFrame { Time = 0, Anchors = new() { new AnchorPose { Id = "ship-elevator", Position = new Vec3(0, 100, 0) } } };
         var last = new ReplayFrame { Time = 1, Anchors = new() { new AnchorPose { Id = "ship-elevator", Position = new Vec3(0, 0, 0) } } };
@@ -90,10 +151,113 @@ static void MovingEnvironment()
         var session = ReplayReader.Read(file);
         Check(session.Worlds[0].World!.Geometry[0].AnchorId == "ship-elevator", "geometry retains ship parent");
         Check(session.Worlds[0].World!.Lights[0].Shadows, "light retains shadow flag");
+        Check(session.Worlds[0].World!.Lights[0].UseColorTemperature &&
+            session.Worlds[0].World!.Lights[0].ColorTemperature == 3200f &&
+            session.Worlds[0].World!.Lights[0].Color[2] == .9f, "light retains tint and color temperature");
         Near(ReplayTimeline.Sample(session, 0.5).Anchors[0].Position.Y, 50);
         var malformed = new ReplayFrame { Time = 0, Anchors = new() { new AnchorPose { Id = "ship-elevator" }, new AnchorPose { Id = "ship-elevator" } } };
         Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "frame", Frame = malformed });
         Expect<InvalidDataException>(() => ReplayReader.Read(file));
+    });
+}
+
+static void ShortLivedParticles()
+{
+    WithTemp(dir =>
+    {
+        var file = Path.Combine(dir, "bursts.lcr");
+        var frame = new ReplayFrame { Time = 0,
+            ParticleStyles = new() { new ParticleStyleSnapshot { Id = "muzzle", Name = "Bullet particles", ParentName = "Turret",
+                MaterialName = "Tracer", ShaderName = "HDRP/Particles/Unlit", RenderMode = 1,
+                VertexStreams = new[] { 0, 1, 2, 3 }, Simulate = true, Time = .4f, VelocityScale = .02f } },
+            Particles = new() { new ParticlePose
+        { EmitterId = "muzzle", Position = new Vec3(1, 2, 3), Size = .2f, Rotation = 45,
+            Size3D = new Vec3(.2f, .1f, .1f), Velocity = new Vec3(40, 0, 0),
+            Lifetime = .5f, RemainingLifetime = .25f, RandomSeed = 42,
+            Color = new[] { 1f, .2f, 0f, .8f }, IsInterior = true } } };
+        using (var writer = new ReplayWriter(file, Header()))
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Time = 0, Frame = frame }), "particle frame accepted");
+        var session = ReplayReader.Read(file);
+        var pose = ReplayTimeline.Sample(session, 0).Particles.Single();
+        Check(pose.IsInterior && pose.Position.Y == 2 && pose.Color[1] == .2f, "particle pose retained");
+        var style = ReplayTimeline.Sample(session, 0).ParticleStyles.Single();
+        Check(style.MaterialName == "Tracer" && style.Simulate && style.RenderMode == 1 &&
+            style.VertexStreams.Length == 4 && pose.EmitterId == style.Id && pose.Velocity.X == 40 &&
+            pose.RandomSeed == 42 && pose.RemainingLifetime == .25f, "native effect identity, stretch and atlas age survive seek");
+        var malformed = JsonConvert.DeserializeObject<ReplayFrame>(JsonConvert.SerializeObject(frame))!;
+        malformed.ParticleStyles.Clear();
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "frame", Frame = malformed });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+        malformed.Particles.Clear(); malformed.ParticleStyles.Add(new ParticleStyleSnapshot { Id = "invalid", VertexStreams = new[] { 999 } });
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "frame", Frame = malformed });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() },
+            new ReplayRecord { Kind = "frame", Frame = new ReplayFrame { Particles = new() { new ParticlePose { Size = float.NaN } } } });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+    });
+}
+
+static void LineRenderers()
+{
+    WithTemp(dir =>
+    {
+        var file = Path.Combine(dir, "lines.lcr");
+        var line = new LinePose { Id = "laser", Positions = new[] { 1f, 2f, 3f, 4f, 5f, 6f },
+            MaterialName = "Laser red", ShaderName = "HDRP/Unlit", TextureMode = 1,
+            StartWidth = .02f, EndWidth = .01f, StartColor = new[] { 1f, 0f, 0f, 1f },
+            EndColor = new[] { 1f, .2f, 0f, .8f }, IsInterior = true };
+        using (var writer = new ReplayWriter(file, Header()))
+        {
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Frame = new ReplayFrame { Lines = new() { line } } }), "line frame accepted");
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Time = 1, Frame = new ReplayFrame { Time = 1,
+                Lines = new() { new LinePose { Id = "laser", Positions = new[] { 3f, 2f, 3f, 6f, 5f, 6f },
+                    StartWidth = .04f, EndWidth = .01f, IsInterior = true } } } }), "moving line accepted");
+        }
+        var session = ReplayReader.Read(file);
+        var restored = ReplayTimeline.Sample(session, 0).Lines.Single();
+        Check(restored.Id == "laser" && restored.IsInterior && restored.Positions[5] == 6f &&
+            restored.StartWidth == .02f, "line path and styling retained");
+        var midway = ReplayTimeline.Sample(session, .5).Lines.Single();
+        Check(midway.Positions[0] == 2f && Math.Abs(midway.StartWidth - .03f) < .00001f,
+            "moving line interpolates between samples");
+        Check(midway.MaterialName == "Laser red" && midway.ShaderName == "HDRP/Unlit" && midway.TextureMode == 1,
+            "line interpolation retains the original laser material and texture mapping");
+        line.Positions = new[] { 1f, 2f, float.NaN, 4f, 5f, 6f };
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() },
+            new ReplayRecord { Kind = "frame", Frame = new ReplayFrame { Lines = new() { line } } });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+    });
+}
+
+static void AudioBlocks()
+{
+    var waveform = Enumerable.Range(0, ReplayAudioCodec.MaxSamplesPerBlock)
+        .Select(i => (short)Math.Round(Math.Sin(i * .07) * 12000)).ToArray();
+    var encoded = ReplayAudioCodec.Encode(waveform, waveform.Length);
+    var decoded = ReplayAudioCodec.Decode(encoded, waveform.Length);
+    Check(encoded.Length == 2 + waveform.Length / 2, "ADPCM block is bounded to four bits per sample");
+    var error = waveform.Zip(decoded, (source, result) => Math.Abs(source / 32768f - result)).Average();
+    Check(error < .025, "audio waveform retains audible detail: " + error);
+    Expect<InvalidDataException>(() => ReplayAudioCodec.Decode(encoded[..^1], waveform.Length));
+    Expect<ArgumentOutOfRangeException>(() => ReplayAudioCodec.Encode(waveform, waveform.Length + 1));
+    WithTemp(dir =>
+    {
+        var file = Path.Combine(dir, "spatial-audio.lcr");
+        var evt = new ReplayEvent { Category = "audio", Name = "source-block", Data = new()
+        {
+            ["rate"] = ReplayAudioCodec.SampleRate.ToString(), ["samples"] = waveform.Length.ToString(),
+            ["adpcm"] = Convert.ToBase64String(encoded), ["source"] = "s1",
+            ["x"] = "12.5", ["y"] = "-2", ["z"] = "3", ["spatial"] = "1",
+            ["min"] = "1", ["max"] = "30", ["rolloff"] = "0"
+        } };
+        using (var writer = new ReplayWriter(file, Header()))
+        {
+            Check(writer.TryWrite(new ReplayRecord { Kind = "event", Event = evt }), "spatial audio event accepted");
+            writer.Dispose(); Check(writer.Error == null, "spatial audio event writes");
+        }
+        var saved = ReplayReader.Read(file).Events.Single();
+        Check(saved.Data["x"] == "12.5" && saved.Data["spatial"] == "1" &&
+            saved.Data["adpcm"] == evt.Data["adpcm"], "spatial source metadata survives archive");
     });
 }
 
@@ -105,7 +269,8 @@ static void EnvironmentAndMaterials()
         var world = new WorldSnapshot
         {
             CaptureSetId = "capture-1", Layer = "exterior",
-            Rooms = new() { new RoomSnapshot { Id = "r1", Center = new Vec3(2, 3, 4), Size = new Vec3(8, 5, 6) } },
+            Rooms = new() { new RoomSnapshot { Id = "r1", Center = new Vec3(2, 3, 4), Size = new Vec3(8, 5, 6),
+                AdditionalVolumes = new() { new RoomVolumeSnapshot { Center = new Vec3(2, 30, 4), Size = new Vec3(4, 12, 4) } } } },
             Environment = new EnvironmentSnapshot { AmbientSkyColor = new[] { .1f, .2f, .3f, 1f }, Components = new()
             {
                 new EnvironmentComponentSnapshot { Type = "VisualEnvironment", Parameters = new()
@@ -124,12 +289,18 @@ static void EnvironmentAndMaterials()
         Check(result.CaptureSetId == "capture-1" && result.Layer == "exterior" &&
             result.Rooms.Single().Center.Z == 4 && result.Environment!.Components.Count == 2,
             "room/environment preserved");
+        Check(result.Rooms.Single().AdditionalVolumes.Single().Center.Y == 30 &&
+            result.Rooms.Single().AdditionalVolumes.Single().Size.Y == 12, "separate entrance volume preserved");
         Check(result.Materials.Single().Properties.Single().Values[0] == .4f && result.Materials.Single().RenderQueue == 2450,
             "shader parameters preserved");
         world.Rooms.Add(new RoomSnapshot { Id = "r1", Size = Vec3.One });
         Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "world", World = world });
         Expect<InvalidDataException>(() => ReplayReader.Read(file));
         world.Rooms.RemoveAt(1);
+        world.Rooms[0].AdditionalVolumes[0].Size = new Vec3(4, -12, 4);
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "world", World = world });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+        world.Rooms[0].AdditionalVolumes[0].Size = new Vec3(4, 12, 4);
         world.Materials[0].Properties[0].Values[0] = float.NaN;
         Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "world", World = world });
         Expect<InvalidDataException>(() => ReplayReader.Read(file));
@@ -209,6 +380,19 @@ static void Validation()
         Check(ReplayReader.Read(file).Header.SessionId == "safe", "type metadata is inert");
         using (var output = File.Create(file)) { output.Write(Encoding.ASCII.GetBytes("LCREPL01")); RawPayload(output, "{}{}"); }
         Expect<InvalidDataException>(() => ReplayReader.Read(file));
+        // Streaming decoding must retain strict UTF-8 checks, even when the
+        // malformed byte occurs in otherwise valid JSON string content.
+        using (var output = File.Create(file))
+        {
+            output.Write(Encoding.ASCII.GetBytes("LCREPL01"));
+            var raw = Encoding.UTF8.GetBytes("{\"Kind\":\"header\",\"Header\":{\"SessionId\":\"X\"}}");
+            raw[Array.IndexOf(raw, (byte)'X')] = 0xff;
+            using var compressed = new MemoryStream();
+            using (var gzip = new GZipStream(compressed, CompressionLevel.Fastest, true)) gzip.Write(raw);
+            using var writer = new BinaryWriter(output, Encoding.UTF8, true);
+            writer.Write((int)compressed.Length); writer.Write(raw.Length); writer.Write(compressed.ToArray());
+        }
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
     });
 }
 
@@ -277,6 +461,41 @@ static void Timeline()
     Near(ReplayTimeline.Sample(activation, 0.5).Entities[0].Position.X, 100);
 }
 
+static void PlaybackSampler()
+{
+    var first = Frame(0, Entity("worker", 0)).Frame!;
+    var last = Frame(1, Entity("worker", 10)).Frame!;
+    first.State["quota"] = "130"; last.State["quota"] = "0";
+    first.Entities[0].State["held"] = "flashlight";
+    last.Entities[0].State["held"] = "shovel";
+    first.Entities[0].Bones.Add(new BonePose { Path = "head", Position = new Vec3(0, 1, 0) });
+    last.Entities[0].Bones.Add(new BonePose { Path = "head", Position = new Vec3(0, 3, 0) });
+    first.Entities[0].Renderers.Add(new RenderPose { Id = "suit", Position = new Vec3(0, 0, 0) });
+    last.Entities[0].Renderers.Add(new RenderPose { Id = "suit", Position = new Vec3(10, 0, 0) });
+    first.SceneRenderers.Add(new RenderPose { Id = "door", Position = new Vec3(0, 0, 0) });
+    last.SceneRenderers.Add(new RenderPose { Id = "door", Position = new Vec3(2, 0, 0) });
+    first.Anchors.Add(new AnchorPose { Id = "ship", Position = new Vec3(0, 0, 0) });
+    last.Anchors.Add(new AnchorPose { Id = "ship", Position = new Vec3(0, -20, 0) });
+    var session = new ReplaySession { Duration = 1, Frames = new() { first, last } };
+    var sampler = new ReplayTimelineSampler();
+    foreach (var time in new[] { .5, .9, 0, .75, .25, 1, .5 })
+    {
+        var expected = ReplayTimeline.Sample(session, time);
+        var actual = sampler.Sample(session, time);
+        Near(actual.Entities[0].Position.X, expected.Entities[0].Position.X);
+        Near(actual.Entities[0].Bones[0].Position.Y, expected.Entities[0].Bones[0].Position.Y);
+        Near(actual.Entities[0].Renderers[0].Position.X, expected.Entities[0].Renderers[0].Position.X);
+        Near(actual.SceneRenderers[0].Position.X, expected.SceneRenderers[0].Position.X);
+        Near(actual.Anchors[0].Position.Y, expected.Anchors[0].Position.Y);
+        Check(actual.State["quota"] == expected.State["quota"] &&
+            actual.Entities[0].State["held"] == expected.Entities[0].State["held"], "discrete state matches");
+    }
+    var held = sampler.Sample(session, .25);
+    sampler.Sample(session, .75);
+    Near(held.Entities[0].Position.X, 2.5);
+    Check(held.Entities[0].State["held"] == "flashlight", "later samples do not replace earlier poses");
+}
+
 static void Quaternion()
 {
     var a = Entity("p", 0); var b = Entity("p", 0); b.Rotation = new Quat(0, 0, 0, -1);
@@ -333,6 +552,38 @@ static void RendererPoses()
     });
 }
 
+static void MovingSceneRenderers()
+{
+    WithTemp(dir =>
+    {
+        var file = Path.Combine(dir, "furniture.lcr");
+        var shelf = new GeometrySnapshot { Id = "shelf", IsInterior = true, IsMovingSceneRenderer = true,
+            Active = false, Vertices = new float[] { 0, 0, 0, 1, 0, 0, 0, 1, 0 }, Triangles = new[] { 0, 1, 2 } };
+        var first = Frame(0).Frame!;
+        first.SceneRenderers.Add(new RenderPose { Id = "shelf", Active = true, Position = new Vec3(0, 0, 0) });
+        var second = Frame(1).Frame!;
+        second.SceneRenderers.Add(new RenderPose { Id = "shelf", Active = true, Position = new Vec3(4, 0, 0) });
+        var hidden = Frame(2).Frame!;
+        hidden.SceneRenderers.Add(new RenderPose { Id = "shelf", Active = false, Position = new Vec3(8, 0, 0) });
+        using (var writer = new ReplayWriter(file, Header()))
+        {
+            Check(writer.TryWrite(new ReplayRecord { Kind = "world", World = new WorldSnapshot { Layer = "interior", CaptureSetId = "furniture", Geometry = new() { shelf } } }), "world accepted");
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Time = first.Time, Frame = first }), "first pose accepted");
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Time = second.Time, Frame = second }), "second pose accepted");
+            Check(writer.TryWrite(new ReplayRecord { Kind = "frame", Time = hidden.Time, Frame = hidden }), "hidden pose accepted");
+            writer.Dispose(); Check(writer.Error == null, "moving furniture writes: " + writer.Error);
+        }
+        var session = ReplayReader.Read(file);
+        Check(!session.Worlds[0].World!.Geometry[0].Active && session.Worlds[0].World!.Geometry[0].IsMovingSceneRenderer, "hidden baseline survives");
+        Near(ReplayTimeline.Sample(session, .5).SceneRenderers[0].Position.X, 2);
+        Check(ReplayTimeline.Sample(session, 1.5).SceneRenderers[0].Active, "visibility holds before boundary");
+        Check(!ReplayTimeline.Sample(session, 2).SceneRenderers[0].Active, "visibility changes at boundary");
+        first.SceneRenderers.Add(new RenderPose { Id = "shelf" });
+        Raw(file, new ReplayRecord { Kind = "header", Header = Header() }, new ReplayRecord { Kind = "frame", Frame = first });
+        Expect<InvalidDataException>(() => ReplayReader.Read(file));
+    });
+}
+
 static void StableRecordOrder()
 {
     WithTemp(dir =>
@@ -360,6 +611,7 @@ static void AppearanceRoundTrip()
     WithTemp(dir =>
     {
         var source = AppearanceWorld();
+        source.Textures[0].Linear = true;
         var player = Entity("crew", 3);
         player.Bones.Add(new BonePose { Path = "hip[0]", Position = new Vec3(0, 1, 0) });
         player.Bones.Add(new BonePose { Path = "hip[0]/head[0]", Position = new Vec3(0, 1.5f, 0) });
@@ -378,6 +630,7 @@ static void AppearanceRoundTrip()
         var texture = world.Textures.Single();
         Check(texture.Id == "suit-albedo" && texture.Width == 1 && texture.Height == 1, "texture identity/dimensions");
         Check(texture.Png.SequenceEqual(source.Textures[0].Png), "PNG bytes survive base64 JSON/gzip round trip exactly");
+        Check(texture.Linear && !new TextureSnapshot().Linear, "linear data map survives with legacy sRGB default");
         var material = world.Materials.Single(m => m.Id == "orange");
         Check(material.TextureId == texture.Id && material.Name == "Crew suit" && material.ShaderName == "HDRP/Lit" && material.AlphaClip, "material identity and cutout mode");
         Check(material.Color.SequenceEqual(new[] { 1f, .35f, .1f, .8f }), "material RGBA tint");
@@ -746,12 +999,31 @@ static void SingleFileWindows()
             var frame = Frame(i, Entity("player", i));
             frame.Frame!.Entities[0].State["detail"] = new string('x', 512);
             records.Add(frame);
+            if (i == 4 || i == 15) records.Add(new ReplayRecord { Kind = "event", Time = i,
+                Event = new ReplayEvent { Time = i, Category = "visual", Name = i == 4 ? "renderer" : "spray",
+                    EntityId = i == 4 ? "g42" : "0", Data = new Dictionary<string, string>
+                    { ["set"] = i == 4 ? "first" : "second", ["visible"] = i == 15 ? "true" : "false" } } });
             if (i == 19) records.Add(new ReplayRecord { Kind = "event", Time = i,
                 Event = new ReplayEvent { Time = i, Name = "marker" } });
+            if (i == 19) records.Add(new ReplayRecord { Kind = "event", Time = i,
+                Event = new ReplayEvent { Time = i, Name = "marker-after" } });
         }
         records.Add(new ReplayRecord { Kind = "end", Time = 31 });
         Raw(path, records.ToArray());
-        var index = ReplayReader.IndexSingleFile(path, windowExpandedBytes: 2048);
+        var indexProgress = new List<double>();
+        var index = ReplayReader.IndexSingleFile(path, windowExpandedBytes: 2048, progress: indexProgress.Add);
+        Check(File.Exists(Path.ChangeExtension(path, ".lci")),
+            "a complete legacy day gains a reusable sidecar after its first scan");
+        File.WriteAllBytes(Path.ChangeExtension(path, ".lci"), new byte[] { 1, 2, 3 });
+        var repaired = ReplayReader.IndexSingleFile(path, windowExpandedBytes: 2048);
+        Check(repaired.Windows.Count == index.Windows.Count &&
+            new FileInfo(Path.ChangeExtension(path, ".lci")).Length > 8,
+            "a corrupt sidecar is rebuilt from the complete day file");
+        Check(indexProgress.Count > 0 && indexProgress[^1] == 1 && indexProgress.All(value => value >= 0 && value <= 1),
+            "index progress reaches completion within bounds");
+        Check(index.WorldRevisionAt(0) == index.WorldRevisionAt(11) &&
+            index.WorldRevisionAt(12) != index.WorldRevisionAt(11),
+            "world revision changes only when the recorded scene changes");
         var indexedPath = Path.Combine(dir, "2.lcr");
         using (var writer = new ReplayWriter(indexedPath, header, 64, indexed: true))
         {
@@ -764,6 +1036,9 @@ static void SingleFileWindows()
         var indexed = ReplayReader.IndexSingleFile(indexedPath, windowExpandedBytes: 2048);
         Check(indexed.IsComplete && indexed.Windows.Count == index.Windows.Count && indexed.Duration == index.Duration,
             "sidecar and recovered scans agree on record/window boundaries");
+        foreach (var window in indexed.Windows.Where(window => window.Start > 15))
+            Check(ReplayReader.ReadWindow(window).Events.Any(item => item.Category == "visual" && item.Name == "spray"),
+                "writer sidecar carries earlier spray state into later windows");
         Check(index.IsComplete && index.Windows.Count >= 3 && index.Duration == 31, "one day indexes into playback windows");
         var timeline = new ReplayRecordingTimeline(index.Windows.Select(window => new ReplayRecordingPart
             { FilePath = path, Duration = window.Duration, Window = window }));
@@ -771,14 +1046,49 @@ static void SingleFileWindows()
         Check(timeline.Parts.All(part => part.FilePath == path), "virtual playback windows share one physical file");
         foreach (var window in index.Windows)
         {
-            var session = ReplayReader.ReadWindow(window);
+            var readProgress = new List<double>();
+            var session = ReplayReader.ReadWindow(window, progress: readProgress.Add);
+            Check(readProgress.Count > 0 && readProgress[^1] == 1 && readProgress.All(value => value >= 0 && value <= 1),
+                "window read progress reaches completion within bounds");
             Check(session.Frames.Count > 0 && session.Worlds.Count > 0, "each window has frames and a carried world");
             Check(session.Worlds[0].Time == 0, "carried world is available at the window start");
             Check(ReplayTimeline.Sample(session, 0).Entities.Single().Id == "player", "boundary frame is playable");
             if (window.Start > 12) Check(session.Worlds[0].World!.CaptureSetId == "second", "latest world replaces earlier set");
+            if (window.Start > 4 && window.Start < 12)
+                Check(session.Events.Any(item => item.Category == "visual" && item.Name == "renderer" && item.Time == 0),
+                    "hidden static geometry is carried into later playback windows");
+            if (window.Start > 15)
+                Check(session.Events.Any(item => item.Category == "visual" && item.Name == "spray" && item.Time == 0),
+                    "spray decal state is carried into later playback windows");
         }
         Check(index.Windows.Select(window => ReplayReader.ReadWindow(window)).SelectMany(session => session.Events).Any(item => item.Name == "marker"),
             "events survive the virtual window boundary");
+        Check(index.Windows.Select(window => ReplayReader.ReadWindow(window)).SelectMany(session => session.Events)
+            .Where(item => item.Name.StartsWith("marker", StringComparison.Ordinal)).Select(item => item.Name)
+            .SequenceEqual(new[] { "marker", "marker-after" }),
+            "parallel decoding preserves physical order for equal-time events");
+        var independent = ReplayReader.ReadWindow(index.Windows[0]);
+        Check(!ReferenceEquals(independent.Worlds[0].World, ReplayReader.ReadWindow(index.Windows[0]).Worlds[0].World),
+            "normal reader callers retain independent mutable worlds");
+        index.ReuseWorldPayloads = true;
+        var firstShared = ReplayReader.ReadWindow(index.Windows[0]);
+        var laterShared = ReplayReader.ReadWindow(index.Windows[1]);
+        Check(ReferenceEquals(firstShared.Worlds[0].World, laterShared.Worlds[0].World),
+            "opt-in playback shares carried world arrays while an earlier window owns them");
+        Check(!ReferenceEquals(firstShared.Worlds[0], laterShared.Worlds[0]) &&
+            firstShared.Worlds[0].Time == 0 && laterShared.Worlds[0].Time == 0,
+            "shared worlds retain independent window-local timestamps");
+        var originalScene = firstShared.Worlds[0].World!.Scene;
+        firstShared.Worlds[0].World!.Scene = new string('x', 32769);
+        Expect<InvalidDataException>(() => ReplayReader.ReadWindow(index.Windows[0]));
+        firstShared.Worlds[0].World!.Scene = originalScene;
+        using (var cancellation = new CancellationTokenSource())
+        {
+            cancellation.Cancel();
+            Expect<OperationCanceledException>(() => ReplayReader.ReadWindow(index.Windows[0], cancellation.Token));
+        }
+        File.SetLastWriteTimeUtc(path, File.GetLastWriteTimeUtc(path).AddSeconds(2));
+        Expect<InvalidDataException>(() => ReplayReader.ReadWindow(index.Windows[0]));
     });
 }
 

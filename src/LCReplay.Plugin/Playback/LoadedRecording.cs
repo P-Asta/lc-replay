@@ -14,8 +14,10 @@ namespace LCReplay.Plugin.Playback
         internal ReplayRecordingTimeline Timeline = null!;
         internal int PartIndex;
 
-        internal static LoadedRecording Read(ArchiveIndex index, string path, CancellationToken cancellation)
+        internal static LoadedRecording Read(ArchiveIndex index, string path, CancellationToken cancellation,
+            Action<string, double>? progress = null)
         {
+            progress?.Invoke("Reading header", 0.01);
             cancellation.ThrowIfCancellationRequested();
             var full = Path.GetFullPath(path);
             var clip = index.Runs.SelectMany(run => run.Sessions).SelectMany(group => group.Days)
@@ -27,7 +29,10 @@ namespace LCReplay.Plugin.Playback
             var headerForLayout = ReplayReader.ReadHeader(full);
             if (headerForLayout.Metadata.TryGetValue("singleFile", out var singleFile) && singleFile == "true")
             {
-                var fileIndex = ReplayReader.IndexSingleFile(full, cancellation);
+                progress?.Invoke("Indexing recording", 0.03);
+                var fileIndex = ReplayReader.IndexSingleFile(full, cancellation, 48L * 1024 * 1024,
+                    value => progress?.Invoke("Indexing recording", 0.03 + value * 0.17));
+                fileIndex.ReuseWorldPayloads = true;
                 var windows = fileIndex.Windows.Select(window => new ReplayRecordingPart
                 {
                     FilePath = full,
@@ -35,12 +40,18 @@ namespace LCReplay.Plugin.Playback
                         ? started.AddSeconds(window.Start) : default,
                     Duration = window.Duration, Window = window
                 }).ToArray();
-                return new LoadedRecording { Session = ReplayReader.ReadWindow(fileIndex.Windows[0], cancellation),
+                progress?.Invoke("Reading first section", 0.20);
+                var firstWindow = ReplayReader.ReadWindow(fileIndex.Windows[0], cancellation,
+                    value => progress?.Invoke("Reading first section", 0.20 + value * 0.65));
+                progress?.Invoke("Preparing scene", 0.85);
+                return new LoadedRecording { Session = firstWindow,
                     Timeline = new ReplayRecordingTimeline(windows), PartIndex = 0 };
             }
             // A corrupt sibling must not prevent opening this independently recoverable file.
             // Read the selected file first so its errors and cancellation always propagate.
-            var session = ReplayReader.Read(full, cancellationToken: cancellation);
+            progress?.Invoke("Reading recording", 0.03);
+            var session = ReplayReader.Read(full, cancellationToken: cancellation,
+                progress: value => progress?.Invoke("Reading recording", 0.03 + value * 0.82));
             var metadata = new List<ReplayRecordingPart> { Metadata(full, session.Header, session.Duration) };
             var warnings = new List<string>();
             var first = selected;
@@ -72,6 +83,7 @@ namespace LCReplay.Plugin.Playback
             session.Warnings.AddRange(warnings);
             session.Header.Warnings.AddRange(warnings);
             cancellation.ThrowIfCancellationRequested();
+            progress?.Invoke("Preparing scene", 0.85);
             return new LoadedRecording { Timeline = new ReplayRecordingTimeline(metadata), PartIndex = selected - first, Session = session };
         }
 

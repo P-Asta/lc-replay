@@ -203,6 +203,7 @@ namespace LCReplay.Plugin.Library
                 var labels = clone.GetComponentsInChildren(textType, true).OfType<Component>().ToArray();
                 if (labels.Length != 1) throw new InvalidOperationException("Settings has an unsupported label layout.");
                 Set(labels[0], "text", "> Replay");
+                // The Settings clone keeps the game's font, colors and hover animation.
                 clone.transform.SetParent(parent, false);
                 clone.transform.SetSiblingIndex(settings.transform.GetSiblingIndex() + 1);
                 var replayRow = new Row((RectTransform)clone.transform, replayButton!);

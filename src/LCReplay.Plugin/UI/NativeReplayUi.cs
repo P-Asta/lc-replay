@@ -13,14 +13,15 @@ using Object = UnityEngine.Object;
 
 namespace LCReplay.Plugin.UI
 {
-    /// <summary>Independent game-native controls. No game prefab or third-party asset is copied.</summary>
+    /// <summary>Independent game-native controls styled after LethalConfig's solid red menu.</summary>
     public sealed class NativeReplayUi : IDisposable
     {
-        public static readonly Color Orange = new Color(0.98f, 0.632f, 0.263f, 1);
-        public static readonly Color Black = new Color(0.18f, 0, 0, 0.98f);
-        public static readonly Color Gray = new Color(0.247f, 0, 0, 1);
-        public static readonly Color White = new Color(1, 0.79f, 0.50f, 1);
-        public static readonly Color ButtonColor = new Color(0.369f, 0, 0, 1);
+        public static readonly Color Orange = new Color(1f, 0.52f, 0.13f, 1f);
+        public static readonly Color Black = new Color(0.18f, 0.005f, 0.005f, 1f);
+        public static readonly Color Gray = new Color(0.29f, 0.012f, 0.01f, 1f);
+        public static readonly Color White = new Color(1f, 0.86f, 0.64f, 1f);
+        public static readonly Color ButtonColor = new Color(0.42f, 0.025f, 0.015f, 1f);
+        public static readonly Color HeaderColor = new Color(0.34f, 0.01f, 0.008f, 1f);
         private readonly Dictionary<Behaviour, bool> _suspended = new Dictionary<Behaviour, bool>();
         private readonly Dictionary<Selectable, bool> _selectableStates = new Dictionary<Selectable, bool>();
         private readonly List<Object> _ownedAssets = new List<Object>();
@@ -127,7 +128,7 @@ namespace LCReplay.Plugin.UI
             return image;
         }
 
-        public TextMeshProUGUI CreateText(Transform parent, string value, float size = 24, Color? color = null, TextAlignmentOptions alignment = TextAlignmentOptions.TopLeft)
+        public TextMeshProUGUI CreateText(Transform parent, string value, float size = 21, Color? color = null, TextAlignmentOptions alignment = TextAlignmentOptions.TopLeft)
         {
             EnsureGlyphs(value);
             var text = NewRect(parent, "Label").gameObject.AddComponent<TextMeshProUGUI>();
@@ -152,15 +153,15 @@ namespace LCReplay.Plugin.UI
             button.targetGraphic = panel;
             var colors = button.colors;
             colors.normalColor = Color.white;
-            colors.highlightedColor = new Color(1.5f, 1.2f, 1.2f);
-            colors.pressedColor = new Color(0.75f, 0.75f, 0.75f);
+            colors.highlightedColor = new Color(1.25f, 1.13f, 1.07f);
+            colors.pressedColor = new Color(0.73f, 0.63f, 0.59f);
             colors.selectedColor = colors.highlightedColor;
-            colors.disabledColor = new Color(0.55f, 0.55f, 0.55f, 0.65f);
+            colors.disabledColor = new Color(0.55f, 0.55f, 0.55f, 1f);
             colors.colorMultiplier = 1;
-            colors.fadeDuration = 0.06f;
+            colors.fadeDuration = 0.12f;
             button.colors = colors;
-            var text = CreateText(button.transform, label, 25, filled ? Black : Orange, TextAlignmentOptions.MidlineLeft);
-            SetRect(text.rectTransform, Vector2.zero, Vector2.one, new Vector2(14, 3), new Vector2(-14, -3));
+            var text = CreateText(button.transform, label, 19, filled ? White : Orange, TextAlignmentOptions.MidlineLeft);
+            SetRect(text.rectTransform, Vector2.zero, Vector2.one, new Vector2(9, 2), new Vector2(-9, -2));
             button.onClick.AddListener(() => click());
             var navigation = button.navigation;
             navigation.mode = Navigation.Mode.Automatic;
@@ -189,11 +190,11 @@ namespace LCReplay.Plugin.UI
             scroll.scrollSensitivity = 42;
             scroll.inertia = false;
             var track = CreatePanel(outer, "Scrollbar", Black);
-            SetRect(track.rectTransform, new Vector2(1, 0), Vector2.one, new Vector2(-13, 0), Vector2.zero);
+            SetRect(track.rectTransform, new Vector2(1, 0), Vector2.one, new Vector2(-10, 0), Vector2.zero);
             var scrollbar = track.gameObject.AddComponent<Scrollbar>();
             var slidingArea = NewRect(track.transform, "Sliding Area");
             Stretch(slidingArea);
-            var handle = CreatePanel(slidingArea, "Handle", ButtonColor);
+            var handle = CreatePanel(slidingArea, "Handle", Orange);
             Stretch(handle.rectTransform);
             scrollbar.handleRect = handle.rectTransform;
             scrollbar.targetGraphic = handle;
@@ -216,7 +217,7 @@ namespace LCReplay.Plugin.UI
             var handleArea = NewRect(root, "Handle area");
             SetRect(handleArea, new Vector2(0, 0.5f), new Vector2(1, 0.5f), new Vector2(7, -13), new Vector2(-7, 13));
             var handle = CreatePanel(handleArea, "Handle", White);
-            handle.rectTransform.sizeDelta = new Vector2(12, 0);
+            handle.rectTransform.sizeDelta = new Vector2(10, 0);
             slider.fillRect = fill.rectTransform;
             slider.handleRect = handle.rectTransform;
             slider.targetGraphic = handle;
@@ -231,6 +232,27 @@ namespace LCReplay.Plugin.UI
             var right = CreatePanel(rect, "Border R", color); SetRect(right.rectTransform, new Vector2(1, 0), Vector2.one, new Vector2(-thickness, 0), Vector2.zero); right.raycastTarget = false;
             var bottom = CreatePanel(rect, "Border B", color); SetRect(bottom.rectTransform, Vector2.zero, new Vector2(1, 0), Vector2.zero, new Vector2(0, thickness)); bottom.raycastTarget = false;
             var top = CreatePanel(rect, "Border T", color); SetRect(top.rectTransform, new Vector2(0, 1), Vector2.one, new Vector2(0, -thickness), Vector2.zero); top.raycastTarget = false;
+        }
+
+        public RectTransform CreateWindow(Transform parent, string name, string title, float headerHeight = 42)
+        {
+            var panel = CreatePanel(parent, name, Black);
+            AddBorder(panel.rectTransform, Orange, 2);
+            AddTitleBar(panel.rectTransform, title, headerHeight);
+            return panel.rectTransform;
+        }
+
+        public TextMeshProUGUI AddTitleBar(RectTransform parent, string title, float height = 42)
+        {
+            var bar = CreatePanel(parent, title + " title bar", HeaderColor);
+            SetRect(bar.rectTransform, new Vector2(0, 1), Vector2.one,
+                new Vector2(2, -height - 2), new Vector2(-2, -2));
+            bar.raycastTarget = false;
+            var label = CreateText(bar.transform, title, 23, Orange, TextAlignmentOptions.Center);
+            Stretch(label.rectTransform, 4);
+            label.fontStyle = FontStyles.Bold;
+            label.characterSpacing = 2;
+            return label;
         }
 
         public static RectTransform NewRect(Transform parent, string name)

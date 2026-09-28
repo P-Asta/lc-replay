@@ -295,6 +295,130 @@ namespace LCReplay.Core.Archive
             return new ArchiveScanner(RootDirectory, limits ?? new ArchiveScanLimits(), segments, folders).Scan();
         }
 
+        /// <summary>Deletes one indexed recording and its own sidecars.</summary>
+        public int DeleteRecording(ArchiveDay recording) => DeleteRecordings(new[] { recording });
+
+        /// <summary>Deletes the recordings in a selected archive folder after validating every path.</summary>
+        public int DeleteRecordings(IReadOnlyCollection<ArchiveDay> recordings)
+        {
+            if (recordings == null) throw new ArgumentNullException(nameof(recordings));
+            if (recordings.Count == 0 || recordings.Count > 10000)
+                throw new ArgumentException("Select at least one bounded recording to delete.", nameof(recordings));
+            lock (gate)
+            {
+                var root = RootDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var files = new List<string>();
+                var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var recording in recordings)
+                {
+                    if (recording == null) throw new ArgumentException("A selected recording is null.", nameof(recordings));
+                    var directory = Path.GetFullPath(recording.DirectoryPath);
+                    EnsureSafePath(directory);
+                    directories.Add(directory);
+                    if (recording.Segments.Count == 0)
+                    {
+                        var emptyManifest = DayManifestPath(recording);
+                        if (File.Exists(emptyManifest) && DayManifestMatches(emptyManifest, recording.Id)) files.Add(emptyManifest);
+                    }
+                    foreach (var segment in recording.Segments)
+                    {
+                        var file = Path.GetFullPath(segment.FilePath);
+                        EnsureSafePath(file);
+                        if (!string.Equals(Path.GetDirectoryName(file), directory, StringComparison.OrdinalIgnoreCase) ||
+                            !string.Equals(Path.GetExtension(file), ".lcr", StringComparison.OrdinalIgnoreCase) ||
+                            !selected.Add(file))
+                            throw new IOException("The selected recording contains an invalid or duplicate replay path.");
+                        if (activeSegments.Contains(file)) throw new InvalidOperationException("The selected recording is still being saved.");
+                        if (!File.Exists(file)) throw new FileNotFoundException("The selected recording changed; refresh the archive before deleting.", file);
+                        files.Add(file);
+                        files.Add(Path.ChangeExtension(file, ".lci"));
+                        files.Add(Path.ChangeExtension(file, ".json"));
+                        if (recording.RecordingStem.Length != 0)
+                        {
+                            if (!string.Equals(Path.GetFileNameWithoutExtension(file), recording.RecordingStem, StringComparison.OrdinalIgnoreCase))
+                                throw new IOException("The selected recording stem does not match its replay file.");
+                            files.Add(Path.Combine(directory, recording.RecordingStem + ".day.json"));
+                        }
+                    }
+                }
+                if (selected.Count == 0) throw new InvalidOperationException("The selected archive item has no replay files to delete.");
+                foreach (var recording in recordings.Where(day => day.RecordingStem.Length == 0))
+                {
+                    var directory = Path.GetFullPath(recording.DirectoryPath);
+                    if (string.Equals(directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root, StringComparison.OrdinalIgnoreCase)) continue;
+                    var dayManifest = Path.Combine(directory, "day.json");
+                    if (File.Exists(dayManifest) &&
+                        Directory.EnumerateFiles(directory, "*.lcr", SearchOption.TopDirectoryOnly)
+                            .All(file => selected.Contains(Path.GetFullPath(file))) &&
+                        DayManifestMatches(dayManifest, recording.Id))
+                        files.Add(dayManifest);
+                }
+                foreach (var file in files.Distinct(StringComparer.OrdinalIgnoreCase)) EnsureSafePath(file);
+                foreach (var file in files.Distinct(StringComparer.OrdinalIgnoreCase))
+                    if (File.Exists(file)) File.Delete(file);
+                var cleanup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var directory in directories)
+                    for (string? current = directory; current != null &&
+                        !string.Equals(current.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root, StringComparison.OrdinalIgnoreCase);
+                        current = Path.GetDirectoryName(current))
+                        cleanup.Add(current);
+                foreach (var directory in cleanup.OrderByDescending(path => path.Length))
+                {
+                    EnsureSafePath(directory);
+                    if (!Directory.Exists(directory) || activeFolders.Contains(directory)) continue;
+                    PruneEmptyQuotaMetadata(directory);
+                    var entries = Directory.EnumerateFileSystemEntries(directory).ToArray();
+                    if (entries.Length == 1 && new[] { "quota.json", "session.json", "run.json" }
+                        .Contains(Path.GetFileName(entries[0]), StringComparer.OrdinalIgnoreCase))
+                    { EnsureSafePath(entries[0]); File.Delete(entries[0]); entries = Array.Empty<string>(); }
+                    if (entries.Length == 0) Directory.Delete(directory);
+                }
+                return selected.Count;
+            }
+        }
+
+        private void PruneEmptyQuotaMetadata(string directory)
+        {
+            var quotaManifest = Path.Combine(directory, "quota.json");
+            if (!File.Exists(quotaManifest) || Directory.EnumerateDirectories(directory).Any() ||
+                Directory.EnumerateFiles(directory, "*.lcr", SearchOption.TopDirectoryOnly).Any() ||
+                activeSegments.Any(file => string.Equals(Path.GetDirectoryName(file), directory, StringComparison.OrdinalIgnoreCase))) return;
+            var files = Directory.EnumerateFiles(directory).ToArray();
+            if (files.Any(file => !string.Equals(file, quotaManifest, StringComparison.OrdinalIgnoreCase) &&
+                !file.EndsWith(".day.json", StringComparison.OrdinalIgnoreCase))) return;
+            ArchiveSession? quota;
+            try
+            {
+                if (new FileInfo(quotaManifest).Length > 128 * 1024) return;
+                quota = JsonConvert.DeserializeObject<ArchiveSession>(File.ReadAllText(quotaManifest), JsonSettings);
+                if (quota == null || string.IsNullOrEmpty(quota.Id) || string.IsNullOrEmpty(quota.RunId)) return;
+                foreach (var file in files.Where(file => !string.Equals(file, quotaManifest, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (new FileInfo(file).Length > 128 * 1024) return;
+                    var day = JsonConvert.DeserializeObject<ArchiveDay>(File.ReadAllText(file), JsonSettings);
+                    if (day == null || day.SessionId != quota.Id || day.RunId != quota.RunId ||
+                        !string.Equals(day.RecordingStem + ".day.json", Path.GetFileName(file), StringComparison.OrdinalIgnoreCase)) return;
+                }
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is JsonException || error is System.Security.SecurityException) { return; }
+            foreach (var file in files.Where(file => !string.Equals(file, quotaManifest, StringComparison.OrdinalIgnoreCase)))
+            { EnsureSafePath(file); File.Delete(file); }
+        }
+
+        private static bool DayManifestMatches(string file, string id)
+        {
+            try
+            {
+                if (new FileInfo(file).Length > 128 * 1024) return false;
+                var day = JsonConvert.DeserializeObject<ArchiveDay>(File.ReadAllText(file), JsonSettings);
+                return day != null && string.Equals(day.Id, id, StringComparison.Ordinal);
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is JsonException || error is System.Security.SecurityException) { return false; }
+        }
+
         private void CreateFolder(ArchiveFolder folder, string manifest)
         {
             for (int attempt = 0; attempt < 16; attempt++)

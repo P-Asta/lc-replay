@@ -78,20 +78,33 @@ namespace LCReplay.Plugin.Capture
 
         // Render-only geometry: no prefabs, scripts, colliders or serialized Unity objects.
         public static CaptureJob Begin(EntityTracker tracker, int maxObjects, int maxVertices, string layer, string captureSetId,
-            ISet<string> alreadyCaptured, bool includeContext, MeshSnapshotReader.StaticBatchReader staticBatches)
+            ISet<string> alreadyCaptured, bool includeContext, MeshSnapshotReader.StaticBatchReader staticBatches,
+            SceneAssetCapture? sceneAssets = null, ISet<string>? onlyEntityIds = null)
         {
             if (layer != "exterior" && layer != "interior") throw new ArgumentException("Unknown capture layer.", nameof(layer));
             var job = new CaptureJob { Snapshot = new WorldSnapshot { Scene = SceneManager.GetActiveScene().name, Layer = layer, CaptureSetId = captureSetId } };
-            job.Start(CaptureSteps(job, tracker, maxObjects, maxVertices, layer, alreadyCaptured, includeContext, staticBatches));
+            job.Start(CaptureSteps(job, tracker, maxObjects, maxVertices, layer, alreadyCaptured, includeContext, staticBatches, sceneAssets, onlyEntityIds));
             return job;
         }
 
         private static IEnumerable<bool> CaptureSteps(CaptureJob job, EntityTracker tracker, int maxObjects, int maxVertices,
-            string layer, ISet<string> alreadyCaptured, bool includeContext, MeshSnapshotReader.StaticBatchReader staticBatches)
+            string layer, ISet<string> alreadyCaptured, bool includeContext, MeshSnapshotReader.StaticBatchReader staticBatches,
+            SceneAssetCapture? sceneAssets, ISet<string>? onlyEntityIds)
         {
             var captured = job.Captured;
             var deferred = 0;
             var world = job.Snapshot;
+            var rendererAssetPaths = new HashSet<string>(StringComparer.Ordinal);
+            var terrainAssetPaths = new HashSet<string>(StringComparer.Ordinal);
+            if (layer == "exterior")
+            {
+                var round = GameAccess.Singleton("StartOfRound");
+                var manager = GameAccess.Singleton("RoundManager");
+                world.MapSeed = SafeInt(GameAccess.Read(round, "randomMapSeed"));
+                world.LevelId = SafeInt(GameAccess.Read(round, "currentLevelID"), -1);
+                world.DungeonFlow = SafeInt(GameAccess.Read(manager, "currentDungeonType"), -1);
+                world.DungeonSeed = SafeInt(GameAccess.Read(GameAccess.Read(GameAccess.Read(manager, "dungeonGenerator"), "Generator"), "Seed"));
+            }
             var appearance = new AppearanceCapture(world);
             var visibility = tracker.Visibility;
             var anchors = MovingAnchors(GameAccess.Singleton("StartOfRound")).ToArray();
@@ -120,16 +133,26 @@ namespace LCReplay.Plugin.Capture
             int cameraMask = CaptureVisibility.GameplayMask();
             var skipped = 0;
             var tileType = GameAccess.Type("DunGen.Tile");
+            var shipDoorAnimator = GameAccess.Find("HangarShipDoor")
+                .Select(door => GameAccess.Read(door, "shipDoorsAnimator") as Animator)
+                .FirstOrDefault(animator => animator);
+            var tileBounds = CaptureVisibility.TileVolumes();
             var orderedRenderers = new List<RendererOrder>();
-            foreach (var candidate in Object.FindObjectsOfType<Renderer>(true))
+            var candidates = onlyEntityIds == null ? Object.FindObjectsOfType<Renderer>(true).AsEnumerable() :
+                tracker.Entries.Where(entry => onlyEntityIds.Contains(entry.Id) && entry.Component)
+                    .SelectMany(entry => entry.Component.GetComponentsInChildren<Renderer>(true)).Distinct();
+            foreach (var candidate in candidates)
             {
                 yield return true;
                 if (!candidate) continue;
                 var distance = DistanceToViewpoints(candidate, viewpoints);
                 var size = candidate.bounds.size;
                 var nearby = viewpoints.Length != 0 && Math.Max(size.x, Math.Max(size.y, size.z)) <= 60f && distance <= 400f;
+                var essentialGround = RenderVisibilityPolicy.IsGroundSurface(candidate.name) ||
+                    RenderVisibilityPolicy.IsRockSurface(candidate.name);
                 orderedRenderers.Add(new RendererOrder(candidate,
-                    candidate is SkinnedMeshRenderer ? 0 : nearby ? 1 : visibility.Rooms.ContainsKey(candidate) ? 3 : 2,
+                    candidate is SkinnedMeshRenderer ? 0 : essentialGround ? 1 : nearby ? 2 :
+                    visibility.Rooms.ContainsKey(candidate) ? 4 : 3,
                     distance));
             }
             // Sort cached scalar keys, never renderer.bounds inside the comparer.
@@ -155,19 +178,41 @@ namespace LCReplay.Plugin.Capture
                 EntityTracker.Entry? owner = null;
                 for (var parent = renderer.transform; parent; parent = parent.parent)
                     if (owners.TryGetValue(parent, out owner)) break;
+                if (onlyEntityIds != null && (owner == null || !onlyEntityIds.Contains(owner.Id))) continue;
+                var shipDoorRenderer = owner == null && shipDoorAnimator &&
+                    renderer.transform.IsChildOf(shipDoorAnimator!.transform);
                 var tile = tileType == null ? null : renderer.GetComponentInParent(tileType);
-                var interior = visibility.Rooms.ContainsKey(renderer) || tile != null;
+                var roomId = shipDoorRenderer ? "" : visibility.Rooms.TryGetValue(renderer, out var managedRoom) && managedRoom.Length != 0 ? managedRoom :
+                    tile ? "r" + tile!.GetInstanceID() : SpatialRoom(renderer.bounds.center, renderer.name, tileBounds);
+                var interior = roomId.Length != 0;
                 if (layer == "interior" && (!interior || owner != null)) continue;
                 if (layer == "exterior" && interior && owner == null) continue;
+                var movingSceneRenderer = owner == null && (shipDoorRenderer || interior && IsMovingSceneRenderer(renderer, tile));
+                if (layer == "exterior" && includeContext && sceneAssets != null && owner == null && !movingSceneRenderer &&
+                    sceneAssets.TryRenderer(renderer, out var assetPath) &&
+                    CaptureVisibility.VisibleLayer(renderer, cameraMask, visibility.CullerManaged.Contains(renderer)) &&
+                    visibility.Enabled(renderer) && renderer.gameObject.activeInHierarchy &&
+                    SceneAssetPaths.IsValidReference(assetPath) &&
+                    world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count < 4096 &&
+                    rendererAssetPaths.Add(assetPath))
+                {
+                    AttachAssetScene(world, sceneAssets);
+                    world.AssetRendererPaths.Add(assetPath);
+                    captured.Add(rendererId);
+                    tracker.Visual.Track(renderer, assetPath, true, visibility.CullerManaged.Contains(renderer) ||
+                        visibility.NaturalLods.ContainsKey(renderer) || visibility.TileLods.Contains(renderer));
+                    continue;
+                }
                 if (world.Geometry.Count >= maxObjects) { skipped++; deferred++; continue; }
                 if (owner?.Kind != "player" && visibility.OtherLods.Contains(renderer)) { lods++; continue; }
                 // Trigger/placement volumes have enabled renderers on layers excluded by the gameplay camera.
                 // Flattening every layer onto the replay layer would turn these invisible volumes into solid walls.
                 if (owner?.Kind != "player" && !CaptureVisibility.VisibleLayer(renderer, cameraMask,
-                    visibility.CullerManaged.Contains(renderer) || visibility.NaturalLods.ContainsKey(renderer)))
+                    visibility.CullerManaged.Contains(renderer) || visibility.NaturalLods.ContainsKey(renderer) ||
+                    visibility.TileLods.Contains(renderer)))
                 { invisible++; continue; }
                 // Keep disabled entity meshes available for later per-frame visibility changes.
-                if (owner == null && (!visibility.Enabled(renderer) || !renderer.gameObject.activeInHierarchy)) continue;
+                if (owner == null && !movingSceneRenderer && (!visibility.Enabled(renderer) || !renderer.gameObject.activeInHierarchy)) continue;
                 if (owner != null && !EntityTracker.IsCapturedRenderer(owner, renderer)) continue;
                 if (owner?.Kind == "player" && !GameAccess.Bool(owner.Component, "isPlayerControlled") && !GameAccess.Bool(owner.Component, "isPlayerDead")) continue;
                 var filter = renderer.GetComponent<MeshFilter>();
@@ -180,6 +225,11 @@ namespace LCReplay.Plugin.Capture
                     EntityId = owner?.Id ?? "", Position = GameAccess.Vec(transform.position), Rotation = GameAccess.Rot(transform.rotation),
                     Scale = GameAccess.Vec(transform.lossyScale), BoundsCenter = GameAccess.Vec(mesh.bounds.center),
                     BoundsSize = GameAccess.Vec(mesh.bounds.size), Color = ReadColor(renderer), IsBoundsProxy = true };
+                if (movingSceneRenderer)
+                {
+                    geometry.IsMovingSceneRenderer = true;
+                    geometry.Active = renderer.gameObject.activeInHierarchy && visibility.Enabled(renderer);
+                }
                 if (owner == null && visibility.NaturalLods.TryGetValue(renderer, out var naturalLod))
                 {
                     geometry.LodGroupId = naturalLod.Id;
@@ -187,10 +237,10 @@ namespace LCReplay.Plugin.Capture
                     geometry.LodCenter = GameAccess.Vec(naturalLod.Center);
                     geometry.LodSwitchDistance = naturalLod.Distance;
                 }
-                if (owner == null && interior)
+                if (interior)
                 {
                     geometry.IsInterior = true;
-                    geometry.RoomId = visibility.Rooms.TryGetValue(renderer, out var room) ? room : "r" + tile!.GetInstanceID();
+                    geometry.RoomId = roomId;
                 }
                 if (owner != null)
                 {
@@ -275,6 +325,16 @@ namespace LCReplay.Plugin.Capture
                 if (geometry.IsInterior && !geometry.IsBoundsProxy) interiors++;
                 world.Geometry.Add(geometry);
                 captured.Add(rendererId);
+                if (movingSceneRenderer)
+                    tracker.TrackMovingSceneRenderer(renderer, anchors.FirstOrDefault(anchor => anchor.Key == geometry.AnchorId).Value);
+                else if (owner == null && !geometry.IsBoundsProxy)
+                    tracker.Visual.Track(renderer, rendererId, false, visibility.CullerManaged.Contains(renderer) ||
+                        visibility.NaturalLods.ContainsKey(renderer) || visibility.TileLods.Contains(renderer));
+            }
+            if (onlyEntityIds != null)
+            {
+                job.Summary = $"late entities: {world.Geometry.Count} render objects, {skinned} animated skins, {bakedActors} baked skins";
+                yield break;
             }
             // Unity Terrain has no MeshFilter. Sample its height field at a useful
             // spectator resolution, yielding between rows to protect gameplay frames.
@@ -284,6 +344,18 @@ namespace LCReplay.Plugin.Capture
                 if (!terrain || !terrain.terrainData) continue;
                 var terrainId = "terrain" + terrain.GetInstanceID();
                 if (alreadyCaptured.Contains(terrainId)) continue;
+                if (includeContext && sceneAssets != null && sceneAssets.TryTerrain(terrain, out var assetTerrainPath) &&
+                    terrain.enabled && terrain.gameObject.activeInHierarchy &&
+                    (cameraMask & (1 << terrain.gameObject.layer)) != 0 &&
+                    SceneAssetPaths.IsValidReference(assetTerrainPath) &&
+                    world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count < 4096 &&
+                    terrainAssetPaths.Add(assetTerrainPath))
+                {
+                    AttachAssetScene(world, sceneAssets);
+                    world.AssetTerrainPaths.Add(assetTerrainPath);
+                    captured.Add(terrainId);
+                    continue;
+                }
                 if (world.Geometry.Count >= maxObjects) { skipped++; deferred++; continue; }
                 var data = terrain.terrainData;
                 var grid = Math.Min(128, Math.Max(32, data.heightmapResolution - 1));
@@ -380,15 +452,20 @@ namespace LCReplay.Plugin.Capture
                     if (!system || !system.isPlaying || !system.gameObject.activeInHierarchy ||
                         !system.gameObject.scene.IsValid() || !system.gameObject.scene.isLoaded) continue;
                     var renderer = system.GetComponent<ParticleSystemRenderer>();
-                    if (!renderer || !renderer.enabled || CaptureVisibility.IsDebugRenderer(renderer) ||
-                        !CaptureVisibility.VisibleLayer(renderer, cameraMask)) continue;
+                    if (!renderer || !visibility.Enabled(renderer) || CaptureVisibility.IsDebugRenderer(renderer) ||
+                        !CaptureVisibility.VisibleLayer(renderer, cameraMask, visibility.CullerManaged.Contains(renderer))) continue;
                     var main = system.main; var emission = system.emission;
                     if (!main.loop || !emission.enabled) continue;
                     EntityTracker.Entry? owner = null;
                     for (var parent = system.transform; parent; parent = parent.parent)
                         if (owners.TryGetValue(parent, out owner)) break;
+                    // Turret firing is sampled from its actual per-frame particles, not a forever-looping baseline.
+                    var turretType = GameAccess.Type("Turret");
+                    if (turretType != null && system.GetComponentInParent(turretType)) continue;
                     var tile = tileType == null ? null : system.GetComponentInParent(tileType);
-                    var interior = visibility.Rooms.ContainsKey(renderer) || tile != null;
+                    var roomId = visibility.Rooms.TryGetValue(renderer, out var managedRoom) && managedRoom.Length != 0 ? managedRoom :
+                        tile ? "r" + tile!.GetInstanceID() : SpatialRoom(renderer.bounds.center, renderer.name, tileBounds);
+                    var interior = roomId.Length != 0;
                     if (layer == "interior" && (!interior || owner != null)) continue;
                     if (layer == "exterior" && interior && owner == null) continue;
                     var position = owner == null ? system.transform.position : owner.Component.transform.InverseTransformPoint(system.transform.position);
@@ -397,8 +474,8 @@ namespace LCReplay.Plugin.Capture
                     var color = main.startColor.color;
                     var shape = system.shape;
                     var snapshot = new ParticleEmitterSnapshot { Id = "p" + system.GetInstanceID(), Name = system.name,
-                        EntityId = owner?.Id ?? "", IsInterior = interior && owner == null,
-                        RoomId = visibility.Rooms.TryGetValue(renderer, out var room) ? room : tile ? "r" + tile!.GetInstanceID() : "",
+                        EntityId = owner?.Id ?? "", IsInterior = interior,
+                        RoomId = roomId,
                         Position = GameAccess.Vec(position), Rotation = GameAccess.Rot(rotation),
                         Color = new[] { Finite(color.r, 1), Finite(color.g, 1), Finite(color.b, 1), Finite(color.a, 1) },
                         Rate = Mathf.Clamp(emission.rateOverTime.constant, 0, 1000),
@@ -409,9 +486,21 @@ namespace LCReplay.Plugin.Capture
                     var appearanceGeometry = new GeometrySnapshot();
                     try { appearance.Capture(renderer, appearanceGeometry); } catch { }
                     snapshot.MaterialId = appearanceGeometry.MaterialIds.Count != 0 ? appearanceGeometry.MaterialIds[0] : "";
+                    snapshot.Style = ParticleCapture.Style(system, renderer);
+                    if (owner != null)
+                    {
+                        var sourceScale = system.transform.lossyScale;
+                        var ownerScale = owner.Component.transform.lossyScale;
+                        snapshot.Style.Scale = new Vec3(Div(sourceScale.x, ownerScale.x),
+                            Div(sourceScale.y, ownerScale.y), Div(sourceScale.z, ownerScale.z));
+                    }
                     world.ParticleEmitters.Add(snapshot);
                 }
-            if (includeContext) CaptureLights(world, anchors, layer == "interior");
+            if (includeContext)
+            {
+                CaptureLights(world, anchors, layer == "interior");
+                if (layer == "interior") CaptureEmissiveRooms(world);
+            }
             var localFogMaskBytes = 0;
             if (includeContext)
                 foreach (var fog in GameAccess.Find("UnityEngine.Rendering.HighDefinition.LocalVolumetricFog"))
@@ -478,25 +567,34 @@ namespace LCReplay.Plugin.Capture
                     }
                     world.LocalFogs.Add(snapshot);
                 }
-            var representedRooms = new HashSet<string>(world.Geometry.Where(geometry => geometry.IsInterior && !geometry.IsBoundsProxy &&
-                geometry.RoomId.Length != 0).Select(geometry => geometry.RoomId), StringComparer.Ordinal);
-            foreach (var tile in layer == "interior" && includeContext ? GameAccess.Find("DunGen.Tile").Take(4096) : Enumerable.Empty<Component>())
+            foreach (var group in (layer == "interior" && includeContext ? tileBounds : Array.Empty<KeyValuePair<string, Bounds>>()).GroupBy(tile => tile.Key))
             {
-                var id = "r" + tile.GetInstanceID();
-                if (!representedRooms.Contains(id)) continue;
-                if (!(GameAccess.Read(tile, "Bounds") is Bounds bounds) || !GameAccess.Finite(bounds.center) ||
-                    !GameAccess.Finite(bounds.size) || bounds.size.x <= 0 || bounds.size.y <= 0 || bounds.size.z <= 0 ||
-                    bounds.size.x > 10000 || bounds.size.y > 10000 || bounds.size.z > 10000) continue;
-                world.Rooms.Add(new RoomSnapshot { Id = id, Center = GameAccess.Vec(bounds.center),
-                    Size = GameAccess.Vec(bounds.size) });
+                var bounds = group.First().Value;
+                world.Rooms.Add(new RoomSnapshot { Id = group.Key, Center = GameAccess.Vec(bounds.center),
+                    Size = GameAccess.Vec(bounds.size), AdditionalVolumes = group.Skip(1).Select(volume =>
+                        new RoomVolumeSnapshot { Center = GameAccess.Vec(volume.Value.center), Size = GameAccess.Vec(volume.Value.size) }).ToList() });
             }
             if (layer == "exterior" && includeContext) world.Environment = EnvironmentCapture.Capture();
             job.Deferred = deferred;
             job.Summary = $"{layer}: {world.Geometry.Count} render objects, {usedVertices} vertices, {world.Textures.Count} textures, {world.Materials.Count} materials, "
+                + $"{world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count} installed-scene surfaces, "
                 + $"{skinned} animated skins, {bakedActors} baked skins, {boxes} bounds proxies, {invisible} camera-hidden renderers excluded, "
                 + $"{debug} debug renderers excluded, {lods} duplicate LODs excluded, {reused} shared meshes, {interiors} interior renderers, "
                 + $"{world.Lights.Count} lights, {world.ParticleEmitters.Count} particle emitters, {world.LocalFogs.Count} local fogs, {world.Rooms.Count} rooms, {world.Environment?.Components.Count ?? 0} environment components, "
                 + $"{skipped} objects and {appearance.OmittedTextures} textures omitted by budget/readback";
+        }
+
+        private static void AttachAssetScene(WorldSnapshot world, SceneAssetCapture sceneAssets)
+        {
+            world.AssetScene = sceneAssets.SceneName;
+            world.AssetBuildIndex = sceneAssets.BuildIndex;
+            world.AssetGameVersion = Application.version;
+        }
+
+        private static int SafeInt(object? value, int fallback = 0)
+        {
+            try { return value == null ? fallback : Convert.ToInt32(value); }
+            catch { return fallback; }
         }
 
         private static void CaptureLights(WorldSnapshot world, KeyValuePair<string, Transform>[] anchors, bool interiorLayer)
@@ -504,7 +602,8 @@ namespace LCReplay.Plugin.Capture
             var rooms = new Dictionary<string, Bounds>();
             foreach (var geometry in world.Geometry)
             {
-                if (!geometry.IsInterior || geometry.RoomId.Length == 0 || geometry.IsBoundsProxy) continue;
+                if (!geometry.IsInterior || geometry.EntityId.Length != 0 ||
+                    geometry.RoomId.Length == 0 || geometry.IsBoundsProxy) continue;
                 // Captured room bounds are an approximate indoor marker for nearby lights.
                 var bounds = new Bounds(new Vector3(geometry.Position.X, geometry.Position.Y, geometry.Position.Z),
                     new Vector3(geometry.BoundsSize.X, geometry.BoundsSize.Y, geometry.BoundsSize.Z));
@@ -513,9 +612,10 @@ namespace LCReplay.Plugin.Capture
             }
             foreach (var light in Object.FindObjectsOfType<Light>(true))
             {
-                if (world.Lights.Count >= 128) break;
-                if (!light || !light.enabled || !light.gameObject.activeInHierarchy || !light.gameObject.scene.IsValid() || !light.gameObject.scene.isLoaded ||
-                    (light.type != LightType.Directional && light.type != LightType.Point && light.type != LightType.Spot) ||
+                if (world.Lights.Count >= 480) break;
+                if (!light || !light.gameObject.activeInHierarchy || !light.gameObject.scene.IsValid() || !light.gameObject.scene.isLoaded ||
+                    (light.type != LightType.Directional && light.type != LightType.Point && light.type != LightType.Spot &&
+                     light.type != LightType.Rectangle && light.type != LightType.Disc) ||
                     !GameAccess.Finite(light.transform.position) || !GameAccess.Finite(light.transform.rotation) ||
                     !GameAccess.Finite(light.intensity) || !GameAccess.Finite(light.range)) continue;
                 var position = light.transform.position;
@@ -532,11 +632,57 @@ namespace LCReplay.Plugin.Capture
                     ((tileType != null && light.GetComponentInParent(tileType) != null) ||
                      rooms.Values.Any(room => room.SqrDistance(light.transform.position) < 16f));
                 if (indoor != interiorLayer) continue;
+                // Tile culling can disable a room light for the recorder's
+                // camera. The replay spectator needs the fixture when nearby.
+                if (!light.enabled && (tileType == null || !light.GetComponentInParent(tileType))) continue;
                 world.Lights.Add(new LightSnapshot { Id = "l" + light.GetInstanceID(), AnchorId = anchor?.Key ?? "", IsInterior = indoor,
-                    Type = light.type.ToString(), Position = GameAccess.Vec(position), Rotation = GameAccess.Rot(rotation),
-                    Color = new[] { color.r, color.g, color.b, color.a }, Intensity = Mathf.Clamp(light.intensity, 0, 1000000),
-                    Range = Mathf.Clamp(light.range, 0, 100000), SpotAngle = Mathf.Clamp(light.spotAngle, 0, 180),
+                    Type = light.type == LightType.Rectangle || light.type == LightType.Disc ? "Point" : light.type.ToString(),
+                    Position = GameAccess.Vec(position), Rotation = GameAccess.Rot(rotation),
+                    Color = new[] { color.r, color.g, color.b, color.a },
+                    UseColorTemperature = light.useColorTemperature,
+                    ColorTemperature = GameAccess.Finite(light.colorTemperature)
+                        ? Mathf.Clamp(light.colorTemperature, 1000f, 20000f) : 6500f,
+                    Intensity = Mathf.Clamp(light.intensity, 0, 1000000),
+                    Range = Mathf.Clamp(light.type == LightType.Rectangle || light.type == LightType.Disc ?
+                        Mathf.Max(6f, light.range) : light.range, 0, 100000),
+                    SpotAngle = Mathf.Clamp(light.spotAngle, 0, 180),
                     Shadows = light.shadows != LightShadows.None });
+            }
+        }
+        private static void CaptureEmissiveRooms(WorldSnapshot world)
+        {
+            var materials = world.Materials.ToDictionary(item => item.Id, item => item, StringComparer.Ordinal);
+            var strongest = new Dictionary<string, (GeometrySnapshot Geometry, Color Glow, float Strength)>(StringComparer.Ordinal);
+            foreach (var geometry in world.Geometry)
+            {
+                if (!geometry.IsInterior || geometry.RoomId.Length == 0 || geometry.IsBoundsProxy) continue;
+                foreach (var id in geometry.MaterialIds)
+                {
+                    if (!materials.TryGetValue(id, out var material)) continue;
+                    var emission = material.Properties.FirstOrDefault(property =>
+                        (property.Name == "_EmissiveColor" || property.Name == "_EmissionColor") &&
+                        property.Values.Length >= 3);
+                    if (emission == null) continue;
+                    var values = emission.Values;
+                    var strength = Mathf.Max(values[0], Mathf.Max(values[1], values[2]));
+                    if (strength < .5f || !GameAccess.Finite(strength)) continue;
+                    if (!strongest.TryGetValue(geometry.RoomId, out var previous) || strength > previous.Strength)
+                        strongest[geometry.RoomId] = (geometry,
+                            new Color(values[0] / strength, values[1] / strength, values[2] / strength, 1), strength);
+                }
+            }
+            foreach (var pair in strongest.OrderByDescending(item => item.Value.Strength).Take(32))
+            {
+                if (world.Lights.Count >= 512) break;
+                var source = pair.Value.Geometry;
+                var center = new Vector3(source.Position.X, source.Position.Y, source.Position.Z);
+                if (world.Lights.Any(light => light.IsInterior &&
+                    (new Vector3(light.Position.X, light.Position.Y, light.Position.Z) - center).sqrMagnitude < 64f)) continue;
+                var glow = pair.Value.Glow;
+                world.Lights.Add(new LightSnapshot { Id = "emissive:" + pair.Key, IsInterior = true,
+                    Type = "Point", Position = GameAccess.Vec(center), Color = new[] { glow.r, glow.g, glow.b, 1f },
+                    Intensity = Mathf.Clamp(pair.Value.Strength * 35f, 20f, 150f),
+                    Range = 12f, Shadows = false });
             }
         }
         private static float Div(float a, float b) => Math.Abs(b) < 0.00001f ? 1 : a / b;
@@ -579,6 +725,40 @@ namespace LCReplay.Plugin.Capture
             16L * (geometry.Vertices.LongLength + geometry.Normals.LongLength + geometry.Uvs.LongLength + geometry.Instances.LongLength + geometry.BindPoses.LongLength + geometry.BoneWeights.LongLength) +
             8L * (geometry.Triangles.LongLength + geometry.BoneIndices.LongLength + geometry.SubmeshTriangles.Sum(indices => indices.LongLength));
         private static bool IsVisualEntity(string kind) => kind != "round" && kind != "time" && kind != "terminal";
+
+        private static string SpatialRoom(Vector3 position, string rendererName, KeyValuePair<string, Bounds>[] rooms)
+        {
+            // A generated prop or spawned hazard need not be parented to its
+            // DunGen.Tile. Use the tile's world bounds as the fallback only for
+            // compact objects, so terrain and exterior foliage stay outdoors.
+            if (RenderVisibilityPolicy.IsGroundSurface(rendererName) ||
+                RenderVisibilityPolicy.IsVegetation(rendererName) ||
+                RenderVisibilityPolicy.IsRockSurface(rendererName)) return "";
+            foreach (var room in rooms)
+            {
+                var bounds = room.Value;
+                bounds.Expand(0.5f);
+                if (bounds.Contains(position)) return room.Key;
+            }
+            return "";
+        }
+
+        // Mansion furniture is usually part of a generated Tile, rather than an
+        // AnimatedObjectTrigger child. Its mesh therefore has no entity owner.
+        private static bool IsMovingSceneRenderer(Renderer renderer, Component? tile)
+        {
+            var name = renderer.name;
+            if (name.IndexOf("shelf", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("bookcase", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("bookshelf", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("door", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("cabinet", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("drawer", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            for (var parent = renderer.transform; parent && (!tile || parent != tile!.transform); parent = parent.parent)
+                if (parent.GetComponent<Animator>() || parent.GetComponent<Animation>() ||
+                    parent.GetComponent("AnimatedObjectTrigger") || parent.GetComponent("DoorLock")) return true;
+            return false;
+        }
         private static float[] ReadColor(Renderer renderer)
         {
             var color = new Color(0.4f, 0.45f, 0.5f, 1);

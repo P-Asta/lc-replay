@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using BepInEx;
@@ -12,6 +14,7 @@ using LCReplay.Core.Lifecycle;
 using LCReplay.Plugin.Capture;
 using LCReplay.Plugin.Library;
 using LCReplay.Plugin.Playback;
+using LCReplay.Plugin.UI;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -21,8 +24,9 @@ namespace LCReplay.Plugin
     public sealed class ReplayPlugin : BaseUnityPlugin
     {
         public const string Guid = "io.lcreplay.recorder";
-        public const string Version = "0.11.0";
-        private ConfigEntry<bool> bones = null!, world = null!, chat = null!;
+        public const string Version = "0.23.0";
+        private GUIStyle? overlayLabel;
+        private ConfigEntry<bool> bones = null!, world = null!, chat = null!, captureAudio = null!, captureVoiceChat = null!, disableInteriorCulling = null!, mutePlayerAudio = null!;
         private ConfigEntry<int> rate = null!, maxFields = null!, maxObjects = null!, maxVertices = null!;
         private ConfigEntry<float> replayResolution = null!, replayGamma = null!;
         private ConfigEntry<string> folder = null!, extraTypes = null!;
@@ -50,11 +54,15 @@ namespace LCReplay.Plugin
         private bool loadCancelled;
         private bool shutdownCompleted;
         private bool inputReported, inputReadyReported;
+        private Component? playbackPlayer;
+        private bool savedMoveInput, savedLookInput;
         private int part;
         private string status = "Gameplay is recorded and saved automatically.";
         private string recordingFailure = "";
         private string? loadingPath;
         private float loadingSpeed = 1f;
+        private int loadingPercent;
+        private string loadingStage = "";
         private string ReplayDirectory => Path.GetFullPath(Path.IsPathRooted(folder.Value) ? folder.Value : Path.Combine(Paths.BepInExRootPath, folder.Value));
 
         private void Awake()
@@ -62,7 +70,11 @@ namespace LCReplay.Plugin
             rate = Config.Bind("Recording", "SampleRate", 10, new ConfigDescription("Automatic recording snapshots per second.", new AcceptableValueRange<int>(1, 60)));
             bones = Config.Bind("Recording", "CaptureBones", true, "Record up to 128 bone poses per actor.");
             world = Config.Bind("Recording", "CaptureWorld", true, "Save bounded geometry, textures and actor appearance for offline replay.");
-            chat = Config.Bind("Recording", "CaptureChat", false, "Capture displayed text chat. Restart required. Voice/audio is not captured.");
+            chat = Config.Bind("Recording", "CaptureChat", false, "Capture displayed text chat. Restart required.");
+            captureAudio = Config.Bind("Recording", "CaptureAudio", true,
+                "Record observed game sound effects, player footsteps and music. New recordings only.");
+            captureVoiceChat = Config.Bind("Recording", "CaptureVoiceChat", false,
+                "Also record player voice chat. This may store other players' conversations. New recordings only.");
             maxFields = Config.Bind("Limits", "FieldsPerEntity", 192, new ConfigDescription("Primitive fields per component.", new AcceptableValueRange<int>(32, 512)));
             maxObjects = Config.Bind("Limits", "WorldObjects", 4000, new ConfigDescription("Render object budget per world snapshot.", new AcceptableValueRange<int>(100, 20000)));
             maxVertices = Config.Bind("Limits", "WorldVertices", 500000, new ConfigDescription("Unique mesh vertex budget per world snapshot; repeated room meshes share data.", new AcceptableValueRange<int>(1000, 1000000)));
@@ -87,6 +99,10 @@ namespace LCReplay.Plugin
             }
             replayGamma = Config.Bind("Playback", "Gamma", 1f,
                 new ConfigDescription("Replay image gamma; 1.0 is neutral.", new AcceptableValueRange<float>(0.5f, 2f)));
+            disableInteriorCulling = Config.Bind("Playback", "DisableInteriorCulling", false,
+                "Show every recorded interior tile from both outside and inside. This can reduce playback performance.");
+            mutePlayerAudio = Config.Bind("Playback", "MutePlayerAudio", false,
+                "Mute all player-origin sounds in replay, including your own footsteps and equipment. New recordings carry source tags.");
             try
             {
                 archive = new ReplayArchive(ReplayDirectory);
@@ -96,11 +112,13 @@ namespace LCReplay.Plugin
                 library.RefreshRequested += RefreshArchive;
                 library.PlayRequested += path => LoadReplay(path);
                 library.OpenFolderRequested += OpenFolder;
+                library.DeleteRequested += DeleteRecording;
                 library.CloseRequested += CloseLibrary;
                 hooks = new EventHooks(evt =>
                 {
                     recorder?.Event(evt);
-                    if (evt.Name.Contains("OnShipLanded") || evt.Name.Contains("StartGame")) recorder?.MarkWorldDirty();
+                    if (evt.Name.Contains("OnShipLanded")) recorder?.RefreshEnvironmentAfterLanding();
+                    else if (evt.Name.Contains("StartGame")) recorder?.MarkWorldDirty();
                 }, chat.Value, message => Logger.LogWarning(message));
                 Logger.LogInfo($"LC Replay {Version}: automatic quota/deadline archive; {hooks.Installed.Count} event hooks active.");
             }
@@ -140,7 +158,6 @@ namespace LCReplay.Plugin
                 inputReadyReported |= inputAvailable;
             }
             var connected = GameAccess.Connected;
-            if (connected && loading != null) { loadCancelled = true; loadingCancellation?.Cancel(); }
             if (!connected && wasConnected)
             {
                 EndSession();
@@ -152,8 +169,14 @@ namespace LCReplay.Plugin
             menuButton?.Tick(!connected && viewer == null && library?.IsOpen != true && loading == null);
             if (viewer != null)
             {
-                if (connected || viewer.CloseRequested || ReplayInput.WasPressed("Escape") || ReplayInput.WasPressed("F11"))
-                { CloseViewer(!connected); return; }
+                if (hooks != null && archive != null && GameAccess.CanRecord)
+                {
+                    try { RecordAutomatically(true); }
+                    catch (Exception ex) { StopSegment(); ReportRecordingFailure("Automatic recording stopped", ex); }
+                }
+                BlockLocalPlayerInput();
+                if (viewer.CloseRequested || ReplayInput.WasPressed("Escape") || ReplayInput.WasPressed("F11"))
+                { CloseViewer(true); return; }
                 try { viewer.Tick(Time.unscaledDeltaTime); }
                 catch (Exception ex) { Logger.LogError(ex); CloseViewer(true); status = "Playback error: " + ex.Message; }
                 if (viewer?.Error != null)
@@ -169,15 +192,22 @@ namespace LCReplay.Plugin
             if (viewer != null) return;
             if (ReplayInput.WasPressed("F9"))
             {
-                Logger.LogInfo("Replay F9 pressed: " + (library?.IsOpen == true ? "closing" : "opening") + " archive.");
-                if (library?.IsOpen == true) CloseLibrary(); else OpenLibrary();
+                if (library?.IsOpen == true)
+                {
+                    if (!library.DismissDialog()) CloseLibrary();
+                }
+                else OpenLibrary();
             }
             if (library?.IsOpen == true)
             {
                 library.Tick();
-                library.DrawGui(status, !connected && GameAccess.NetworkStateKnown && recorder == null,
-                    loading != null || scanning != null, recordingFailure);
-                if (ReplayInput.WasPressed("Escape")) CloseLibrary();
+                BlockLocalPlayerInput();
+                library.DrawGui(status, GameAccess.NetworkStateKnown,
+                    loading != null || scanning != null, recordingFailure,
+                    loading != null ? Volatile.Read(ref loadingPercent) / 100f : 0f,
+                    loading != null ? Volatile.Read(ref loadingStage) : scanning != null ? "Scanning archive" : "",
+                    day?.Id ?? "");
+                if (ReplayInput.WasPressed("Escape") && !library.DismissDialog()) CloseLibrary();
             }
             if (ReplayInput.WasPressed("F8") && GameAccess.CanRecord && archive != null && hooks != null)
             {
@@ -210,7 +240,7 @@ namespace LCReplay.Plugin
             }
         }
 
-        private void RecordAutomatically()
+        private void RecordAutomatically(bool playbackActive = false)
         {
             if (recordingBlocked) return;
             var round = GameAccess.Singleton("StartOfRound");
@@ -220,6 +250,12 @@ namespace LCReplay.Plugin
             if (!(GameAccess.Read(round, "inShipPhase") is bool inShipPhase))
                 throw new InvalidOperationException("This game version does not expose round phase (inShipPhase).");
             var quota = CurrentQuota();
+            // TimeOfDay exists before the save is applied. Creating a quota
+            // folder in that interval permanently labels the first day 0/2.
+            if (session == null && (!quota.Target.HasValue || quota.Target.Value <= 0 ||
+                !quota.DeadlineDaysRemaining.HasValue ||
+                quota.DeadlineDaysRemaining.Value == 0 &&
+                !(GameAccess.Read(GameAccess.Singleton("TimeOfDay"), "timeUntilDeadline") is float deadlineTime && deadlineTime > 0))) return;
             if (session == null)
             {
                 run = run ?? archive!.BeginRun(launchedAt);
@@ -228,19 +264,24 @@ namespace LCReplay.Plugin
                 dayLifecycle = new DayLifecycle();
             }
             var transition = dayLifecycle.Observe(inShipPhase);
-            // Reconcile on every attempt: a failed disk operation may have advanced the
-            // logical day before its folder could be created. Retrying must never append to yesterday.
-            if (day != null && (day.DayNumber != dayLifecycle.DayNumber || day.QuotaRemaining != quota.Remaining ||
-                day.QuotaTarget != quota.Target || day.DeadlineDaysRemaining != quota.DeadlineDaysRemaining || day.QuotaCycle != quota.QuotaCycle))
+            // The game's deadline display can update during an expedition. Do not
+            // close the daily file when that value changes while entering a room.
+            // A completed return to orbit is the only normal daily save boundary.
+            if (day != null && transition == DayTransition.ReturnedToOrbit)
             {
+                recorder?.Event(new ReplayEvent { Category = "day", Name = transition.ToString(),
+                    Data = new Dictionary<string, string> { ["day"] = dayLifecycle.DayNumber.ToString() } });
+                recorder?.Tick(true, playbackActive);
                 StopSegment();
                 var endedDay = day;
                 day = null;
                 part = 0;
                 archive!.EndDay(endedDay, recordingBlocked ? "interrupted" : "saved");
-                if (recordingBlocked) return;
+                return;
             }
-            if (session.QuotaRemaining != quota.Remaining)
+            // Keep the finished day closed while the crew remains in orbit.
+            if (day == null && dayLifecycle.HasReturned) return;
+            if (day == null && session.QuotaRemaining != quota.Remaining)
             {
                 archive!.EndSession(session);
                 session = archive.BeginQuota(run!, DateTimeOffset.UtcNow, quota, GameAccess.IsHost ? "host-observed" : "client-observed");
@@ -256,7 +297,7 @@ namespace LCReplay.Plugin
             if (transition != DayTransition.None)
                 recorder.Event(new ReplayEvent { Category = "day", Name = transition.ToString(),
                     Data = new Dictionary<string, string> { ["day"] = dayLifecycle.DayNumber.ToString() } });
-            recorder.Tick(transition == DayTransition.ReturnedToOrbit);
+            recorder.Tick(transition == DayTransition.ReturnedToOrbit, playbackActive);
             if (recorder.Error != null)
             { var error = recorder.Error; StopSegment(); ReportRecordingFailure("Automatic saving stopped", error); return; }
         }
@@ -277,9 +318,16 @@ namespace LCReplay.Plugin
         private static ArchiveQuotaSnapshot CurrentQuota()
         {
             var time = GameAccess.Singleton("TimeOfDay");
+            int? remainingDays = NonnegativeInt(GameAccess.Read(time, "daysUntilDeadline"));
+            var remainingTime = GameAccess.Read(time, "timeUntilDeadline");
+            var totalTime = GameAccess.Read(time, "totalTime");
+            if (remainingTime is float seconds && totalTime is float daySeconds &&
+                seconds >= 0 && daySeconds > 0 && !float.IsNaN(seconds) && !float.IsInfinity(seconds) &&
+                !float.IsNaN(daySeconds) && !float.IsInfinity(daySeconds))
+                remainingDays = Math.Max(0, (int)Math.Ceiling(seconds / daySeconds));
             return new ArchiveQuotaSnapshot { Target = NonnegativeInt(GameAccess.Read(time, "profitQuota")),
                 Fulfilled = NonnegativeInt(GameAccess.Read(time, "quotaFulfilled")),
-                DeadlineDaysRemaining = NonnegativeInt(GameAccess.Read(time, "daysUntilDeadline")),
+                DeadlineDaysRemaining = remainingDays,
                 DeadlineDaysTotal = NonnegativeInt(GameAccess.Read(GameAccess.Read(time, "quotaVariables"), "deadlineDaysAmount")),
                 QuotaCycle = NonnegativeInt(GameAccess.Read(time, "timesFulfilledQuota")) };
         }
@@ -300,7 +348,7 @@ namespace LCReplay.Plugin
             {
                 recorder = new Recorder(day.DirectoryPath, rate.Value, bones.Value, world.Value, maxFields.Value, maxObjects.Value,
                     maxVertices.Value, extraTypes.Value, hooks, chat.Value, message => Logger.LogInfo(message), day.Id, part,
-                    segment.FilePath, segment.Metadata, reusableWorld);
+                    segment.FilePath, segment.Metadata, reusableWorld, captureAudio.Value, captureVoiceChat.Value);
                 ReplayApi.EventSink = recorder.Event;
                 recordingFailure = "";
                 library?.SetRecordingPath(segment.FilePath);
@@ -390,6 +438,28 @@ namespace LCReplay.Plugin
         }
 
         private void RefreshArchiveIfOpen() { if (library?.IsOpen == true) RefreshArchive(); }
+        private void DeleteRecording(IReadOnlyList<ArchiveDay> selected)
+        {
+            if (archive == null || library?.IsOpen != true || scanning != null || loading != null || viewer != null) return;
+            var current = new HashSet<ArchiveDay>(index.Runs.SelectMany(run => run.Sessions).SelectMany(group => group.Days));
+            if (selected.Count == 0 || selected.Any(candidate => !current.Contains(candidate)))
+            { status = "The archive changed. Refresh and select the recording again."; RefreshArchive(); return; }
+            if (day != null && selected.Any(candidate => day.Id == candidate.Id && day.RunId == candidate.RunId))
+            { status = "The current day's recording cannot be deleted while it is active."; return; }
+            try
+            {
+                var count = archive.DeleteRecordings(selected);
+                status = "Deleted " + count + (count == 1 ? " replay file." : " replay files.");
+                Logger.LogInfo(status);
+                RefreshArchive();
+            }
+            catch (Exception error)
+            {
+                status = "Could not delete the recording: " + error.Message;
+                Logger.LogWarning(status);
+                RefreshArchive();
+            }
+        }
         private void RefreshArchive()
         {
             if (archive == null || quitting) return;
@@ -414,6 +484,7 @@ namespace LCReplay.Plugin
         {
             if (library == null || viewer != null) return;
             library.Open();
+            BlockLocalPlayerInput();
             library.SetRecordingPath(recorder?.FilePath);
             RefreshArchive();
         }
@@ -421,21 +492,28 @@ namespace LCReplay.Plugin
         {
             if (loading != null) { loadCancelled = true; loadingCancellation?.Cancel(); status = "Recording load cancelled."; }
             library?.Close();
+            if (viewer == null) RestoreLocalPlayerInput();
         }
         private void LoadReplay(string path, float speed = 1f)
         {
             if (loading != null || viewer != null) return;
-            if (GameAccess.Connected || !GameAccess.NetworkStateKnown || recorder != null)
-            { status = "Return to the main menu to play a recording."; return; }
+            if (!GameAccess.NetworkStateKnown)
+            { status = "Replay playback is unavailable until the game network is initialized."; return; }
             loadingPath = Path.GetFullPath(path);
             loadingSpeed = speed;
             loadCancelled = false;
             status = "Loading recording...";
+            Volatile.Write(ref loadingPercent, 0);
+            Volatile.Write(ref loadingStage, "Reading header");
             loadingCancellation?.Dispose();
             loadingCancellation = new CancellationTokenSource();
             var cancellation = loadingCancellation.Token;
             var sourceIndex = index;
-            loading = Task.Run(() => LoadedRecording.Read(sourceIndex, path, cancellation), cancellation);
+            loading = Task.Run(() => LoadedRecording.Read(sourceIndex, path, cancellation, (stage, fraction) =>
+            {
+                Volatile.Write(ref loadingStage, stage);
+                Volatile.Write(ref loadingPercent, Math.Max(0, Math.Min(99, (int)Math.Round(fraction * 100))));
+            }), cancellation);
         }
         private void CompleteLoad(bool connected)
         {
@@ -449,17 +527,21 @@ namespace LCReplay.Plugin
                 return;
             }
             if (task.IsFaulted) { status = "Recording file error: " + task.Exception?.GetBaseException().Message; OpenLibrary(); }
-            else if (connected || loadCancelled || !GameAccess.NetworkStateKnown)
-            { status = "Playback cancelled because a game connection is active."; }
+            else if (loadCancelled || !GameAccess.NetworkStateKnown)
+            { status = "Playback cancelled."; }
             else
             {
                 try
                 {
                     library?.Close();
+                    ReplayIsolation.PlaybackActive = true;
                     viewer = new ReplayViewer(task.Result.Session, task.Result.Timeline, task.Result.PartIndex,
                         replayResolution.Value, replayGamma.Value,
-                        value => replayResolution.Value = value, value => replayGamma.Value = value) { Speed = loadingSpeed };
+                        value => replayResolution.Value = value, value => replayGamma.Value = value,
+                        disableInteriorCulling.Value, value => disableInteriorCulling.Value = value,
+                        mutePlayerAudio.Value, value => mutePlayerAudio.Value = value) { Speed = loadingSpeed };
                     status = "Recording loaded.";
+                    BlockLocalPlayerInput();
                     foreach (var warning in task.Result.Session.Warnings) Logger.LogWarning(warning);
                 }
                 catch (Exception ex) { Logger.LogError(ex); CloseViewer(true); status = "Cannot start playback: " + ex.Message; }
@@ -469,8 +551,40 @@ namespace LCReplay.Plugin
         private void CloseViewer(bool reopenLibrary)
         {
             try { viewer?.Dispose(); }
-            finally { viewer = null; }
+            finally { viewer = null; ReplayIsolation.PlaybackActive = false; }
             if (reopenLibrary && !quitting) OpenLibrary();
+            else RestoreLocalPlayerInput();
+        }
+
+        private void BlockLocalPlayerInput()
+        {
+            var player = GameAccess.Read(GameAccess.Singleton("GameNetworkManager"), "localPlayerController") as Component;
+            if (!player) return;
+            if (playbackPlayer != player)
+            {
+                RestoreLocalPlayerInput();
+                playbackPlayer = player;
+                savedMoveInput = GameAccess.Bool(player, "disableMoveInput");
+                savedLookInput = GameAccess.Bool(player, "disableLookInput");
+            }
+            SetPlayerInputFlag(player!, "disableMoveInput", true);
+            SetPlayerInputFlag(player!, "disableLookInput", true);
+        }
+
+        private void RestoreLocalPlayerInput()
+        {
+            if (playbackPlayer)
+            {
+                SetPlayerInputFlag(playbackPlayer!, "disableMoveInput", savedMoveInput);
+                SetPlayerInputFlag(playbackPlayer!, "disableLookInput", savedLookInput);
+            }
+            playbackPlayer = null;
+        }
+
+        private static void SetPlayerInputFlag(Component player, string name, bool value)
+        {
+            try { player.GetType().GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.SetValue(player, value); }
+            catch { /* Other game versions may not expose this optional input flag. */ }
         }
         private void OpenFolder(string path)
         {
@@ -492,11 +606,31 @@ namespace LCReplay.Plugin
             if (library?.IsOpen != true)
             {
                 if (recordingFailure.Length > 0)
-                    GUI.Box(new Rect(12, 12, Math.Min(900, Screen.width - 24), 50), "LC Replay: " + recordingFailure +
+                    DrawOverlay(new Rect(12, 12, Math.Min(900, Screen.width - 24), 54), "LC Replay: " + recordingFailure +
                         (hooks == null || archive == null ? "\nRestart the game after resolving the initialization error." : "\nF9: details / F8: retry"));
                 else if (recorder != null)
-                    GUI.Box(new Rect(12, 12, 570, 28), $"AUTO REC / SAVING  |  Quota {day?.QuotaRemaining?.ToString() ?? "?"} / Deadline {day?.DeadlineDaysRemaining?.ToString() ?? "?"}  |  F9 Replays");
+                    DrawOverlay(new Rect(12, 12, 570, 32), $"AUTO REC / SAVING  |  Quota {day?.QuotaRemaining?.ToString() ?? "?"} / Deadline {day?.DeadlineDaysRemaining?.ToString() ?? "?"}  |  F9 Replays");
             }
+        }
+
+        private void DrawOverlay(Rect rect, string message)
+        {
+            var tint = GUI.color;
+            GUI.color = NativeReplayUi.Orange;
+            GUI.DrawTexture(rect, Texture2D.whiteTexture);
+            GUI.color = NativeReplayUi.Black;
+            GUI.DrawTexture(new Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height - 4), Texture2D.whiteTexture);
+            GUI.color = tint;
+            if (overlayLabel == null)
+            {
+                overlayLabel = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 16, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft,
+                    wordWrap = false, padding = new RectOffset(11, 8, 2, 2)
+                };
+                overlayLabel.normal.textColor = NativeReplayUi.White;
+            }
+            GUI.Label(rect, message, overlayLabel);
         }
         private void ApplicationQuitting() { quitting = true; Shutdown(); }
         private void OnApplicationQuit() => ApplicationQuitting();

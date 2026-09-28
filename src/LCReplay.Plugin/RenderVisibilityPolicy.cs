@@ -17,6 +17,15 @@ namespace LCReplay.Plugin
                 name.IndexOf("splatmap", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        internal static bool IsRockSurface(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("rock", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("stone", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("boulder", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("cliff", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         internal static bool IsVegetation(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;

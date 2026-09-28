@@ -25,13 +25,21 @@ namespace LCReplay.Plugin.Capture
         private readonly Action<string> log;
         private ReplayFrame? previous;
         private double nextFrame, nextDiscovery, nextWorld = 2;
+        private double nextLateEntityScan;
         private bool worldDirty = true;
+        private bool environmentDirty;
         private int worldLayerPhase;
         private int exteriorChunkIndex;
         private string worldCaptureSetId = "";
         private readonly HashSet<string> capturedWorldIds = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> emittedGeometryIds = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> capturedEntityIds = new HashSet<string>(StringComparer.Ordinal);
         private MeshSnapshotReader.StaticBatchReader? staticBatches;
+        private SceneAssetCapture? sceneAssets;
+        private ReplayAudioCapture? audioCapture;
         private WorldCapture.CaptureJob? worldJob;
+        private WorldCapture.CaptureJob? lateEntityJob;
+        private string[] lateEntityIds = Array.Empty<string>();
         private bool disposed;
         private Task? finishTask;
         private bool hasWorld;
@@ -51,7 +59,8 @@ namespace LCReplay.Plugin.Capture
 
         public Recorder(string directory, int sampleRate, bool bones, bool world, int fields, int objects, int vertices,
             string extraTypes, EventHooks hooks, bool chat, Action<string> logger, string recordingGroup = "", int part = 1,
-            string? outputPath = null, IDictionary<string, string>? archiveMetadata = null, IReadOnlyList<WorldSnapshot>? initialWorld = null)
+            string? outputPath = null, IDictionary<string, string>? archiveMetadata = null, IReadOnlyList<WorldSnapshot>? initialWorld = null,
+            bool captureAudio = true, bool captureVoiceChat = false)
         {
             if (sampleRate < 1 || sampleRate > 60) throw new ArgumentOutOfRangeException(nameof(sampleRate));
             if (fields < 1 || fields > 512) throw new ArgumentOutOfRangeException(nameof(fields));
@@ -74,9 +83,19 @@ namespace LCReplay.Plugin.Capture
             if (captureWorld) header.Capabilities.AddRange(new[] { "render-geometry-and-bounds", "embedded-render-assets",
                 "layered-world-capture", "recorded-sky-fog", "shader-properties", "instanced-grass", "looping-particle-emitters" });
             header.Capabilities.Add("visual-effect-swarm-approximation");
+            header.Capabilities.Add("moving-scene-renderers");
+            header.Capabilities.Add("sparse-static-visibility");
+            header.Capabilities.Add("spray-decal-events");
+            header.Capabilities.Add("sampled-line-renderers");
+            header.Capabilities.Add("late-entity-geometry");
             if (chat) header.Capabilities.Add("local-chat");
+            if (captureAudio) { header.Capabilities.Add("source-audio-adpcm-22050"); header.Capabilities.Add("spatial-source-audio");
+                header.Capabilities.Add("spectator-world-audio");
+                header.Capabilities.Add("player-audio-origin"); header.Capabilities.Add("virtual-audio-readable-clips"); }
+            if (captureAudio && captureVoiceChat) header.Capabilities.Add("player-voice-audio-opt-in");
             header.Warnings.Add("Only data visible to this recorder is available. Remote/private state is not reconstructed.");
-            header.Warnings.Add("Audio/voice, short-lived and GPU-only particle states, baked lighting, unsupported post-processing, RNG execution and arbitrary object graphs are not recorded. Looping emitters and GPU swarms use bounded visual approximations.");
+            header.Warnings.Add("GPU-only particle states, baked lighting, unsupported post-processing, RNG execution and arbitrary object graphs are not recorded. Short-lived Unity particles are sampled with a per-frame cap; looping emitters and GPU swarms use bounded approximations.");
+            if (captureAudio) header.Warnings.Add("Audio is captured as bounded mono AudioSource blocks with sampled source positions and distance settings. Virtualized sources can be sampled from readable DecompressOnLoad clips; compressed, streamed and non-AudioSource sounds may be unavailable. Voice chat is excluded unless CaptureVoiceChat is enabled.");
             header.Warnings.Add("Fields, arrays, bones, entities, provider state and world geometry are bounded; omissions are recorded.");
             header.Warnings.Add("Method calls may include rejected actions, RPC duplicates or miss overrides; use snapshot transitions for outcomes.");
             foreach (var type in tracker.MissingTypes) header.Warnings.Add("Unavailable component type: " + type);
@@ -100,7 +119,7 @@ namespace LCReplay.Plugin.Capture
             header.Metadata["recordingGroup"] = group;
             header.Metadata["part"] = part.ToString(CultureInfo.InvariantCulture);
             header.Metadata["singleFile"] = "true";
-            header.Metadata["segmentBoundary"] = "quota-deadline-change-or-disconnect";
+            header.Metadata["segmentBoundary"] = "return-to-orbit-or-disconnect";
             if (archiveMetadata != null)
                 foreach (var entry in archiveMetadata) header.Metadata[entry.Key] = entry.Value;
             foreach (var plugin in Chainloader.PluginInfos.Values)
@@ -113,14 +132,23 @@ namespace LCReplay.Plugin.Capture
             {
                 SceneManager.sceneLoaded += SceneLoaded;
                 SceneManager.sceneUnloaded += SceneUnloaded;
+                if (captureAudio)
+                    try { audioCapture = new ReplayAudioCapture(captureVoiceChat, logger); }
+                    catch (Exception ex) { log("Audio capture unavailable: " + ex.Message); }
                 if (initialWorld != null && initialWorld.Count != 0)
                 {
                     foreach (var snapshot in initialWorld)
                     {
                         Write(new ReplayRecord { Kind = "world", Time = 0, World = snapshot });
                         reusableWorlds.Add(snapshot);
+                        foreach (var geometry in snapshot.Geometry)
+                        {
+                            emittedGeometryIds.Add(geometry.Id);
+                            if (geometry.EntityId.Length != 0) capturedEntityIds.Add(geometry.EntityId);
+                        }
                     }
                     if (Error != null) throw Error;
+                    worldCaptureSetId = initialWorld[0].CaptureSetId;
                     hasWorld = true; worldDirty = false;
                 }
             }
@@ -128,6 +156,7 @@ namespace LCReplay.Plugin.Capture
             {
                 SceneManager.sceneLoaded -= SceneLoaded;
                 SceneManager.sceneUnloaded -= SceneUnloaded;
+                audioCapture?.Dispose();
                 writer.Dispose();
                 throw;
             }
@@ -146,22 +175,48 @@ namespace LCReplay.Plugin.Capture
         public void MarkWorldDirty()
         {
             worldJob?.Dispose(); worldJob = null;
-            worldDirty = true; worldLayerPhase = 0; exteriorChunkIndex = 0;
+            lateEntityJob?.Dispose(); lateEntityJob = null; lateEntityIds = Array.Empty<string>();
+            tracker.Visual.Reset();
+            tracker.ClearMovingSceneRenderers();
+            worldDirty = true; environmentDirty = false; worldLayerPhase = 0; exteriorChunkIndex = 0;
             reusableWorlds.Clear();
+            emittedGeometryIds.Clear(); capturedEntityIds.Clear();
             capturedWorldIds.Clear(); staticBatches = null; nextWorld = Duration + 2;
         }
+        public void RefreshEnvironmentAfterLanding()
+        {
+            if (!captureWorld) return;
+            if (!hasWorld || worldDirty) { MarkWorldDirty(); return; }
+            environmentDirty = true;
+            nextWorld = Math.Max(nextWorld, Duration + 2);
+        }
         private void SceneLoaded(Scene scene, LoadSceneMode mode)
-        { Event(new ReplayEvent { Category = "scene", Name = "loaded", Data = new Dictionary<string, string> { ["scene"] = scene.name } }); MarkWorldDirty(); }
+        {
+            if (ReplayIsolation.PlaybackActive || ReplayIsolation.IsReplayScene(scene)) return;
+            Event(new ReplayEvent { Category = "scene", Name = "loaded", Data = new Dictionary<string, string> { ["scene"] = scene.name } });
+            var expected = GameAccess.Scalar(GameAccess.Read(GameAccess.Read(GameAccess.Singleton("StartOfRound"), "currentLevel"), "sceneName"));
+            sceneAssets = SceneAssetCapture.TryCreate(scene, expected);
+            MarkWorldDirty();
+        }
         private void SceneUnloaded(Scene scene)
-        { Event(new ReplayEvent { Category = "scene", Name = "unloaded", Data = new Dictionary<string, string> { ["scene"] = scene.name } }); MarkWorldDirty(); }
+        {
+            if (ReplayIsolation.PlaybackActive || ReplayIsolation.IsReplayScene(scene)) return;
+            Event(new ReplayEvent { Category = "scene", Name = "unloaded", Data = new Dictionary<string, string> { ["scene"] = scene.name } });
+            if (sceneAssets?.SceneName == scene.name) sceneAssets = null;
+            MarkWorldDirty();
+        }
 
-        public void Tick(bool forceFrame = false)
+        public void Tick(bool forceFrame = false, bool suspendWorldCapture = false)
         {
             if (disposed) return;
             if (writer.Error != null) Error = writer.Error;
             if (writer.ExpandedBytes >= MaxDayExpandedBytes)
                 Error = new IOException("The single-day replay reached its 24 GiB expanded-data safety limit.");
             if (Error != null) return;
+            audioCapture?.Tick();
+            if (audioCapture != null)
+                foreach (var audioEvent in audioCapture.Drain())
+                    Write(new ReplayRecord { Kind = "event", Time = audioEvent.Time, Event = audioEvent });
             var now = Duration;
             if (now >= nextDiscovery)
             {
@@ -188,7 +243,7 @@ namespace LCReplay.Plugin.Capture
                 previous = frame;
                 nextFrame = now + 1.0 / rate;
             }
-            if (captureWorld && worldDirty && now >= nextWorld)
+            if (captureWorld && !suspendWorldCapture && worldDirty && now >= nextWorld)
             {
                 if (worldJob == null && worldLayerPhase == 0 && exteriorChunkIndex == 0)
                 {
@@ -201,7 +256,7 @@ namespace LCReplay.Plugin.Capture
                 if (worldJob == null)
                     worldJob = WorldCapture.Begin(tracker, maxObjects, maxVertices,
                         worldLayerPhase == 0 ? "exterior" : "interior", worldCaptureSetId, capturedWorldIds,
-                        worldLayerPhase != 0 || exteriorChunkIndex == 0, staticBatches!);
+                        worldLayerPhase != 0 || exteriorChunkIndex == 0, staticBatches!, sceneAssets);
                 // Keep scene capture on Unity's main thread, but bound its work per
                 // game frame. Unity objects and GPU readback cannot be moved to the
                 // background writer thread.
@@ -215,6 +270,11 @@ namespace LCReplay.Plugin.Capture
                 Write(new ReplayRecord { Kind = "world", Time = hasWorld ? time : 0, World = snapshot });
                 reusableWorlds.Add(snapshot); hasWorld = true;
                 foreach (var id in captured) capturedWorldIds.Add(id);
+                foreach (var geometry in snapshot.Geometry)
+                {
+                    emittedGeometryIds.Add(geometry.Id);
+                    if (geometry.EntityId.Length != 0) capturedEntityIds.Add(geometry.EntityId);
+                }
                 if (worldLayerPhase == 0)
                 {
                     exteriorChunkIndex++;
@@ -230,6 +290,56 @@ namespace LCReplay.Plugin.Capture
                 Write(new ReplayRecord { Kind = "event", Time = time, Event = report });
                 log(summary);
             }
+            if (captureWorld && !suspendWorldCapture && environmentDirty && !worldDirty && now >= nextWorld && worldCaptureSetId.Length != 0)
+            {
+                var update = new WorldSnapshot
+                {
+                    Scene = SceneManager.GetActiveScene().name,
+                    Layer = "exterior",
+                    CaptureSetId = worldCaptureSetId,
+                    Environment = EnvironmentCapture.Capture()
+                };
+                Write(new ReplayRecord { Kind = "world", Time = Duration, World = update });
+                reusableWorlds.Add(update);
+                environmentDirty = false;
+                nextWorld = Duration + 2;
+                log("Refreshed replay sky and fog after landing without recapturing static map geometry.");
+            }
+            if (captureWorld && !suspendWorldCapture && !worldDirty && worldCaptureSetId.Length != 0)
+                CaptureLateEntities();
+            if (captureWorld && !worldDirty)
+                foreach (var visualEvent in tracker.Visual.Scan(Duration, worldCaptureSetId))
+                    Write(new ReplayRecord { Kind = "event", Time = visualEvent.Time, Event = visualEvent });
+        }
+
+        private void CaptureLateEntities()
+        {
+            if (lateEntityJob == null)
+            {
+                if (Duration < nextLateEntityScan) return;
+                nextLateEntityScan = Duration + .5;
+                lateEntityIds = tracker.Entries.Where(entry => entry.Kind != "round" && entry.Kind != "time" &&
+                    entry.Kind != "terminal" && entry.Component && !capturedEntityIds.Contains(entry.Id) &&
+                    entry.Component.GetComponentsInChildren<Renderer>(true).Any(renderer =>
+                        renderer is MeshRenderer || renderer is SkinnedMeshRenderer))
+                    .Take(12).Select(entry => entry.Id).ToArray();
+                if (lateEntityIds.Length == 0) return;
+                var selected = new HashSet<string>(lateEntityIds, StringComparer.Ordinal);
+                lateEntityJob = WorldCapture.Begin(tracker, maxObjects, maxVertices, "exterior", worldCaptureSetId,
+                    emittedGeometryIds, false, new MeshSnapshotReader.StaticBatchReader(), null, selected);
+            }
+            if (!lateEntityJob.Step(1)) return;
+            var snapshot = lateEntityJob.Snapshot;
+            var summary = lateEntityJob.Summary;
+            lateEntityJob = null;
+            foreach (var id in lateEntityIds) capturedEntityIds.Add(id);
+            lateEntityIds = Array.Empty<string>();
+            if (snapshot.Geometry.Count == 0) return;
+            var time = Duration;
+            Write(new ReplayRecord { Kind = "world", Time = time, World = snapshot });
+            reusableWorlds.Add(snapshot);
+            foreach (var geometry in snapshot.Geometry) emittedGeometryIds.Add(geometry.Id);
+            log(summary);
         }
         private void Transitions(ReplayFrame current)
         {
@@ -281,6 +391,18 @@ namespace LCReplay.Plugin.Capture
         {
             lock (eventGate) { if (disposed) return finishTask ?? Task.CompletedTask; disposed = true; }
             worldJob?.Dispose(); worldJob = null;
+            lateEntityJob?.Dispose(); lateEntityJob = null;
+            audioCapture?.Finish();
+            if (audioCapture != null)
+            {
+                foreach (var audioEvent in audioCapture.Drain())
+                    Write(new ReplayRecord { Kind = "event", Time = audioEvent.Time, Event = audioEvent });
+                if (audioCapture.Dropped > 0)
+                    Write(new ReplayRecord { Kind = "event", Time = Duration,
+                        Event = new ReplayEvent { Time = Duration, Category = "audio", Name = "dropped-blocks",
+                            Data = new Dictionary<string, string> { ["count"] = audioCapture.Dropped.ToString(CultureInfo.InvariantCulture) } } });
+                audioCapture = null;
+            }
             SceneManager.sceneLoaded -= SceneLoaded; SceneManager.sceneUnloaded -= SceneUnloaded;
             while (events.TryDequeue(out var evt)) Write(new ReplayRecord { Kind = "event", Time = evt.Time, Event = evt });
             var stoppedAt = Duration;

@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -8,6 +9,36 @@ namespace LCReplay.Plugin.Capture
 {
     internal static class CaptureVisibility
     {
+        internal static KeyValuePair<string, Bounds>[] TileVolumes()
+        {
+            var tiles = GameAccess.Find("DunGen.Tile").Take(4096).ToArray();
+            var volumes = new List<KeyValuePair<string, Bounds>>(tiles.Length + 1);
+            foreach (var tile in tiles)
+                if (GameAccess.Read(tile, "Bounds") is Bounds bounds && ValidBounds(bounds))
+                    volumes.Add(new KeyValuePair<string, Bounds>("r" + tile.GetInstanceID(), bounds));
+            // The game's room culler explicitly treats the mine entrance/elevator
+            // volume as the start tile. Keep it separate: an enclosing AABB would
+            // also mark the space between the two volumes as indoors.
+            var special = GameAccess.Read(GameAccess.Singleton("RoundManager"), "startRoomSpecialBounds") as Collider;
+            if (special && special!.gameObject.scene.IsValid() && ValidBounds(special.bounds))
+            {
+                var culler = GameAccess.Read(GameAccess.Singleton("StartOfRound"), "occlusionCuller");
+                var currentTiles = GameAccess.Read(culler, "allTiles") as IEnumerable;
+                var start = currentTiles?.OfType<Component>().FirstOrDefault(IsStartTile)
+                    ?? tiles.FirstOrDefault(IsStartTile);
+                if (start && volumes.Any(volume => volume.Key == "r" + start!.GetInstanceID()))
+                    volumes.Add(new KeyValuePair<string, Bounds>("r" + start!.GetInstanceID(), special.bounds));
+            }
+            return volumes.ToArray();
+        }
+
+        private static bool IsStartTile(Component tile) => tile &&
+            GameAccess.Read(GameAccess.Read(tile, "Placement"), "NormalizedPathDepth") is float depth && depth == 0f;
+
+        private static bool ValidBounds(Bounds bounds) => GameAccess.Finite(bounds.center) && GameAccess.Finite(bounds.size) &&
+            bounds.size.x > 0 && bounds.size.y > 0 && bounds.size.z > 0 &&
+            bounds.size.x <= 10000 && bounds.size.y <= 10000 && bounds.size.z <= 10000;
+
         internal static int GameplayMask()
         {
             var player = GameAccess.Read(GameAccess.Singleton("GameNetworkManager"), "localPlayerController")
@@ -71,7 +102,12 @@ namespace LCReplay.Plugin.Capture
                 var lods = group.GetLODs();
                 if (lods.Length == 0) continue;
                 var selected = new HashSet<Renderer>();
-                var natural = IsNatural(group, lods) && lods.Length > 1;
+                // Generated mansion/facility tiles can have their high-detail LOD
+                // disabled by the live camera before the recorder scans the map.
+                // Keep that source mesh so the spectator can render the room later.
+                var tileType = GameAccess.Type("DunGen.Tile");
+                var generatedTile = tileType != null && group.GetComponentInParent(tileType) != null;
+                var natural = !generatedTile && IsNatural(group, lods) && lods.Length > 1;
                 if (natural)
                 {
                     var low = lods.Length - 1;
@@ -93,8 +129,13 @@ namespace LCReplay.Plugin.Capture
                 }
                 foreach (var lod in lods)
                 {
-                    if (selected.Count == 0)
-                        foreach (var renderer in lod.renderers) if (renderer) selected.Add(renderer);
+                    if (selected.Count == 0 && lod.renderers.Length != 0)
+                        foreach (var renderer in lod.renderers)
+                            if (renderer)
+                            {
+                                selected.Add(renderer);
+                                if (generatedTile) result.TileLods.Add(renderer);
+                            }
                     foreach (var renderer in lod.renderers)
                         if (renderer && !selected.Contains(renderer)) result.OtherLods.Add(renderer);
                 }
@@ -137,8 +178,9 @@ namespace LCReplay.Plugin.Capture
             internal readonly HashSet<Renderer> CullerManaged = new HashSet<Renderer>();
             internal readonly Dictionary<Renderer, bool> Overrides = new Dictionary<Renderer, bool>();
             internal readonly HashSet<Renderer> OtherLods = new HashSet<Renderer>();
+            internal readonly HashSet<Renderer> TileLods = new HashSet<Renderer>();
             internal readonly Dictionary<Renderer, LodSelection> NaturalLods = new Dictionary<Renderer, LodSelection>();
-            internal bool Enabled(Renderer renderer) => NaturalLods.ContainsKey(renderer) ||
+            internal bool Enabled(Renderer renderer) => NaturalLods.ContainsKey(renderer) || TileLods.Contains(renderer) ||
                 (Overrides.TryGetValue(renderer, out var visible) ? visible : renderer.enabled || CullerManaged.Contains(renderer));
         }
     }

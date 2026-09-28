@@ -73,6 +73,46 @@ namespace LCReplay.Core
         private static void Frame(ReplayFrame f, ReplayReadLimits l)
         {
             Time(f.Time, l); Dictionary(f.State, l);
+            if (f.ParticleStyles == null || f.ParticleStyles.Count > 128) Fail("Particle style count exceeds limit.");
+            var particleStyleIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var style in f.ParticleStyles!)
+            {
+                ParticleStyle(style, l);
+                if (!particleStyleIds.Add(style.Id)) Fail("Duplicate particle style identifier.");
+            }
+            if (f.Particles == null || f.Particles.Count > 256) Fail("Short-lived particle count exceeds limit.");
+            foreach (var particle in f.Particles!)
+            {
+                if (particle == null) Fail("Null short-lived particle.");
+                String(particle.EmitterId, l);
+                if (particle.EmitterId.Length != 0 && !particleStyleIds.Contains(particle.EmitterId)) Fail("Missing particle style.");
+                Vector(particle.Position); Floats(particle.Color, 4, false);
+                Vector(particle.Velocity); Vector(particle.Size3D); Vector(particle.Rotation3D);
+                if (!Finite(particle.Lifetime) || !Finite(particle.RemainingLifetime) || particle.Lifetime <= 0 ||
+                    particle.Lifetime > 86400 || particle.RemainingLifetime < 0 || particle.RemainingLifetime > particle.Lifetime)
+                    Fail("Invalid particle lifetime.");
+                if (!Finite(particle.Size) || particle.Size <= 0 || particle.Size > 100 ||
+                    !Finite(particle.Rotation) || Math.Abs(particle.Rotation) > 3600)
+                    Fail("Invalid short-lived particle pose.");
+            }
+            if (f.Lines == null || f.Lines.Count > 128) Fail("Line renderer count exceeds limit.");
+            var lineIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var line in f.Lines!)
+            {
+                if (line == null) Fail("Null line renderer pose.");
+                String(line.Id, l);
+                String(line.MaterialName, l); String(line.ShaderName, l);
+                if (line.TextureMode < 0 || line.TextureMode > 4 || line.Alignment < 0 || line.Alignment > 1)
+                    Fail("Invalid line renderer mode.");
+                if (line.Id.Length == 0 || !lineIds.Add(line.Id) || line.Positions == null ||
+                    line.Positions.Length < 6 || line.Positions.Length > 96 || line.Positions.Length % 3 != 0)
+                    Fail("Invalid line renderer geometry.");
+                foreach (var value in line.Positions!) if (!Finite(value) || Math.Abs(value) > 1000000) Fail("Invalid line position.");
+                Floats(line.StartColor, 4, false); Floats(line.EndColor, 4, false);
+                if (!Finite(line.StartWidth) || !Finite(line.EndWidth) ||
+                    line.StartWidth < 0 || line.EndWidth < 0 || line.StartWidth > 100 || line.EndWidth > 100)
+                    Fail("Invalid line width.");
+            }
             if (f.Anchors == null || f.Anchors.Count > 16) Fail("Anchor count exceeds limit.");
             var anchorIds = new HashSet<string>(StringComparer.Ordinal);
             foreach (var anchor in f.Anchors!)
@@ -81,6 +121,15 @@ namespace LCReplay.Core
                 String(anchor.Id, l);
                 if (anchor.Id.Length == 0 || !anchorIds.Add(anchor.Id)) Fail("Invalid or duplicate anchor identifier.");
                 Vector(anchor.Position); Vector(anchor.Scale); Rotation(anchor.Rotation);
+            }
+            if (f.SceneRenderers == null || f.SceneRenderers.Count > 512) Fail("Moving scene renderer count exceeds limit.");
+            var sceneRendererIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var renderer in f.SceneRenderers!)
+            {
+                if (renderer == null) Fail("Null moving scene renderer pose.");
+                String(renderer.Id, l);
+                if (renderer.Id.Length == 0 || !sceneRendererIds.Add(renderer.Id)) Fail("Invalid or duplicate moving scene renderer identifier.");
+                Vector(renderer.Position); Vector(renderer.Scale); Rotation(renderer.Rotation);
             }
             if (f.Entities == null || f.Entities.Count > l.MaxEntitiesPerFrame) Fail("Entity count exceeds limit.");
             var ids = new HashSet<string>(StringComparer.Ordinal);
@@ -115,6 +164,25 @@ namespace LCReplay.Core
         {
             String(w.Scene, l);
             String(w.CaptureSetId, l); String(w.Layer, l);
+            String(w.AssetScene, l); String(w.AssetGameVersion, l);
+            if (w.AssetRendererPaths == null || w.AssetTerrainPaths == null ||
+                w.AssetRendererPaths.Count + w.AssetTerrainPaths.Count > 4096 ||
+                (w.AssetScene.Length == 0 && (w.AssetRendererPaths.Count != 0 || w.AssetTerrainPaths.Count != 0)) ||
+                (w.AssetScene.Length != 0 && (w.AssetBuildIndex < 0 || w.AssetGameVersion.Length == 0 || w.Layer != "exterior")) ||
+                w.LevelId < -1 || w.DungeonFlow < -1) Fail("Invalid scene-asset reference metadata.");
+            var assetPaths = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var path in w.AssetRendererPaths!)
+            {
+                String(path, l);
+                if (path.Length == 0 || path.Length > 256) Fail("Scene renderer path length is invalid: " + path.Length + ".");
+                if (!assetPaths.Add("r" + path)) Fail("Duplicate scene renderer path.");
+            }
+            foreach (var path in w.AssetTerrainPaths!)
+            {
+                String(path, l);
+                if (path.Length == 0 || path.Length > 256) Fail("Scene terrain path length is invalid: " + path.Length + ".");
+                if (!assetPaths.Add("t" + path)) Fail("Duplicate scene terrain path.");
+            }
             if (w.CaptureSetId.Length > 96 || (w.Layer != "" && w.Layer != "exterior" && w.Layer != "interior") ||
                 (w.Layer.Length != 0 && w.CaptureSetId.Length == 0)) Fail("Invalid world capture layer.");
             if (w.Rooms == null || w.Rooms.Count > 4096) Fail("World room count exceeds limit.");
@@ -125,6 +193,14 @@ namespace LCReplay.Core
                 String(room.Id, l); Vector(room.Center); Vector(room.Size);
                 if (room.Id.Length == 0 || !roomIds.Add(room.Id) || room.Size.X <= 0 || room.Size.Y <= 0 || room.Size.Z <= 0 ||
                     room.Size.X > 10000 || room.Size.Y > 10000 || room.Size.Z > 10000) Fail("Invalid room bounds.");
+                if (room.AdditionalVolumes == null || room.AdditionalVolumes.Count > 8) Fail("Room volume count exceeds limit.");
+                foreach (var volume in room.AdditionalVolumes!)
+                {
+                    if (volume == null) Fail("Null room volume.");
+                    Vector(volume.Center); Vector(volume.Size);
+                    if (volume.Size.X <= 0 || volume.Size.Y <= 0 || volume.Size.Z <= 0 ||
+                        volume.Size.X > 10000 || volume.Size.Y > 10000 || volume.Size.Z > 10000) Fail("Invalid additional room bounds.");
+                }
             }
             if (w.Environment != null)
             {
@@ -172,7 +248,8 @@ namespace LCReplay.Core
                 if (light.Id.Length == 0 || !lightIds.Add(light.Id) ||
                     (light.Type != "Directional" && light.Type != "Point" && light.Type != "Spot")) Fail("Invalid light identifier or type.");
                 Vector(light.Position); Rotation(light.Rotation); Floats(light.Color, 4, false);
-                if (!Finite(light.Intensity) || light.Intensity < 0 || light.Intensity > 1000000 ||
+                if (!Finite(light.ColorTemperature) || light.ColorTemperature < 1000 || light.ColorTemperature > 20000 ||
+                    !Finite(light.Intensity) || light.Intensity < 0 || light.Intensity > 1000000 ||
                     !Finite(light.Range) || light.Range < 0 || light.Range > 100000 ||
                     !Finite(light.SpotAngle) || light.SpotAngle < 0 || light.SpotAngle > 180) Fail("Invalid light parameters.");
             }
@@ -229,6 +306,7 @@ namespace LCReplay.Core
                 if (emitter == null) Fail("Null particle emitter.");
                 String(emitter.Id, l); String(emitter.Name, l); String(emitter.EntityId, l);
                 String(emitter.MaterialId, l); String(emitter.RoomId, l);
+                if (emitter.Style != null) ParticleStyle(emitter.Style, l);
                 if (emitter.Id.Length == 0 || !emitterIds.Add(emitter.Id) ||
                     (emitter.MaterialId.Length != 0 && !materialIds.Contains(emitter.MaterialId)))
                     Fail("Invalid particle emitter reference.");
@@ -326,6 +404,10 @@ namespace LCReplay.Core
                     if (id.Length != 0 && !materialIds.Contains(id)) Fail("Geometry references missing material.");
                 }
                 if (g.BonePaths == null || g.BonePaths.Count > l.MaxBonesPerEntity) Fail("Mesh bone count exceeds limit.");
+                String(g.RootBonePath, l);
+                if (g.RootBonePath.Length > 4096) Fail("Mesh root bone path exceeds limit.");
+                var rootDepth = 1;
+                foreach (var c in g.RootBonePath) if (c == '/' && ++rootDepth > 128) Fail("Mesh root bone hierarchy exceeds limit.");
                 foreach (var path in g.BonePaths!)
                 {
                     String(path, l);
@@ -355,6 +437,23 @@ namespace LCReplay.Core
                 }
                 else if (!g.IsBoundsProxy && g.Vertices.Length >= 9 && g.BonePaths.Count == 0) meshSources.Add(g.Id);
             }
+        }
+
+        private static void ParticleStyle(ParticleStyleSnapshot style, ReplayReadLimits l)
+        {
+            if (style == null) Fail("Null particle style.");
+            String(style.Id, l); String(style.Name, l); String(style.ParentName, l);
+            String(style.MaterialName, l); String(style.ShaderName, l); String(style.MeshName, l);
+            if (style.Id.Length == 0 || style.RenderMode < 0 || style.RenderMode > 5 ||
+                style.Alignment < 0 || style.Alignment > 5 || style.VertexStreams == null || style.VertexStreams.Length > 32)
+                Fail("Invalid particle renderer style.");
+            foreach (var stream in style.VertexStreams!) if (stream < 0 || stream > 63) Fail("Invalid particle vertex stream.");
+            Vector(style.Scale); Vector(style.Pivot);
+            Vector(style.Position); Rotation(style.Rotation);
+            if (!Finite(style.Time) || style.Time < 0 || style.Time > 86400) Fail("Invalid particle simulation time.");
+            if (!Finite(style.LengthScale) || !Finite(style.VelocityScale) || !Finite(style.CameraVelocityScale) ||
+                Math.Abs(style.LengthScale) > 10000 || Math.Abs(style.VelocityScale) > 10000 || Math.Abs(style.CameraVelocityScale) > 10000)
+                Fail("Invalid particle stretch settings.");
         }
 
         private static uint PngDimension(byte[] data, int offset) =>

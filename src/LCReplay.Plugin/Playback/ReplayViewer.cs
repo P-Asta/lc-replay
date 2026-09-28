@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using LCReplay.Core;
 using LCReplay.Plugin.Capture;
+using LCReplay.Plugin.UI;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
@@ -15,15 +18,16 @@ using Object = UnityEngine.Object;
 namespace LCReplay.Plugin.Playback
 {
     /// <summary>
-    /// Displays recorded data using renderer-only objects. Never loads a game level,
-    /// instantiates a game prefab, or invokes a recorded method or network message.
-    /// The caller must disconnect from a live session before creating this viewer.
+    /// Displays recorded data using renderer-only objects. A matching built-in
+    /// moon scene may be loaded as inert scenery; gameplay methods are not replayed.
+    /// During connected playback the live session continues behind the viewer.
     /// </summary>
     public sealed class ReplayViewer : IDisposable
     {
         private const int ReplayLayer = 31;
         private ReplaySession _session;
         private readonly ReplayRecordingTimeline _recording;
+        private readonly Dictionary<int, ReplaySession> _recentParts = new Dictionary<int, ReplaySession>();
         private int _partIndex;
         private int _readPart = -1;
         private Task<ReplaySession>? _partRead;
@@ -33,6 +37,8 @@ namespace LCReplay.Plugin.Playback
         private Exception? _playbackError;
         private readonly Dictionary<Camera, bool> _cameraStates = new Dictionary<Camera, bool>();
         private readonly Dictionary<Canvas, bool> _canvasStates = new Dictionary<Canvas, bool>();
+        private readonly Dictionary<AudioListener, bool> _listenerStates = new Dictionary<AudioListener, bool>();
+        private readonly Dictionary<AudioSource, bool> _audioSourceStates = new Dictionary<AudioSource, bool>();
         private readonly Dictionary<Renderer, bool> _rendererStates = new Dictionary<Renderer, bool>();
         private readonly Dictionary<Behaviour, bool> _uiInputStates = new Dictionary<Behaviour, bool>();
         private readonly Dictionary<Type, bool> _uiInputTypes = new Dictionary<Type, bool>();
@@ -51,22 +57,34 @@ namespace LCReplay.Plugin.Playback
         private readonly List<KeyValuePair<Light, bool>> _worldLights = new List<KeyValuePair<Light, bool>>();
         private readonly Dictionary<string, Transform> _anchorRoots = new Dictionary<string, Transform>(StringComparer.Ordinal);
         private readonly Dictionary<string, Bounds> _interiorRooms = new Dictionary<string, Bounds>();
-        private readonly Dictionary<string, WorldSnapshot> _combinedWorlds = new Dictionary<string, WorldSnapshot>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Bounds[]> _additionalRoomVolumes = new Dictionary<string, Bounds[]>();
         internal float InteriorRenderDistance { get; set; } = 105f;
         private ReplayAppearance? _appearance;
+        private SceneAssetReplay? _assetScene;
+        private ReplayVisualState? _visualState;
         private ReplayEnvironment? _environment;
         private RenderTexture? _displayTexture;
         private RawImage? _displayImage;
         private float _resolutionScale;
         private float _gamma;
+        private bool _disableInteriorCulling;
+        private bool _mutePlayerAudio;
         private readonly Action<float>? _saveResolution;
         private readonly Action<float>? _saveGamma;
+        private readonly Action<bool>? _saveDisableInteriorCulling;
+        private readonly Action<bool>? _saveMutePlayerAudio;
+        private Transform? _shipCabinAnchor;
+        private Vector3 _shipCabinCenter;
         private int _screenWidth, _screenHeight;
         private readonly Dictionary<string, GameObject> _geometryObjects = new Dictionary<string, GameObject>();
         private readonly List<KeyValuePair<Behaviour, LocalFogSnapshot>> _localFogs = new List<KeyValuePair<Behaviour, LocalFogSnapshot>>();
         private readonly List<Texture3D> _worldFogMasks = new List<Texture3D>();
         private readonly Dictionary<string, GeometrySnapshot> _dynamicGeometry = new Dictionary<string, GeometrySnapshot>();
+        private readonly Dictionary<string, GeometrySnapshot> _movingSceneGeometry = new Dictionary<string, GeometrySnapshot>();
         private readonly HashSet<string> _completeRendererLists = new HashSet<string>();
+        private readonly Dictionary<string, RenderPose> _currentRendererPoses = new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+        private readonly Dictionary<string, RenderPose> _currentSceneRendererPoses = new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+        private readonly HashSet<string> _inactiveEntities = new HashSet<string>(StringComparer.Ordinal);
         private bool _hasRendererPoseCapability;
         private readonly List<EntitySnapshot> _players = new List<EntitySnapshot>();
         private readonly CursorLockMode _savedCursorLock;
@@ -74,6 +92,28 @@ namespace LCReplay.Plugin.Playback
         private Scene _scene;
         private GameObject? _root;
         private Camera? _camera;
+        private AudioSource? _replayAudio;
+        private AudioClip? _replayAudioClip;
+        private ReplayEvent[] _spatialAudioBlocks = Array.Empty<ReplayEvent>();
+        private readonly List<SpatialAudioVoice> _spatialVoices = new List<SpatialAudioVoice>();
+        private int _spatialAudioCursor;
+        private double _lastAudioTime = -1;
+        private bool _spatialAudioPaused;
+        private ParticleSystem? _burstParticles;
+        private ReplayParticleAssets? _particleAssets;
+        private readonly Dictionary<string, ParticleSystem> _emitterBursts = new Dictionary<string, ParticleSystem>(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<ParticlePose>> _emitterSamples = new Dictionary<string, List<ParticlePose>>(StringComparer.Ordinal);
+        private readonly HashSet<string> _simulatedEmitters = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _activeEmitters = new HashSet<string>(StringComparer.Ordinal);
+        private Material? _burstMaterial;
+        private Material? _particleTemplate;
+        private bool _particleTemplateSearched;
+        private readonly Dictionary<int, Material> _particleMaterials = new Dictionary<int, Material>();
+        private Mesh? _swarmMesh;
+        private Texture2D? _burstTexture;
+        private readonly ParticleSystem.Particle[] _burstBuffer = new ParticleSystem.Particle[256];
+        private readonly Dictionary<string, LineRenderer> _frameLines = new Dictionary<string, LineRenderer>(StringComparer.Ordinal);
+        private readonly HashSet<string> _inactiveLines = new HashSet<string>(StringComparer.Ordinal);
         private Light? _spectatorLight;
         private Light? _exteriorFill;
         private Mesh? _cube;
@@ -86,11 +126,17 @@ namespace LCReplay.Plugin.Playback
         private Component? _savedEventSystem;
         private bool _eventSystemRemembered;
         private ReplayFrame _frame = new ReplayFrame();
+        private readonly ReplayTimelineSampler _sampler = new ReplayTimelineSampler();
+        private WorldSnapshot? _displayWorld;
         private int _worldIndex = -2;
+        private IEnumerator<float>? _worldBuild;
+        private float _worldBuildProgress;
+        private bool _initialPrefetchPending = true;
         private string _selectedId = "";
         private string _sceneName = "No world geometry recorded";
         private bool _follow;
         private bool _showLabels;
+        private GUIStyle? _diagnosticLabelStyle;
         private bool _showSkeletons;
         private bool _disposed;
         private bool _looking;
@@ -102,12 +148,14 @@ namespace LCReplay.Plugin.Playback
         private float _interiorScanElapsed;
         private float _followClearanceElapsed;
         private float _followDistance = 2.5f;
+        private double? _pendingHudSeek;
+        private float _pendingHudSeekAt;
 
         public bool IsPlaying { get; private set; } = true;
         public double Time { get; private set; }
         public double Duration => _recording.Duration;
         public double LocalTime => _recording.LocalTime(_partIndex, Time);
-        public bool IsBuffering => _requestedPart >= 0;
+        public bool IsBuffering => _requestedPart >= 0 || _worldBuild != null || _assetScene?.IsLoading == true;
         public int PartIndex => _partIndex;
         public Exception? Error => _playbackError;
         public bool CloseRequested { get; private set; }
@@ -119,6 +167,12 @@ namespace LCReplay.Plugin.Playback
 
         public ReplayViewer(ReplaySession session, ReplayRecordingTimeline? recording = null, int partIndex = 0,
             float resolutionScale = 1f, float gamma = 1f, Action<float>? saveResolution = null, Action<float>? saveGamma = null)
+            : this(session, recording, partIndex, resolutionScale, gamma, saveResolution, saveGamma, false, null, false, null) { }
+
+        public ReplayViewer(ReplaySession session, ReplayRecordingTimeline? recording, int partIndex,
+            float resolutionScale, float gamma, Action<float>? saveResolution, Action<float>? saveGamma,
+            bool disableInteriorCulling, Action<bool>? saveDisableInteriorCulling,
+            bool mutePlayerAudio, Action<bool>? saveMutePlayerAudio)
         {
             _session = session ?? throw new ArgumentNullException(nameof(session));
             _recording = recording ?? new ReplayRecordingTimeline(new[] { new ReplayRecordingPart { FilePath = "single.lcr", Duration = session.Duration } });
@@ -128,20 +182,29 @@ namespace LCReplay.Plugin.Playback
             _savedCursorVisible = Cursor.visible;
             _resolutionScale = Mathf.Clamp(resolutionScale, 0.25f, 1f);
             _gamma = Mathf.Clamp(gamma, 0.5f, 2f);
+            _disableInteriorCulling = disableInteriorCulling;
+            _mutePlayerAudio = mutePlayerAudio;
             _saveResolution = saveResolution;
             _saveGamma = saveGamma;
+            _saveDisableInteriorCulling = saveDisableInteriorCulling;
+            _saveMutePlayerAudio = saveMutePlayerAudio;
             try
             {
                 _shader = FindShader();
                 _unlitShader = Shader.Find("HDRP/Unlit") ?? Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Color");
                 if (_shader == null) throw new InvalidOperationException("No supported replay shader is available in this game version.");
                 _scene = SceneManager.CreateScene("LCReplay_" + Guid.NewGuid().ToString("N"), new CreateSceneParameters(LocalPhysicsMode.None));
+                ReplayIsolation.Register(_scene);
                 _root = NewObject("LCReplay (render only)", null);
                 SceneManager.MoveGameObjectToScene(_root, _scene);
                 _cube = MakeCube();
                 SuspendOtherViews();
                 var cameraObject = NewObject("Replay camera", _root.transform);
                 _camera = cameraObject.AddComponent<Camera>();
+                cameraObject.AddComponent<AudioListener>();
+                _replayAudio = cameraObject.AddComponent<AudioSource>();
+                _replayAudio.playOnAwake = false;
+                _replayAudio.spatialBlend = 0f;
                 _camera.cullingMask = 1 << ReplayLayer;
                 _camera.clearFlags = CameraClearFlags.Skybox;
                 _camera.backgroundColor = new Color(0.025f, 0.035f, 0.05f);
@@ -172,8 +235,12 @@ namespace LCReplay.Plugin.Playback
                 _exteriorFill.cullingMask = 1 << ReplayLayer;
                 AddRenderPipelineLightData(fillObject, 2.5f);
                 _exteriorFill.intensity = 2.5f;
+                _assetScene = new SceneAssetReplay(ReplayLayer, UpdateInteriorVisibility);
+                CreateBurstRenderer();
+                SuspendOtherViews();
                 SetLooking(false);
                 Seek(_recording.Parts[_partIndex].Offset);
+                RebuildAudio();
                 if (_players.Count != 0) SelectPlayer(_players[0].Id, true);
                 else
                 {
@@ -182,9 +249,11 @@ namespace LCReplay.Plugin.Playback
                 }
                 _hud = new NativePlaybackHud(session, TogglePause, SeekFromHud, CycleSpeed, () => _follow = !_follow,
                     FocusSelected, id => SelectPlayer(id, true), ToggleDiagnostics, () => CloseRequested = true,
-                    _resolutionScale, _gamma, SetResolutionScale, SetGamma);
+                    _resolutionScale, _gamma, SetResolutionScale, SetGamma,
+                    _disableInteriorCulling, SetDisableInteriorCulling,
+                    _mutePlayerAudio, SetMutePlayerAudio);
                 SceneManager.MoveGameObjectToScene(_hud.Root, _scene);
-                PrefetchNextPart();
+                _hud.SetLoading(true, "Building replay scene", .85f);
             }
             catch
             {
@@ -197,7 +266,41 @@ namespace LCReplay.Plugin.Playback
         {
             if (_disposed || _camera == null) return;
             if (Screen.width != _screenWidth || Screen.height != _screenHeight) ResizeDisplay();
+            var hudSeekApplied = false;
+            if (_pendingHudSeek.HasValue)
+            {
+                var target = _pendingHudSeek.Value;
+                var targetPart = _recording.Locate(target);
+                var sameWorld = targetPart == _partIndex && _worldBuild == null &&
+                    FindWorld(_recording.LocalTime(targetPart, target)) == _worldIndex;
+                if (sameWorld || UnityEngine.Time.realtimeSinceStartup - _pendingHudSeekAt >= .12f)
+                {
+                    _pendingHudSeek = null;
+                    Seek(target);
+                    hudSeekApplied = true;
+                }
+            }
             CompletePartRead();
+            if (_worldBuild != null)
+            {
+                var watch = Stopwatch.StartNew();
+                // Budget elapsed work, not object count. The old 24-object cap
+                // stretched cheap mesh/texture setup across hundreds of frames.
+                while (watch.Elapsed.TotalMilliseconds < 12)
+                {
+                    if (!_worldBuild.MoveNext())
+                    { _worldBuild.Dispose(); _worldBuild = null; _worldBuildProgress = 1f; ApplyFrame(); break; }
+                    _worldBuildProgress = Mathf.Clamp01(_worldBuild.Current);
+                    if (_assetScene?.IsLoading == true) break;
+                }
+                _hud?.SetLoading(true, _assetScene?.IsLoading == true ? "Loading moon scenery" : "Building replay scene",
+                    .85f + .13f * _worldBuildProgress);
+                if (_worldBuild != null) return;
+            }
+            if (_assetScene?.IsLoading == true)
+            { _hud?.SetLoading(true, "Loading moon scenery", .98f); return; }
+            _hud?.SetLoading(false, "", 1f);
+            if (_initialPrefetchPending) { _initialPrefetchPending = false; PrefetchNextPart(); }
             var delta = float.IsNaN(unscaledDeltaTime) || float.IsInfinity(unscaledDeltaTime) ? 0 : Mathf.Max(0f, unscaledDeltaTime);
             // A menu transition can introduce another camera or canvas while replay is open.
             _environmentScanElapsed += delta;
@@ -206,7 +309,7 @@ namespace LCReplay.Plugin.Playback
                 _environmentScanElapsed = 0;
                 SuspendOtherViews();
             }
-            if (IsPlaying && !IsBuffering)
+            if (IsPlaying && !IsBuffering && !hudSeekApplied && !_pendingHudSeek.HasValue)
             {
                 Seek(Time + delta * Speed);
                 if (Time >= Duration) IsPlaying = false;
@@ -261,12 +364,22 @@ namespace LCReplay.Plugin.Playback
             }
             _interiorScanElapsed += delta;
             if (_interiorScanElapsed >= 0.2f) { _interiorScanElapsed = 0; UpdateInteriorVisibility(); }
+            ApplyBurstParticles();
+            ApplyLines();
             UpdatePlayerBodyOcclusion();
             foreach (var effect in _worldParticles) if (effect) { var main = effect.main; main.simulationSpeed = IsPlaying ? Speed : 0f; }
+            SyncAudio();
             _hud?.Update(_session, _frame, _players, _selectedId, _sceneName, Time, IsPlaying, Speed, _follow, _showSkeletons, Duration, LocalTime, IsBuffering);
         }
 
-        private void SeekFromHud(double time) => Seek(double.IsNegativeInfinity(time) ? Time - 5 : double.IsPositiveInfinity(time) ? Time + 5 : time);
+        private void SeekFromHud(double time)
+        {
+            if (double.IsNegativeInfinity(time) || double.IsPositiveInfinity(time))
+            { _pendingHudSeek = null; Seek(double.IsNegativeInfinity(time) ? Time - 5 : Time + 5); return; }
+            if (double.IsNaN(time)) return;
+            _pendingHudSeek = Math.Max(0, Math.Min(Duration, time));
+            _pendingHudSeekAt = UnityEngine.Time.realtimeSinceStartup;
+        }
 
         private void CycleSpeed()
         {
@@ -292,20 +405,25 @@ namespace LCReplay.Plugin.Playback
                 _requestedPart = targetPart;
                 _requestedTime = target;
                 Time = target;
-                RequestPartRead(targetPart);
+                if (!_recentParts.ContainsKey(targetPart)) RequestPartRead(targetPart);
                 CompletePartRead();
                 return;
             }
             _requestedPart = -1;
             Time = target;
-            _frame = ReplayTimeline.Sample(_session, LocalTime);
-            ApplyFrame();
+            _frame = _sampler.Sample(_session, LocalTime);
             var index = FindWorld(LocalTime);
             if (index != _worldIndex)
             {
-                RebuildWorld(index < 0 ? null : AssembleWorld(index));
+                var world = index < 0 ? null : AssembleWorld(index);
+                _worldBuild?.Dispose();
+                _visualState?.Dispose();
+                _visualState = null;
+                _worldBuild = RebuildWorldSteps(world).GetEnumerator();
+                _worldBuildProgress = 0;
                 _worldIndex = index;
             }
+            ApplyFrame();
         }
 
         public void TogglePause()
@@ -342,37 +460,64 @@ namespace LCReplay.Plugin.Playback
 
         private void CompletePartRead()
         {
-            if (_partRead == null) { if (_requestedPart >= 0) RequestPartRead(_requestedPart); return; }
-            if (!_partRead.IsCompleted) return;
             if (_requestedPart < 0) return; // Keep exactly one prefetched part.
-            if (_readPart != _requestedPart) { RequestPartRead(_requestedPart); return; }
-            var task = _partRead;
-            _partRead = null;
-            if (task.IsCanceled) { RequestPartRead(_requestedPart); return; }
-            if (task.IsFaulted)
+            ReplaySession? ready;
+            if (_recentParts.TryGetValue(_requestedPart, out var cached))
             {
-                _playbackError = task.Exception?.GetBaseException();
-                _requestedPart = -1;
-                IsPlaying = false;
-                return;
+                ready = cached;
+                _recentParts.Remove(_requestedPart);
+            }
+            else
+            {
+                if (_partRead == null) { RequestPartRead(_requestedPart); return; }
+                if (!_partRead.IsCompleted) return;
+                if (_readPart != _requestedPart) { RequestPartRead(_requestedPart); return; }
+                var task = _partRead;
+                _partRead = null;
+                if (task.IsCanceled) { RequestPartRead(_requestedPart); return; }
+                if (task.IsFaulted)
+                {
+                    _playbackError = task.Exception?.GetBaseException();
+                    _requestedPart = -1;
+                    IsPlaying = false;
+                    return;
+                }
+                ready = task.Result;
             }
             var selectedName = SelectedPlayer()?.Name;
             var part = _requestedPart;
             var target = _requestedTime;
             _requestedPart = -1;
-            RebuildWorld(null);
-            foreach (var entity in _entities.Values)
+            var previousWindow = _recording.Parts[_partIndex].Window;
+            var targetWindow = _recording.Parts[part].Window;
+            var retainWorld = _displayWorld != null && previousWindow != null && targetWindow != null &&
+                ReferenceEquals(previousWindow.Index, targetWindow.Index) &&
+                previousWindow.Index.WorldRevisionAt(previousWindow.Start + LocalTime) ==
+                targetWindow.Index.WorldRevisionAt(targetWindow.Start + _recording.LocalTime(part, target));
+            if (!retainWorld) { _visualState?.Dispose(); _visualState = null; }
+            if (!retainWorld) foreach (var entity in _entities.Values)
             {
                 if (entity.SkeletonMesh != null) Object.Destroy(entity.SkeletonMesh);
                 if (entity.Root != null) { entity.Root.SetActive(false); Object.Destroy(entity.Root); }
             }
-            _entities.Clear();
-            _session = task.Result;
-            _combinedWorlds.Clear();
+            if (!retainWorld) _entities.Clear();
+            if (previousWindow != null)
+            {
+                _recentParts[_partIndex] = _session;
+                if (_recentParts.Count > 1) _recentParts.Remove(_recentParts.Keys.First());
+            }
+            _session = ready;
             _partIndex = part;
+            if (retainWorld && _displayWorld != null)
+            {
+                _visualState?.Dispose();
+                _visualState = new ReplayVisualState(_displayWorld, _session.Events,
+                    _geometryObjects, _anchorRoots, _assetScene, _root!.transform, ReplayLayer);
+            }
             _hasRendererPoseCapability = _session.Header.Capabilities.Contains("child-renderer-poses");
-            _worldIndex = -2;
+            _worldIndex = retainWorld ? FindWorld(_recording.LocalTime(part, target)) : -2;
             Seek(target);
+            RebuildAudio();
             var selected = _players.FirstOrDefault(player => player.Name == selectedName);
             if (selected != null) _selectedId = selected.Id;
             PrefetchNextPart();
@@ -386,69 +531,102 @@ namespace LCReplay.Plugin.Playback
         private void DrawLabels()
         {
             if (!_showLabels || _camera == null) return;
+            if (_diagnosticLabelStyle == null)
+            {
+                _diagnosticLabelStyle = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 15, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter,
+                    clipping = TextClipping.Clip
+                };
+                _diagnosticLabelStyle.normal.textColor = NativeReplayUi.White;
+            }
+            var priorColor = GUI.color;
             foreach (var entity in _frame.Entities)
             {
                 if (!entity.Active || (entity.Kind != "player" && entity.Kind != "enemy")) continue;
                 var screen = _camera.WorldToScreenPoint(ToVector(entity.Position) + Vector3.up * 2.1f);
                 if (screen.z <= 0 || screen.x < 0 || screen.x > Screen.width || screen.y < 0 || screen.y > Screen.height) continue;
-                GUI.color = EntityColor(entity.Kind);
-                GUI.Label(new Rect(screen.x - 95, Screen.height - screen.y, 190, 40), SafeText(entity.Name));
+                var rect = new Rect(screen.x - 95, Screen.height - screen.y, 190, 30);
+                GUI.color = NativeReplayUi.Orange;
+                GUI.DrawTexture(rect, Texture2D.whiteTexture);
+                GUI.color = NativeReplayUi.Black;
+                GUI.DrawTexture(new Rect(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2), Texture2D.whiteTexture);
+                GUI.color = priorColor;
+                GUI.Label(rect, SafeText(entity.Name), _diagnosticLabelStyle);
             }
-            GUI.color = Color.white;
+            GUI.color = priorColor;
         }
 
         private void ApplyFrame()
         {
             foreach (var anchor in _frame.Anchors)
                 if (_anchorRoots.TryGetValue(anchor.Id, out var root)) SetTransform(root, anchor.Position, anchor.Rotation, anchor.Scale);
-            foreach (var visual in _entities.Values) visual.Root.SetActive(false);
+            _inactiveEntities.Clear();
+            foreach (var id in _entities.Keys) _inactiveEntities.Add(id);
             _players.Clear();
             foreach (var entity in _frame.Entities)
             {
                 var visual = GetEntity(entity.Id);
-                visual.Root.SetActive(entity.Active && IsVisualKind(entity.Kind));
+                _inactiveEntities.Remove(entity.Id);
+                SetActiveIfChanged(visual.Root, entity.Active && IsVisualKind(entity.Kind));
                 SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
-                ConfigureProxy(visual, entity.Kind);
+                ConfigureProxy(visual, entity);
                 ConfigureSwarm(visual, entity);
                 UpdateBones(visual, entity.Bones);
                 // The game keeps unused player slots in the scene. Their hidden spawn
                 // positions must not become the initial camera target or a selectable player.
                 if (entity.Active && entity.Kind.Equals("player", StringComparison.OrdinalIgnoreCase)) _players.Add(entity);
             }
+            foreach (var id in _inactiveEntities)
+                if (_entities.TryGetValue(id, out var visual)) SetActiveIfChanged(visual.Root, false);
             if (_players.Count != 0 && !_players.Any(player => player.Id == _selectedId)) _selectedId = _players[0].Id;
-            ApplyRendererPoses();
-            UpdatePlayerBodyOcclusion();
+            if (_worldBuild == null)
+            {
+                ApplyRendererPoses();
+                _visualState?.Sync(LocalTime);
+            }
         }
 
         private void ApplyRendererPoses()
         {
             _completeRendererLists.Clear();
+            _currentRendererPoses.Clear();
+            _currentSceneRendererPoses.Clear();
             foreach (var entity in _frame.Entities)
             {
                 if ((_hasRendererPoseCapability || entity.Renderers.Count != 0) && !entity.State.ContainsKey("$omittedRenderers"))
                     _completeRendererLists.Add(entity.Id);
+                foreach (var pose in entity.Renderers)
+                    if (_dynamicGeometry.TryGetValue(pose.Id, out var geometry) && geometry.EntityId == entity.Id)
+                        _currentRendererPoses[pose.Id] = pose;
             }
-            // Start from the world snapshot on every sample. This keeps seeking
-            // backwards deterministic and supports older files without renderer poses.
+            foreach (var pose in _frame.SceneRenderers)
+                _currentSceneRendererPoses[pose.Id] = pose;
+            // Apply each renderer's final state once. Resetting all to the snapshot
+            // first toggled active geometry twice on every playback frame.
             foreach (var pair in _dynamicGeometry)
             {
                 if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || obj == null) continue;
                 var baseline = pair.Value;
-                SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
-                // Missing IDs in a complete renderer list mean destroyed renderers.
-                // Older or capped recordings retain their world-snapshot fallback.
-                obj.SetActive(!_completeRendererLists.Contains(baseline.EntityId));
-            }
-            foreach (var entity in _frame.Entities)
-            {
-                foreach (var pose in entity.Renderers)
+                if (_currentRendererPoses.TryGetValue(pair.Key, out var pose))
                 {
-                    if (!_dynamicGeometry.TryGetValue(pose.Id, out var geometry) || geometry.EntityId != entity.Id || !_geometryObjects.TryGetValue(pose.Id, out var obj) || obj == null) continue;
                     SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
-                    // This is local renderer visibility. An inactive/nonvisual owner
-                    // remains hidden because its entity root is still inactive.
-                    obj.SetActive(pose.Active);
+                    SetActiveIfChanged(obj, pose.Active);
                 }
+                else
+                {
+                    SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
+                    // Missing IDs in a complete list are destroyed renderers.
+                    SetActiveIfChanged(obj, !_completeRendererLists.Contains(baseline.EntityId));
+                }
+            }
+            foreach (var pair in _movingSceneGeometry)
+            {
+                if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || !obj) continue;
+                if (_currentSceneRendererPoses.TryGetValue(pair.Key, out var pose))
+                { SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale); SetActiveIfChanged(obj, pose.Active); }
+                else
+                { SetTransform(obj.transform, pair.Value.Position, pair.Value.Rotation, pair.Value.Scale); SetActiveIfChanged(obj, pair.Value.Active); }
             }
         }
 
@@ -463,9 +641,10 @@ namespace LCReplay.Plugin.Playback
             return result;
         }
 
-        private void ConfigureProxy(EntityVisual visual, string kind)
+        private void ConfigureProxy(EntityVisual visual, EntitySnapshot entity)
         {
-            visual.Proxy.SetActive(_showSkeletons && visual.GeometryCount == 0 && IsVisualKind(kind));
+            var kind = entity.Kind;
+            visual.Proxy.SetActive(visual.GeometryCount == 0 && (kind == "hazard" || _showSkeletons && IsVisualKind(kind)));
             if (kind == "player") visual.Root.name = "Recorded player body (render only)";
             if (visual.Kind == kind) return;
             visual.Kind = kind;
@@ -483,6 +662,11 @@ namespace LCReplay.Plugin.Playback
                 case "door":
                     visual.Proxy.transform.localPosition = Vector3.up;
                     visual.Proxy.transform.localScale = new Vector3(1.2f, 2f, 0.16f);
+                    break;
+                case "hazard":
+                    var mine = entity.Name.IndexOf("mine", StringComparison.OrdinalIgnoreCase) >= 0;
+                    visual.Proxy.transform.localPosition = Vector3.up * (mine ? .08f : .65f);
+                    visual.Proxy.transform.localScale = mine ? new Vector3(.65f, .16f, .65f) : new Vector3(.5f, 1.3f, .5f);
                     break;
                 default:
                     visual.Proxy.transform.localPosition = Vector3.zero;
@@ -507,19 +691,41 @@ namespace LCReplay.Plugin.Playback
                 var particles = effect.AddComponent<ParticleSystem>();
                 var main = particles.main;
                 main.loop = true; main.duration = 2f; main.startLifetime = 1.5f;
-                main.startSpeed = 0.55f; main.startSize = 0.065f;
+                main.startSpeed = 0.55f; main.startSize = 0.11f;
+                main.startColor = entity.Name.IndexOf("locust", StringComparison.OrdinalIgnoreCase) >= 0 ?
+                    new Color(0.68f, 0.24f, 0.13f, 0.9f) : new Color(0.89f, 0.69f, 0.17f, 0.95f);
                 main.maxParticles = 160; main.simulationSpace = ParticleSystemSimulationSpace.Local;
                 var emission = particles.emission; emission.rateOverTime = 95f;
                 var shape = particles.shape; shape.enabled = true; shape.shapeType = ParticleSystemShapeType.Sphere;
                 shape.radius = 1.05f;
                 var noise = particles.noise; noise.enabled = true; noise.strength = 0.35f; noise.frequency = 1.2f;
                 var renderer = effect.GetComponent<ParticleSystemRenderer>();
-                renderer.renderMode = ParticleSystemRenderMode.Billboard;
+                // The live Circuit Bees use VFX Graph, which cannot be serialized
+                // as a Unity ParticleSystem. A tiny shaded body is a safer proxy
+                // than a billboard when a game's particle shader ignores alpha.
+                renderer.renderMode = ParticleSystemRenderMode.Mesh;
+                renderer.mesh = _swarmMesh ? _swarmMesh : (_swarmMesh = MakeSwarmMesh());
                 renderer.shadowCastingMode = ShadowCastingMode.Off; renderer.receiveShadows = false;
                 renderer.sharedMaterial = GetMaterial(entity.Name.IndexOf("locust", StringComparison.OrdinalIgnoreCase) >= 0 ?
-                    new Color(0.68f, 0.24f, 0.13f) : new Color(0.89f, 0.69f, 0.17f));
+                    new Color(0.45f, 0.19f, 0.08f) : new Color(0.62f, 0.40f, 0.06f));
                 visual.Swarm = effect;
                 visual.SwarmParticles = particles;
+                if (entity.Name.IndexOf("bee", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    visual.SwarmLightning = new LineRenderer[2];
+                    for (var i = 0; i < visual.SwarmLightning.Length; i++)
+                    {
+                        var lineObject = NewObject("Recorded bee lightning", effect.transform);
+                        var line = lineObject.AddComponent<LineRenderer>();
+                        line.useWorldSpace = false; line.positionCount = 5;
+                        line.widthMultiplier = 0.025f;
+                        line.startColor = new Color(1f, 0.86f, 0.3f, 0.85f);
+                        line.endColor = new Color(1f, 0.96f, 0.65f, 0.15f);
+                        line.sharedMaterial = GetMaterial(new Color(1f, 0.8f, 0.28f));
+                        line.shadowCastingMode = ShadowCastingMode.Off; line.receiveShadows = false;
+                        visual.SwarmLightning[i] = line;
+                    }
+                }
                 particles.Play(true);
             }
             var dead = entity.State.TryGetValue("isEnemyDead", out var value) &&
@@ -527,6 +733,21 @@ namespace LCReplay.Plugin.Playback
             visual.Swarm!.SetActive(entity.Active && !dead);
             var playback = visual.SwarmParticles!.main;
             playback.simulationSpeed = IsPlaying ? Speed : 0f;
+            if (visual.SwarmLightning != null)
+                for (var index = 0; index < visual.SwarmLightning.Length; index++)
+                {
+                    var line = visual.SwarmLightning[index];
+                    line.enabled = visual.Swarm.activeInHierarchy && ((int)(_frame.Time * 8) + index) % 3 == 0;
+                    if (!line.enabled) continue;
+                    var phase = (float)_frame.Time * 11f + index * 2.7f;
+                    for (var vertex = 0; vertex < 5; vertex++)
+                    {
+                        var fraction = vertex / 4f;
+                        line.SetPosition(vertex, new Vector3(Mathf.Sin(phase + vertex * 1.7f) * (0.12f + fraction * 0.8f),
+                            Mathf.Sin(phase * 0.8f + vertex * 2f) * 0.23f,
+                            Mathf.Cos(phase + vertex * 1.4f) * (0.12f + fraction * 0.8f)));
+                    }
+                }
         }
 
         private void UpdateBones(EntityVisual visual, List<BonePose> bones)
@@ -600,7 +821,6 @@ namespace LCReplay.Plugin.Playback
         {
             var selected = _session.Worlds[index].World!;
             if (selected.CaptureSetId.Length == 0) return selected;
-            if (_combinedWorlds.TryGetValue(selected.CaptureSetId, out var cached)) return cached;
             var exteriors = new List<WorldSnapshot>();
             WorldSnapshot? interior = null;
             for (var i = 0; i <= index; i++)
@@ -613,9 +833,16 @@ namespace LCReplay.Plugin.Playback
             if (exteriors.Count == 0) return selected;
             if (exteriors.Count == 1 && interior == null) return selected;
             var parts = interior == null ? exteriors : exteriors.Concat(new[] { interior! }).ToList();
+            var source = exteriors.LastOrDefault(part => part.AssetScene.Length != 0) ?? exteriors.First();
             var combined = new WorldSnapshot
             {
                 Scene = selected.Scene, CaptureSetId = selected.CaptureSetId,
+                AssetScene = source.AssetScene, AssetGameVersion = source.AssetGameVersion,
+                AssetBuildIndex = source.AssetBuildIndex,
+                MapSeed = source.MapSeed, LevelId = source.LevelId,
+                DungeonSeed = source.DungeonSeed, DungeonFlow = source.DungeonFlow,
+                AssetRendererPaths = exteriors.SelectMany(part => part.AssetRendererPaths).Distinct(StringComparer.Ordinal).ToList(),
+                AssetTerrainPaths = exteriors.SelectMany(part => part.AssetTerrainPaths).Distinct(StringComparer.Ordinal).ToList(),
                 Geometry = parts.SelectMany(part => part.Geometry).GroupBy(item => item.Id).Select(group => group.First()).ToList(),
                 Textures = parts.SelectMany(part => part.Textures).GroupBy(item => item.Id).Select(group => group.First()).ToList(),
                 Materials = parts.SelectMany(part => part.Materials).GroupBy(item => item.Id).Select(group => group.First()).ToList(),
@@ -623,9 +850,8 @@ namespace LCReplay.Plugin.Playback
                 ParticleEmitters = parts.SelectMany(part => part.ParticleEmitters).GroupBy(item => item.Id).Select(group => group.First()).ToList(),
                 LocalFogs = parts.SelectMany(part => part.LocalFogs).GroupBy(item => item.Id).Select(group => group.Last()).ToList(),
                 Rooms = interior?.Rooms ?? new List<RoomSnapshot>(),
-                Environment = exteriors.Select(part => part.Environment).FirstOrDefault(environment => environment != null)
+                Environment = exteriors.Select(part => part.Environment).LastOrDefault(environment => environment != null)
             };
-            if (interior != null) _combinedWorlds[selected.CaptureSetId] = combined;
             return combined;
         }
 
@@ -681,14 +907,41 @@ namespace LCReplay.Plugin.Playback
             _saveGamma?.Invoke(_gamma);
         }
 
-        private void RebuildWorld(WorldSnapshot? world)
+        private void SetDisableInteriorCulling(bool value)
         {
+            _disableInteriorCulling = value;
+            _saveDisableInteriorCulling?.Invoke(value);
+            UpdateInteriorVisibility();
+        }
+
+        private void SetMutePlayerAudio(bool value)
+        {
+            _mutePlayerAudio = value;
+            _saveMutePlayerAudio?.Invoke(value);
+            foreach (var voice in _spatialVoices)
+                if (voice.Player) voice.Source.mute = value;
+        }
+
+        private IEnumerable<float> RebuildWorldSteps(WorldSnapshot? world)
+        {
+            ClearSampledParticles();
+            _visualState?.Dispose(); _visualState = null;
+            _displayWorld = world;
             _environment?.Dispose(); _environment = null;
-            foreach (var obj in _worldObjects)
+            for (var i = 0; i < _worldObjects.Count; i++)
             {
+                var obj = _worldObjects[i];
                 if (obj != null) { obj.SetActive(false); Object.Destroy(obj); }
+                _worldObjects[i] = null!;
+                if (i % 48 == 47) yield return .02f;
             }
-            foreach (var mesh in _worldMeshes) if (mesh != null) Object.Destroy(mesh);
+            for (var i = 0; i < _worldMeshes.Count; i++)
+            {
+                var mesh = _worldMeshes[i];
+                if (mesh != null) Object.Destroy(mesh);
+                _worldMeshes[i] = null!;
+                if (i % 48 == 47) yield return .035f;
+            }
             foreach (var mask in _worldFogMasks) if (mask) Object.Destroy(mask);
             _worldObjects.Clear();
             _worldMeshes.Clear();
@@ -699,6 +952,7 @@ namespace LCReplay.Plugin.Playback
             _localFogs.Clear();
             _geometryObjects.Clear();
             _dynamicGeometry.Clear();
+            _movingSceneGeometry.Clear();
             _renderGeometrySources.Clear();
             _interiorRenderers.Clear();
             _exteriorRenderers.Clear();
@@ -706,24 +960,39 @@ namespace LCReplay.Plugin.Playback
             _worldLights.Clear();
             _anchorRoots.Clear();
             _interiorRooms.Clear();
+            _additionalRoomVolumes.Clear();
+            _shipCabinAnchor = null;
             _appearance?.Dispose(); _appearance = null;
+            foreach (var material in _particleMaterials.Values) if (material) Object.Destroy(material);
+            _particleMaterials.Clear();
             _worldHasLighting = world != null && world.Lights.Count != 0;
             foreach (var visual in _entities.Values) { visual.GeometryCount = 0; visual.Proxy.SetActive(_showSkeletons && IsVisualKind(visual.Kind)); }
             _sceneName = world?.Scene ?? "No world geometry recorded";
             if (world == null)
             {
+                _assetScene?.SetWorld(new WorldSnapshot());
                 if (_spectatorLight) _spectatorLight!.enabled = false;
                 if (_exteriorFill) _exteriorFill!.enabled = false;
-                return;
+                yield break;
             }
             _environment = new ReplayEnvironment(world, _root!.transform, ReplayLayer);
+            _assetScene?.SetWorld(world);
+            // Native material and particle templates arrive with the installed moon.
+            // Indexing resources before its asynchronous load completes would cache
+            // false misses and recreate effects with fallback shaders for this world.
+            while (_assetScene?.IsLoading == true) yield return .08f;
             _environment.SetGamma(_gamma);
-            _appearance = new ReplayAppearance(world, world.Lights.Count == 0 && _unlitShader != null && _unlitShader.isSupported ? _unlitShader : _shader!);
-            var representedRooms = new HashSet<string>(world.Geometry.Where(geometry => geometry.IsInterior &&
-                !geometry.IsBoundsProxy && geometry.RoomId.Length != 0).Select(geometry => geometry.RoomId), StringComparer.Ordinal);
+            _appearance = new ReplayAppearance();
+            foreach (var step in _appearance.BuildSteps(world,
+                world.Lights.Count == 0 && _unlitShader != null && _unlitShader.isSupported ? _unlitShader : _shader!))
+                yield return .08f + .37f * step;
             foreach (var room in world.Rooms)
-                if (representedRooms.Contains(room.Id))
-                    _interiorRooms[room.Id] = new Bounds(ToVector(room.Center), ToVector(room.Size));
+            {
+                _interiorRooms[room.Id] = new Bounds(ToVector(room.Center), ToVector(room.Size));
+                if (room.AdditionalVolumes.Count > 0)
+                    _additionalRoomVolumes[room.Id] = room.AdditionalVolumes.Select(volume =>
+                        new Bounds(ToVector(volume.Center), ToVector(volume.Size))).ToArray();
+            }
             foreach (var anchor in _frame.Anchors)
             {
                 var root = NewObject("Moving environment " + anchor.Id, _root!.transform);
@@ -735,8 +1004,13 @@ namespace LCReplay.Plugin.Playback
             var meshes = new Dictionary<string, Mesh>();
             foreach (var geometry in world.Geometry)
                 _renderGeometrySources[geometry.Id] = geometry.MeshSourceId.Length != 0 && _renderGeometrySources.TryGetValue(geometry.MeshSourceId, out var source) ? source : geometry;
+            var completedGeometry = 0;
             foreach (var geometry in world.Geometry)
             {
+                completedGeometry++;
+                if (geometry.AnchorId == "ship-elevator" && geometry.Name == "ShipInside" &&
+                    _anchorRoots.TryGetValue(geometry.AnchorId, out var cabinAnchor))
+                { _shipCabinAnchor = cabinAnchor; _shipCabinCenter = ToVector(geometry.Position); }
                 // Bounds describe unavailable geometry; filled bounds would invent opaque walls and fill the camera.
                 if (geometry.IsBoundsProxy || RenderVisibilityPolicy.IsDebugGeometry(geometry, debugMaterials)) continue;
                 if (geometry.Instances.Length != 0)
@@ -751,6 +1025,7 @@ namespace LCReplay.Plugin.Playback
                         for (var cell = 0; cell < 16; cell++) matrices[index][cell] = geometry.Instances[index * 16 + cell];
                     _instancedGeometry.Add(new InstancedGeometry(instanceMesh, instanceMaterials, matrices));
                     BuildProceduralGrass(instanceMesh, instanceMaterials, matrices);
+                    yield return .45f + .45f * completedGeometry / Math.Max(1, world.Geometry.Count);
                     continue;
                 }
                 var parent = _root!.transform;
@@ -765,7 +1040,9 @@ namespace LCReplay.Plugin.Playback
                 _worldObjects.Add(obj);
                 _geometryObjects[geometry.Id] = obj;
                 if (owner != null) _dynamicGeometry[geometry.Id] = geometry;
+                else if (geometry.IsMovingSceneRenderer) _movingSceneGeometry[geometry.Id] = geometry;
                 SetTransform(obj.transform, geometry.Position, geometry.Rotation, geometry.Scale);
+                if (!geometry.Active) obj.SetActive(false);
                 var data = _renderGeometrySources[geometry.Id];
                 if (!meshes.TryGetValue(data.Id, out var mesh))
                 {
@@ -817,6 +1094,7 @@ namespace LCReplay.Plugin.Playback
                     if (renderer) _exteriorRenderers.Add(renderer);
                 }
                 if (owner != null) { owner.GeometryCount++; owner.Proxy.SetActive(false); }
+                yield return .45f + .45f * completedGeometry / Math.Max(1, world.Geometry.Count);
             }
             var exteriorShadows = 0;
             var interiorShadows = 0;
@@ -829,6 +1107,8 @@ namespace LCReplay.Plugin.Playback
                 var light = obj.AddComponent<Light>();
                 light.type = snapshot.Type == "Directional" ? LightType.Directional : snapshot.Type == "Spot" ? LightType.Spot : LightType.Point;
                 light.color = new Color(snapshot.Color[0], snapshot.Color[1], snapshot.Color[2], snapshot.Color[3]);
+                light.useColorTemperature = snapshot.UseColorTemperature;
+                if (snapshot.UseColorTemperature) light.colorTemperature = snapshot.ColorTemperature;
                 light.range = snapshot.Range;
                 light.spotAngle = snapshot.SpotAngle;
                 var shadowCount = snapshot.IsInterior ? interiorShadows : exteriorShadows;
@@ -859,35 +1139,41 @@ namespace LCReplay.Plugin.Playback
             foreach (var snapshot in world.ParticleEmitters)
             {
                 var parent = snapshot.EntityId.Length != 0 ? GetEntity(snapshot.EntityId).Root.transform : _root!.transform;
-                var obj = NewObject("Recorded particles " + snapshot.Name, parent);
+                _particleAssets ??= new ReplayParticleAssets(_root!.transform, ReplayLayer);
+                var effect = _particleAssets.Create(parent, snapshot.Style, snapshot.Name, snapshot.MaterialId,
+                    _appearance, _burstMaterial, false, out var nativeEffect);
+                var obj = effect.gameObject;
                 _worldObjects.Add(obj);
-                SetTransform(obj.transform, snapshot.Position, snapshot.Rotation, Vec3.One);
-                var effect = obj.AddComponent<ParticleSystem>();
+                SetTransform(obj.transform, snapshot.Position, snapshot.Rotation, snapshot.Style?.Scale ?? Vec3.One);
                 var main = effect.main;
-                main.loop = true; main.duration = Math.Max(1f, snapshot.Lifetime);
-                main.startLifetime = snapshot.Lifetime; main.startSpeed = snapshot.Speed;
-                main.startSize = snapshot.Size; main.maxParticles = 512;
-                main.simulationSpace = ParticleSystemSimulationSpace.Local;
-                main.startColor = new Color(snapshot.Color[0], snapshot.Color[1], snapshot.Color[2], snapshot.Color[3]);
-                var emission = effect.emission; emission.rateOverTime = Mathf.Max(1f, snapshot.Rate);
-                var shape = effect.shape; shape.enabled = snapshot.Radius > 0;
-                if (shape.enabled) { shape.shapeType = ParticleSystemShapeType.Sphere; shape.radius = snapshot.Radius; }
+                if (!nativeEffect)
+                {
+                    main.loop = true; main.duration = Math.Max(1f, snapshot.Lifetime);
+                    main.startLifetime = snapshot.Lifetime; main.startSpeed = snapshot.Speed;
+                    main.startSize = snapshot.Size; main.maxParticles = 512;
+                    main.simulationSpace = ParticleSystemSimulationSpace.Local;
+                    main.startColor = new Color(snapshot.Color[0], snapshot.Color[1], snapshot.Color[2], snapshot.Color[3]);
+                    var emission = effect.emission; emission.rateOverTime = snapshot.Rate;
+                    var shape = effect.shape; shape.enabled = snapshot.Radius > 0;
+                    if (shape.enabled) { shape.shapeType = ParticleSystemShapeType.Sphere; shape.radius = snapshot.Radius; }
+                }
                 var renderer = obj.GetComponent<ParticleSystemRenderer>();
-                renderer.renderMode = ParticleSystemRenderMode.Billboard;
-                renderer.shadowCastingMode = ShadowCastingMode.Off; renderer.receiveShadows = false;
-                renderer.sharedMaterial = _appearance.Resolve(snapshot.MaterialId,
-                    GetMaterial(new Color(snapshot.Color[0], snapshot.Color[1], snapshot.Color[2], snapshot.Color[3])));
                 if (snapshot.IsInterior) _interiorRenderers.Add(new KeyValuePair<Renderer, string>(renderer, snapshot.RoomId));
                 else if (snapshot.EntityId.Length == 0) _exteriorRenderers.Add(renderer);
                 _worldParticles.Add(effect);
                 effect.Play(true);
             }
+            yield return .98f;
             // Geometry can refer to entities absent from this particular frame.
             var present = new HashSet<string>(_frame.Entities.Where(entity => entity.Active && IsVisualKind(entity.Kind)).Select(entity => entity.Id));
             foreach (var pair in _entities) if (!present.Contains(pair.Key)) pair.Value.Root.SetActive(false);
             ApplyRendererPoses();
+            _visualState = new ReplayVisualState(world, _session.Events,
+                _geometryObjects, _anchorRoots, _assetScene, _root!.transform, ReplayLayer);
+            _visualState.Sync(LocalTime);
             UpdateInteriorVisibility();
             UpdatePlayerBodyOcclusion();
+            yield return 1f;
         }
 
         // Replay rooms follow the spectator camera. No live culler, collider or
@@ -899,23 +1185,30 @@ namespace LCReplay.Plugin.Playback
             var distance = Mathf.Clamp(InteriorRenderDistance, 10f, 200f);
             var squaredDistance = distance * distance;
             var indoor = false;
-            foreach (var room in _interiorRooms.Values)
+            foreach (var room in _interiorRooms.Keys)
             {
-                var expanded = room;
-                expanded.Expand(1f);
-                if (expanded.Contains(position)) { indoor = true; break; }
+                if (RoomContains(room, position, 1f)) { indoor = true; break; }
             }
             _indoor = indoor;
+            var inShipCabin = false;
+            if (_shipCabinAnchor)
+            {
+                var cabinOffset = _shipCabinAnchor!.InverseTransformPoint(position) - _shipCabinCenter;
+                inShipCabin = Mathf.Abs(cabinOffset.x) < 8.5f && Mathf.Abs(cabinOffset.y) < 4f &&
+                    Mathf.Abs(cabinOffset.z) < 5.5f;
+            }
             foreach (var renderer in _exteriorRenderers)
                 if (renderer) renderer.forceRenderingOff = indoor;
+            _assetScene?.SetIndoor(indoor);
             foreach (var renderer in _proceduralGrassRenderers)
                 if (renderer) renderer.forceRenderingOff = indoor || renderer.bounds.SqrDistance(position) > 180f * 180f;
             foreach (var entry in _interiorRenderers)
             {
                 var renderer = entry.Key;
                 if (!renderer) continue;
-                bool sameRoom = entry.Value.Length != 0 && _interiorRooms.TryGetValue(entry.Value, out var room) && room.Contains(position);
-                renderer.forceRenderingOff = !indoor || (!sameRoom && renderer.bounds.SqrDistance(position) > squaredDistance);
+                bool sameRoom = entry.Value.Length != 0 && RoomContains(entry.Value, position, 1f);
+                renderer.forceRenderingOff = !_disableInteriorCulling && (!indoor ||
+                    !sameRoom && renderer.bounds.SqrDistance(position) > squaredDistance);
             }
             foreach (var members in _naturalLods.Values)
             {
@@ -934,24 +1227,42 @@ namespace LCReplay.Plugin.Playback
             {
                 var light = entry.Key;
                 if (!light) continue;
+                var lightDistance = Mathf.Max(distance, light.range + 12f);
                 var near = !indoor || light.type == LightType.Directional ||
-                    (light.transform.position - position).sqrMagnitude <= Mathf.Pow(Mathf.Min(light.range + 8f, 60f), 2f);
-                light.enabled = entry.Value == indoor && near;
+                    (light.transform.position - position).sqrMagnitude <= lightDistance * lightDistance;
+                light.enabled = entry.Value ? (_disableInteriorCulling || indoor && near) : !indoor;
             }
             foreach (var entry in _localFogs)
             {
                 var fog = entry.Key;
                 if (!fog) continue;
                 var snapshot = entry.Value;
-                var inside = snapshot.IsInterior || _interiorRooms.Values.Any(room => room.Contains(fog.transform.position));
+                var inside = snapshot.IsInterior || _interiorRooms.Keys.Any(room => RoomContains(room, fog.transform.position));
                 var size = ToVector(snapshot.Size);
                 var bounds = new Bounds(fog.transform.position, size);
                 var near = bounds.SqrDistance(position) <= squaredDistance;
-                fog.enabled = inside == indoor && near;
+                fog.enabled = inside ? (_disableInteriorCulling || indoor && near) : !indoor && near;
             }
-            if (_spectatorLight) _spectatorLight!.enabled = _worldHasLighting && indoor;
-            if (_exteriorFill) _exteriorFill!.enabled = _worldHasLighting && !indoor;
-            _environment?.SetIndoor(indoor);
+            if (_spectatorLight) _spectatorLight!.enabled = _worldHasLighting && (indoor || inShipCabin);
+            if (_exteriorFill) _exteriorFill!.enabled = _worldHasLighting && !indoor && !inShipCabin;
+            _environment?.SetIndoor(indoor || inShipCabin);
+        }
+
+        private bool RoomContains(string id, Vector3 position, float padding = 0)
+        {
+            if (_interiorRooms.TryGetValue(id, out var bounds))
+            {
+                bounds.Expand(padding);
+                if (bounds.Contains(position)) return true;
+            }
+            if (_additionalRoomVolumes.TryGetValue(id, out var volumes))
+                foreach (var volume in volumes)
+                {
+                    var expanded = volume;
+                    expanded.Expand(padding);
+                    if (expanded.Contains(position)) return true;
+                }
+            return false;
         }
 
         private void BuildProceduralGrass(Mesh source, Material[] materials, Matrix4x4[] matrices)
@@ -1024,6 +1335,7 @@ namespace LCReplay.Plugin.Playback
                     mesh.normals = normals;
                 }
                 else mesh.RecalculateNormals();
+                if (geometry.Uvs.Length == count * 2) mesh.RecalculateTangents();
                 mesh.RecalculateBounds();
                 return mesh;
             }
@@ -1051,13 +1363,435 @@ namespace LCReplay.Plugin.Playback
             mesh.bindposes = bindposes; mesh.boneWeights = weights;
             var renderer = obj.AddComponent<SkinnedMeshRenderer>();
             renderer.sharedMesh = mesh; renderer.sharedMaterials = materials; renderer.bones = bones;
-            renderer.rootBone = owner.Root.transform; renderer.updateWhenOffscreen = true;
+            renderer.rootBone = geometry.RootBonePath.Length == 0 ? owner.Root.transform : GetBone(owner, geometry.RootBonePath);
+            renderer.updateWhenOffscreen = true;
             renderer.shadowCastingMode = ShadowCastingMode.On; renderer.receiveShadows = true;
             renderer.lightProbeUsage = LightProbeUsage.BlendProbes; renderer.reflectionProbeUsage = ReflectionProbeUsage.BlendProbes;
         }
 
+        private void RebuildAudio()
+        {
+            ClearSpatialAudio();
+            if (!_replayAudio) return;
+            _replayAudio!.Stop();
+            _replayAudio.clip = null;
+            if (_replayAudioClip) Object.Destroy(_replayAudioClip);
+            _replayAudioClip = null;
+            var blocks = _session.Events.Where(value => value.Category == "audio" && value.Name == "source-block").ToArray();
+            if (blocks.Length == 0) return;
+            if (blocks.Any(block => block.Data.ContainsKey("spatial")))
+            {
+                _spatialAudioBlocks = blocks.Where(block => block.Data.ContainsKey("spatial"))
+                    .OrderBy(block => block.Time).ToArray();
+                return;
+            }
+            // New single-file recordings are opened in bounded playback windows.
+            // The cap also protects direct/legacy reads from one enormous PCM allocation.
+            var seconds = Math.Min(600, Math.Max(0.1, _session.Duration));
+            var mix = new float[Math.Max(1, (int)Math.Ceiling(seconds * ReplayAudioCodec.SampleRate))];
+            foreach (var block in blocks)
+            {
+                try
+                {
+                    if (!block.Data.TryGetValue("rate", out var rate) || rate != ReplayAudioCodec.SampleRate.ToString() ||
+                        !block.Data.TryGetValue("samples", out var countText) ||
+                        !int.TryParse(countText, out var count) || count < 1 || count > ReplayAudioCodec.MaxSamplesPerBlock ||
+                        !block.Data.TryGetValue("adpcm", out var encoded)) continue;
+                    var samples = ReplayAudioCodec.Decode(Convert.FromBase64String(encoded), count);
+                    var start = (int)Math.Round(block.Time * ReplayAudioCodec.SampleRate);
+                    for (var i = Math.Max(0, -start); i < samples.Length && start + i < mix.Length; i++)
+                        mix[start + i] += samples[i];
+                }
+                catch (Exception) { /* A malformed optional audio event cannot break visual playback. */ }
+            }
+            for (var i = 0; i < mix.Length; i++) mix[i] = Mathf.Clamp(mix[i], -1f, 1f);
+            _replayAudioClip = AudioClip.Create("LC Replay audio", mix.Length, 1, ReplayAudioCodec.SampleRate, false);
+            _replayAudioClip.SetData(mix, 0);
+            _replayAudio.clip = _replayAudioClip;
+        }
+
+        private void CreateBurstRenderer()
+        {
+            var obj = NewObject("Recorded short-lived particles", _root!.transform);
+            _burstParticles = obj.AddComponent<ParticleSystem>();
+            var main = _burstParticles.main;
+            main.loop = false; main.startLifetime = 1f; main.maxParticles = 256;
+            main.simulationSpace = ParticleSystemSimulationSpace.World;
+            main.simulationSpeed = 0f;
+            var emission = _burstParticles.emission; emission.enabled = false;
+            var shape = _burstParticles.shape; shape.enabled = false;
+            var renderer = obj.GetComponent<ParticleSystemRenderer>();
+            renderer.renderMode = ParticleSystemRenderMode.Billboard;
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            _burstTexture = new Texture2D(64, 64, TextureFormat.RGBA32, false, true)
+            { name = "LC Replay soft particle", hideFlags = HideFlags.DontSave, wrapMode = TextureWrapMode.Clamp };
+            var pixels = new Color32[64 * 64];
+            for (var y = 0; y < 64; y++)
+                for (var x = 0; x < 64; x++)
+                {
+                    var dx = (x + .5f - 32f) / 31.5f;
+                    var dy = (y + .5f - 32f) / 31.5f;
+                    var alpha = Mathf.Clamp01((1f - Mathf.Sqrt(dx * dx + dy * dy)) * 3f);
+                    pixels[y * 64 + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(alpha * 255f));
+                }
+            _burstTexture.SetPixels32(pixels);
+            _burstTexture.Apply(false, true);
+            _burstMaterial = CreateParticleMaterial(_burstTexture, "LC Replay burst particles");
+            renderer.sharedMaterial = _burstMaterial;
+            _burstParticles.Play(true);
+        }
+
+        private Material ParticleMaterial(Texture2D texture)
+        {
+            var key = texture.GetInstanceID();
+            if (_particleMaterials.TryGetValue(key, out var existing)) return existing;
+            var material = CreateParticleMaterial(texture, "LC Replay particle texture");
+            _particleMaterials.Add(key, material);
+            return material;
+        }
+
+        private Material CreateParticleMaterial(Texture texture, string name)
+        {
+            // Use a transparent variant that the installed game has actually
+            // rendered. Player builds can strip the transparent variants of a
+            // Shader.Find result, leaving opaque white particle quads.
+            if (!_particleTemplateSearched)
+            {
+                _particleTemplateSearched = true;
+                var candidates = Resources.FindObjectsOfTypeAll<Material>().Where(candidate =>
+                    candidate && candidate.shader && candidate.shader.isSupported &&
+                    (candidate.shader.name.StartsWith("HDRP/Particles/", StringComparison.Ordinal) ||
+                     candidate.shader.name == "HDRP/Unlit" || candidate.shader.name == "HDRP/Lit") &&
+                    candidate.renderQueue >= (int)RenderQueue.Transparent &&
+                    !candidate.IsKeywordEnabled("_ALPHATEST_ON") &&
+                    (candidate.HasProperty("_BaseColorMap") && candidate.GetTexture("_BaseColorMap") ||
+                     candidate.HasProperty("_UnlitColorMap") && candidate.GetTexture("_UnlitColorMap") ||
+                     candidate.HasProperty("_MainTex") && candidate.GetTexture("_MainTex")))
+                    .OrderBy(candidate => candidate.shader.name == "HDRP/Particles/Unlit" ? 0 :
+                        candidate.shader.name.StartsWith("HDRP/Particles/", StringComparison.Ordinal) ? 1 :
+                        candidate.shader.name == "HDRP/Unlit" ? 2 : 3)
+                    .ThenBy(candidate => candidate.HasProperty("_DstBlend") &&
+                        Mathf.Approximately(candidate.GetFloat("_DstBlend"), (float)BlendMode.OneMinusSrcAlpha) ? 0 : 1)
+                    .ToArray();
+                _particleTemplate = candidates.FirstOrDefault();
+                UnityEngine.Debug.Log(_particleTemplate
+                    ? "LC Replay particles: cloned loaded transparent material " + _particleTemplate!.name +
+                      " (" + _particleTemplate.shader.name + ")."
+                    : "LC Replay particles: no loaded transparent HDRP material; using configured shader fallback.");
+            }
+            var shader = new[] { Shader.Find("HDRP/Particles/Unlit"), Shader.Find("HDRP/Unlit"),
+                Shader.Find("Universal Render Pipeline/Particles/Unlit"), _unlitShader, _shader }
+                .FirstOrDefault(candidate => candidate && candidate!.isSupported)!;
+            var material = _particleTemplate ? new Material(_particleTemplate) : new Material(shader);
+            material.name = name;
+            material.hideFlags = HideFlags.DontSave;
+            foreach (var property in new[] { "_BaseColorMap", "_UnlitColorMap", "_MainTex", "_BaseMap" })
+                if (material.HasProperty(property)) material.SetTexture(property, texture);
+            foreach (var property in new[] { "_BaseColor", "_UnlitColor", "_Color" })
+                if (material.HasProperty(property)) material.SetColor(property, Color.white);
+            if (!_particleTemplate)
+            {
+                material.EnableKeyword("_UNLIT_COLOR_MAP");
+                material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                material.EnableKeyword("_ALPHABLEND_ON");
+                material.DisableKeyword("_ALPHATEST_ON");
+                if (material.HasProperty("_AlphaCutoffEnable")) material.SetFloat("_AlphaCutoffEnable", 0f);
+                if (material.HasProperty("_SurfaceType")) material.SetFloat("_SurfaceType", 1f);
+                if (material.HasProperty("_BlendMode")) material.SetFloat("_BlendMode", 0f);
+                if (material.HasProperty("_ZWrite")) material.SetFloat("_ZWrite", 0f);
+                if (material.HasProperty("_TransparentZWrite")) material.SetFloat("_TransparentZWrite", 0f);
+                if (material.HasProperty("_SrcBlend")) material.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+                if (material.HasProperty("_DstBlend")) material.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+                if (material.HasProperty("_AlphaSrcBlend")) material.SetFloat("_AlphaSrcBlend", (float)BlendMode.One);
+                if (material.HasProperty("_AlphaDstBlend")) material.SetFloat("_AlphaDstBlend", (float)BlendMode.OneMinusSrcAlpha);
+                material.SetOverrideTag("RenderType", "Transparent");
+                ReplayAppearance.ValidateHdrpMaterial(material);
+            }
+            material.renderQueue = (int)RenderQueue.Transparent;
+            return material;
+        }
+
+        private void ApplyBurstParticles()
+        {
+            if (!_burstParticles) return;
+            foreach (var list in _emitterSamples.Values) list.Clear();
+            _activeEmitters.Clear();
+            if (_appearance != null)
+                foreach (var style in _frame.ParticleStyles)
+                {
+                    if (style.IsInterior ? !_indoor && !_disableInteriorCulling : _indoor) continue;
+                    if (!_emitterBursts.TryGetValue(style.Id, out var system))
+                    {
+                        if (_emitterBursts.Count >= 256) break;
+                        _particleAssets ??= new ReplayParticleAssets(_root!.transform, ReplayLayer);
+                        system = _particleAssets.Create(_root!.transform, style, style.Name, "", _appearance, _burstMaterial,
+                            !style.Simulate, out var native);
+                        system.transform.position = Vector3.zero;
+                        system.transform.rotation = Quaternion.identity;
+                        system.Play(false);
+                        _emitterBursts.Add(style.Id, system);
+                        if (style.Simulate && native) _simulatedEmitters.Add(style.Id);
+                    }
+                    _activeEmitters.Add(style.Id);
+                    if (_simulatedEmitters.Contains(style.Id))
+                    {
+                        SetTransform(system.transform, style.Position, style.Rotation, style.Scale);
+                        if (!system.isPlaying) system.Play(false);
+                        if (Math.Abs(system.time - style.Time) > .25f) system.Simulate(style.Time, false, true, false);
+                        var main = system.main; main.simulationSpeed = IsPlaying ? Speed : 0f;
+                    }
+                }
+            foreach (var id in _simulatedEmitters)
+                if (!_activeEmitters.Contains(id)) _emitterBursts[id].Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear);
+            if (!_emitterSamples.ContainsKey("")) _emitterSamples.Add("", new List<ParticlePose>());
+            foreach (var pose in _frame.Particles)
+            {
+                if (pose.IsInterior ? !_indoor && !_disableInteriorCulling : _indoor) continue;
+                if (_simulatedEmitters.Contains(pose.EmitterId)) continue;
+                var key = pose.EmitterId.Length != 0 && _emitterBursts.ContainsKey(pose.EmitterId) ? pose.EmitterId : "";
+                if (!_emitterSamples.TryGetValue(key, out var list))
+                    _emitterSamples.Add(key, list = new List<ParticlePose>());
+                list.Add(pose);
+            }
+            foreach (var pair in _emitterSamples)
+            {
+                var system = pair.Key.Length == 0 ? _burstParticles : _emitterBursts[pair.Key];
+                var count = 0;
+                foreach (var pose in pair.Value)
+                {
+                    if (count == _burstBuffer.Length) break;
+                    var native = pose.EmitterId.Length != 0;
+                    _burstBuffer[count++] = new ParticleSystem.Particle
+                    {
+                        position = ToVector(pose.Position), velocity = ToVector(pose.Velocity),
+                        startSize3D = native ? ToVector(pose.Size3D) : Vector3.one * pose.Size,
+                        rotation3D = native ? ToVector(pose.Rotation3D) : new Vector3(0, 0, pose.Rotation),
+                        startLifetime = pose.Lifetime, remainingLifetime = pose.RemainingLifetime,
+                        randomSeed = pose.RandomSeed,
+                        startColor = new Color32((byte)Mathf.RoundToInt(Mathf.Clamp01(pose.Color[0]) * 255),
+                            (byte)Mathf.RoundToInt(Mathf.Clamp01(pose.Color[1]) * 255),
+                            (byte)Mathf.RoundToInt(Mathf.Clamp01(pose.Color[2]) * 255),
+                            (byte)Mathf.RoundToInt(Mathf.Clamp01(pose.Color[3]) * 255))
+                    };
+                }
+                system!.SetParticles(_burstBuffer, count);
+            }
+        }
+
+        private void ClearSampledParticles()
+        {
+            foreach (var effect in _emitterBursts.Values)
+                if (effect) { effect.gameObject.SetActive(false); Object.Destroy(effect.gameObject); }
+            _emitterBursts.Clear();
+            _emitterSamples.Clear();
+            _simulatedEmitters.Clear(); _activeEmitters.Clear();
+            _particleAssets?.Dispose(); _particleAssets = null;
+        }
+
+        private void ApplyLines()
+        {
+            _inactiveLines.Clear();
+            foreach (var id in _frameLines.Keys) _inactiveLines.Add(id);
+            foreach (var pose in _frame.Lines)
+            {
+                if ((pose.IsInterior ? !_indoor && !_disableInteriorCulling : _indoor) || pose.Positions.Length < 6) continue;
+                if (!_frameLines.TryGetValue(pose.Id, out var line) || !line)
+                {
+                    if (_frameLines.Count >= 512) continue;
+                    var obj = NewObject("Recorded line " + pose.Id, _root!.transform);
+                    line = obj.AddComponent<LineRenderer>();
+                    line.useWorldSpace = true;
+                    line.shadowCastingMode = ShadowCastingMode.Off;
+                    line.receiveShadows = false;
+                    line.sharedMaterial = _appearance?.ResolveParticleMaterial("", pose.MaterialName, pose.ShaderName)
+                        ?? (_burstMaterial ? _burstMaterial : GetMaterial(Color.white));
+                    _frameLines[pose.Id] = line;
+                }
+                _inactiveLines.Remove(pose.Id);
+                if (!line.sharedMaterial)
+                    line.sharedMaterial = _appearance?.ResolveParticleMaterial("", pose.MaterialName, pose.ShaderName)
+                        ?? (_burstMaterial ? _burstMaterial : GetMaterial(Color.white));
+                if (!line.enabled) line.enabled = true;
+                line.positionCount = pose.Positions.Length / 3;
+                line.textureMode = (LineTextureMode)pose.TextureMode;
+                line.alignment = (LineAlignment)pose.Alignment;
+                line.startWidth = pose.StartWidth;
+                line.endWidth = pose.EndWidth;
+                line.startColor = new Color(pose.StartColor[0], pose.StartColor[1], pose.StartColor[2], pose.StartColor[3]);
+                line.endColor = new Color(pose.EndColor[0], pose.EndColor[1], pose.EndColor[2], pose.EndColor[3]);
+                for (var i = 0; i < line.positionCount; i++)
+                    line.SetPosition(i, new Vector3(pose.Positions[i * 3], pose.Positions[i * 3 + 1], pose.Positions[i * 3 + 2]));
+            }
+            foreach (var id in _inactiveLines)
+                if (_frameLines.TryGetValue(id, out var line) && line && line.enabled) line.enabled = false;
+        }
+
+        private void SyncAudio()
+        {
+            if (_spatialAudioBlocks.Length != 0) { SyncSpatialAudio(); return; }
+            if (!_replayAudio || !_replayAudio!.clip) return;
+            if (!IsPlaying || IsBuffering || Speed > 3f)
+            { if (_replayAudio.isPlaying) _replayAudio.Pause(); return; }
+            var target = Mathf.Clamp((float)LocalTime, 0, Mathf.Max(0, _replayAudio.clip.length - .02f));
+            _replayAudio.pitch = Speed;
+            if (!_replayAudio.isPlaying)
+            {
+                _replayAudio.time = target;
+                _replayAudio.Play();
+            }
+            else if (Mathf.Abs(_replayAudio.time - target) > .18f)
+                _replayAudio.time = target;
+        }
+
+        private void SyncSpatialAudio()
+        {
+            var target = LocalTime;
+            if (!IsPlaying || IsBuffering || Speed > 3f)
+            {
+                if (!_spatialAudioPaused)
+                    foreach (var voice in _spatialVoices) if (voice.Clip) voice.Source.Pause();
+                _spatialAudioPaused = true;
+                return;
+            }
+            if (target < _lastAudioTime - .05 || target - _lastAudioTime > .45)
+            {
+                foreach (var voice in _spatialVoices) ReleaseSpatialVoice(voice);
+                _spatialAudioCursor = FindAudioCursor(target - .6);
+            }
+            _lastAudioTime = target;
+            if (_spatialAudioPaused)
+                foreach (var voice in _spatialVoices) if (voice.Clip) voice.Source.UnPause();
+            _spatialAudioPaused = false;
+            foreach (var voice in _spatialVoices)
+            {
+                if (!voice.Clip) continue;
+                if (voice.EndTime <= target - .03) ReleaseSpatialVoice(voice);
+                else voice.Source.pitch = Speed;
+            }
+            while (_spatialAudioCursor < _spatialAudioBlocks.Length &&
+                _spatialAudioBlocks[_spatialAudioCursor].Time <= target + .025)
+            {
+                var block = _spatialAudioBlocks[_spatialAudioCursor++];
+                if (target - block.Time < ReplayAudioCodec.MaxSamplesPerBlock / (double)ReplayAudioCodec.SampleRate)
+                    StartSpatialAudioBlock(block, target);
+            }
+        }
+
+        private int FindAudioCursor(double time)
+        {
+            var low = 0;
+            var high = _spatialAudioBlocks.Length;
+            while (low < high)
+            {
+                var mid = low + (high - low) / 2;
+                if (_spatialAudioBlocks[mid].Time < time) low = mid + 1;
+                else high = mid;
+            }
+            return low;
+        }
+
+        private void StartSpatialAudioBlock(ReplayEvent block, double target)
+        {
+            try
+            {
+                var data = block.Data;
+                var player = data.TryGetValue("player", out var playerValue) &&
+                    string.Equals(playerValue, "true", StringComparison.OrdinalIgnoreCase);
+                if (player && _mutePlayerAudio) return;
+                if (!data.TryGetValue("rate", out var rate) || rate != ReplayAudioCodec.SampleRate.ToString(CultureInfo.InvariantCulture) ||
+                    !data.TryGetValue("samples", out var countText) || !int.TryParse(countText, out var count) ||
+                    count < 1 || count > ReplayAudioCodec.MaxSamplesPerBlock ||
+                    !data.TryGetValue("adpcm", out var encoded) ||
+                    !ReadAudioFloat(data, "x", out var x) || !ReadAudioFloat(data, "y", out var y) ||
+                    !ReadAudioFloat(data, "z", out var z) || !ReadAudioFloat(data, "spatial", out var spatial) ||
+                    !ReadAudioFloat(data, "min", out var min) || !ReadAudioFloat(data, "max", out var max)) return;
+                var voice = _spatialVoices.FirstOrDefault(value => !value.Clip);
+                if (voice == null)
+                {
+                    if (_spatialVoices.Count >= 32) return;
+                    var obj = NewObject("Recorded audio source", _root!.transform);
+                    var source = obj.AddComponent<AudioSource>();
+                    source.playOnAwake = false;
+                    voice = new SpatialAudioVoice(source);
+                    _spatialVoices.Add(voice);
+                }
+                var pcm = ReplayAudioCodec.Decode(Convert.FromBase64String(encoded), count);
+                var clip = AudioClip.Create("LC Replay sound", pcm.Length, 1, ReplayAudioCodec.SampleRate, false);
+                clip.SetData(pcm, 0);
+                voice.Clip = clip;
+                voice.Player = player;
+                voice.EndTime = block.Time + pcm.Length / (double)ReplayAudioCodec.SampleRate;
+                var sourceAudio = voice.Source;
+                sourceAudio.transform.position = new Vector3(x, y, z);
+                // New recordings mark true global music/UI explicitly. A world
+                // source must be spatialized from the free spectator listener,
+                // even if the recording player's source was locally mixed in 2D.
+                sourceAudio.spatialBlend = data.TryGetValue("global", out var global) ?
+                    (global == "true" ? 0f : 1f) : Mathf.Clamp01(spatial);
+                sourceAudio.minDistance = Mathf.Clamp(min, .01f, 1000f);
+                sourceAudio.maxDistance = Mathf.Clamp(max, sourceAudio.minDistance, 10000f);
+                if (data.TryGetValue("rolloff", out var mode) && int.TryParse(mode, out var rolloff) && rolloff >= 0 && rolloff <= 2)
+                    sourceAudio.rolloffMode = (AudioRolloffMode)rolloff;
+                sourceAudio.dopplerLevel = 0f;
+                sourceAudio.mute = _mutePlayerAudio && player;
+                sourceAudio.pitch = Speed;
+                sourceAudio.clip = clip;
+                sourceAudio.time = Mathf.Clamp((float)(target - block.Time), 0, Mathf.Max(0, clip.length - .005f));
+                sourceAudio.Play();
+            }
+            catch { /* A malformed optional sound block cannot stop the replay. */ }
+        }
+
+        private static bool ReadAudioFloat(Dictionary<string, string> data, string key, out float value)
+        {
+            value = 0;
+            return data.TryGetValue(key, out var text) &&
+                float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) &&
+                !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+
+        private static void ReleaseSpatialVoice(SpatialAudioVoice voice)
+        {
+            voice.Source.Stop(); voice.Source.clip = null;
+            if (voice.Clip) Object.Destroy(voice.Clip);
+            voice.Clip = null; voice.EndTime = 0; voice.Player = false;
+        }
+
+        private void ClearSpatialAudio()
+        {
+            foreach (var voice in _spatialVoices) ReleaseSpatialVoice(voice);
+            _spatialAudioBlocks = Array.Empty<ReplayEvent>();
+            _spatialAudioCursor = 0;
+            _lastAudioTime = -1;
+            _spatialAudioPaused = false;
+        }
+
+        private sealed class SpatialAudioVoice
+        {
+            internal readonly AudioSource Source;
+            internal AudioClip? Clip;
+            internal double EndTime;
+            internal bool Player;
+            internal SpatialAudioVoice(AudioSource source) { Source = source; }
+        }
+
         private void SuspendOtherViews()
         {
+            foreach (var source in Resources.FindObjectsOfTypeAll<AudioSource>())
+            {
+                if (!source || source == _replayAudio || !source.gameObject.scene.IsValid() ||
+                    !source.gameObject.scene.isLoaded || source.gameObject.scene == _scene) continue;
+                if (!_audioSourceStates.ContainsKey(source)) _audioSourceStates.Add(source, source.mute);
+                source.mute = true;
+            }
+            foreach (var listener in Resources.FindObjectsOfTypeAll<AudioListener>())
+            {
+                if (!listener || listener.gameObject.scene == _scene || !listener.gameObject.scene.IsValid() ||
+                    !listener.gameObject.scene.isLoaded) continue;
+                if (!_listenerStates.ContainsKey(listener)) _listenerStates.Add(listener, listener.enabled);
+                listener.enabled = false;
+            }
             foreach (var camera in Resources.FindObjectsOfTypeAll<Camera>())
             {
                 if (camera == null || camera == _camera || !camera.gameObject.scene.IsValid() || !camera.gameObject.scene.isLoaded) continue;
@@ -1074,7 +1808,8 @@ namespace LCReplay.Plugin.Playback
             // cannot accidentally include menu or other non-recorded geometry.
             foreach (var renderer in Resources.FindObjectsOfTypeAll<Renderer>())
             {
-                if (renderer == null || renderer.gameObject.layer != ReplayLayer || !renderer.gameObject.scene.IsValid() || !renderer.gameObject.scene.isLoaded || renderer.gameObject.scene == _scene) continue;
+                if (renderer == null || renderer.gameObject.layer != ReplayLayer || !renderer.gameObject.scene.IsValid() || !renderer.gameObject.scene.isLoaded || renderer.gameObject.scene == _scene ||
+                    _assetScene != null && renderer.gameObject.scene == _assetScene.Scene) continue;
                 if (!_rendererStates.ContainsKey(renderer)) _rendererStates.Add(renderer, renderer.enabled);
                 renderer.enabled = false;
             }
@@ -1192,19 +1927,25 @@ namespace LCReplay.Plugin.Playback
         // Camera framing uses recorded triangles, not colliders or the live game's physics scene.
         private Vector3 ClearCameraPosition(Vector3 start, Vector3 desired, string ignoredEntity)
         {
-            if (_worldIndex < 0 || _worldIndex >= _session.Worlds.Count) return desired;
-            var world = _session.Worlds[_worldIndex].World;
+            var world = _displayWorld;
             if (world == null) return desired;
             float nearest = 1;
+            var segment = desired - start;
+            var segmentLength = segment.magnitude;
+            if (segmentLength < .0001f) return desired;
             foreach (var geometry in world.Geometry)
             {
                 if (geometry.IsBoundsProxy || geometry.EntityId == ignoredEntity || geometry.BonePaths.Count > 0 ||
                     !_geometryObjects.TryGetValue(geometry.Id, out var obj) || !obj || !obj.activeInHierarchy) continue;
+                var renderer = obj.GetComponent<Renderer>();
+                if (renderer && (!renderer.bounds.IntersectRay(new Ray(start, segment / segmentLength), out var worldHit) ||
+                    worldHit > segmentLength * nearest)) continue;
                 var a = obj.transform.InverseTransformPoint(start);
                 var delta = obj.transform.InverseTransformPoint(desired) - a;
                 if (delta.sqrMagnitude < 0.000001f) continue;
                 var bounds = new Bounds(ToVector(geometry.BoundsCenter), ToVector(geometry.BoundsSize));
-                if (bounds.size.sqrMagnitude > 0 && !bounds.IntersectRay(new Ray(a, delta.normalized))) continue;
+                if (bounds.size.sqrMagnitude > 0 && (!bounds.IntersectRay(new Ray(a, delta.normalized), out var localHit) ||
+                    localHit > delta.magnitude * nearest)) continue;
                 var data = _renderGeometrySources.TryGetValue(geometry.Id, out var source) ? source : geometry;
                 var vertices = data.Vertices; var indices = data.Triangles;
                 for (int i = 0; i + 2 < indices.Length; i += 3)
@@ -1437,6 +2178,25 @@ namespace LCReplay.Plugin.Playback
             return mesh;
         }
 
+        private static Mesh MakeSwarmMesh()
+        {
+            var mesh = new Mesh { name = "Replay swarm body", hideFlags = HideFlags.DontSave };
+            mesh.vertices = new[]
+            {
+                new Vector3(0f, 0f, 0.75f), new Vector3(0f, 0f, -0.85f),
+                new Vector3(-0.32f, 0f, 0f), new Vector3(0.32f, 0f, 0f),
+                new Vector3(0f, 0.29f, 0f), new Vector3(0f, -0.29f, 0f)
+            };
+            mesh.triangles = new[]
+            {
+                0, 4, 2, 0, 3, 4, 0, 2, 5, 0, 5, 3,
+                1, 2, 4, 1, 4, 3, 1, 5, 2, 1, 3, 5
+            };
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
         private static Color GeometryColor(GeometrySnapshot geometry)
         {
             var values = geometry.Color;
@@ -1462,9 +2222,19 @@ namespace LCReplay.Plugin.Playback
         {
             var point = ToVector(position);
             var size = ToVector(scale);
-            transform.localPosition = Finite(point) ? point : Vector3.zero;
-            transform.localRotation = ToQuaternion(rotation);
-            transform.localScale = Finite(size) ? size : Vector3.one;
+            point = Finite(point) ? point : Vector3.zero;
+            size = Finite(size) ? size : Vector3.one;
+            var orientation = ToQuaternion(rotation);
+            if (transform.localPosition != point) transform.localPosition = point;
+            var prior = transform.localRotation;
+            if (prior.x != orientation.x || prior.y != orientation.y || prior.z != orientation.z || prior.w != orientation.w)
+                transform.localRotation = orientation;
+            if (transform.localScale != size) transform.localScale = size;
+        }
+
+        private static void SetActiveIfChanged(GameObject obj, bool active)
+        {
+            if (obj.activeSelf != active) obj.SetActive(active);
         }
 
         private static Vector3 ToVector(Vec3 value) => new Vector3(value.X, value.Y, value.Z);
@@ -1482,6 +2252,7 @@ namespace LCReplay.Plugin.Playback
         {
             if (_disposed) return;
             _disposed = true;
+            _worldBuild?.Dispose(); _worldBuild = null;
             IsPlaying = false;
             _partCancellation?.Cancel();
             _partCancellation?.Dispose();
@@ -1489,12 +2260,27 @@ namespace LCReplay.Plugin.Playback
             if (_partRead != null)
                 _ = _partRead.ContinueWith(task => { _ = task.Exception; }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
             _partRead = null;
+            _recentParts.Clear();
             try
             {
+                ClearSpatialAudio();
+                ClearSampledParticles();
+                if (_replayAudio) { _replayAudio!.Stop(); _replayAudio.clip = null; }
+                if (_replayAudioClip) Object.Destroy(_replayAudioClip);
+                _replayAudioClip = null;
+                if (_burstMaterial) Object.Destroy(_burstMaterial);
+                _burstMaterial = null;
+                foreach (var material in _particleMaterials.Values) if (material) Object.Destroy(material);
+                _particleMaterials.Clear();
+                if (_burstTexture) Object.Destroy(_burstTexture);
+                _burstTexture = null;
                 _hud?.Dispose();
                 _hud = null;
                 _environment?.Dispose();
                 _environment = null;
+                _assetScene?.Dispose();
+                _assetScene = null;
+                _visualState?.Dispose(); _visualState = null;
                 _appearance?.Dispose();
                 _appearance = null;
                 if (_camera) _camera!.targetTexture = null;
@@ -1504,14 +2290,18 @@ namespace LCReplay.Plugin.Playback
                 foreach (var mesh in _worldMeshes) if (mesh != null) Object.Destroy(mesh);
                 foreach (var mask in _worldFogMasks) if (mask) Object.Destroy(mask);
                 foreach (var visual in _entities.Values) if (visual.SkeletonMesh != null) Object.Destroy(visual.SkeletonMesh);
+                if (_swarmMesh != null) Object.Destroy(_swarmMesh);
                 if (_cube != null) Object.Destroy(_cube);
                 foreach (var material in _materials.Values) if (material != null) Object.Destroy(material);
+                ReplayIsolation.Unregister(_scene);
                 if (_scene.IsValid() && _scene.isLoaded) SceneManager.UnloadSceneAsync(_scene);
             }
             finally
             {
                 foreach (var pair in _cameraStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
                 foreach (var pair in _canvasStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
+                foreach (var pair in _listenerStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
+                foreach (var pair in _audioSourceStates) if (pair.Key != null) pair.Key.mute = pair.Value;
                 foreach (var pair in _rendererStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
                 foreach (var pair in _uiInputStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
                 if (_savedEventSystem != null && _eventSystemCurrentProperty?.CanWrite == true)
@@ -1523,10 +2313,13 @@ namespace LCReplay.Plugin.Playback
                 Cursor.visible = _savedCursorVisible;
                 _cameraStates.Clear();
                 _canvasStates.Clear();
+                _listenerStates.Clear();
+                _audioSourceStates.Clear();
                 _rendererStates.Clear();
                 _uiInputStates.Clear();
                 _uiInputTypes.Clear();
                 _entities.Clear();
+                _frameLines.Clear();
                 _materials.Clear();
                 _worldMeshes.Clear();
                 _worldFogMasks.Clear();
@@ -1536,11 +2329,12 @@ namespace LCReplay.Plugin.Playback
                 _worldObjects.Clear();
                 _geometryObjects.Clear();
                 _dynamicGeometry.Clear();
+                _movingSceneGeometry.Clear();
                 _completeRendererLists.Clear();
                 _interiorRenderers.Clear();
                 _interiorRooms.Clear();
+                _additionalRoomVolumes.Clear();
                 _renderGeometrySources.Clear();
-                _combinedWorlds.Clear();
             }
         }
 
@@ -1555,6 +2349,7 @@ namespace LCReplay.Plugin.Playback
             internal Mesh? SkeletonMesh;
             internal GameObject? Swarm;
             internal ParticleSystem? SwarmParticles;
+            internal LineRenderer[]? SwarmLightning;
             internal EntityVisual(GameObject root, GameObject proxy) { Root = root; Proxy = proxy; }
         }
 

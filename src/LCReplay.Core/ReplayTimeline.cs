@@ -11,6 +11,9 @@ namespace LCReplay.Core
         /// The returned frame is independent of the stored recording and safe for a viewer to modify.
         /// </summary>
         public static ReplayFrame Sample(ReplaySession session, double time)
+            => SampleCore(session, time, null);
+
+        internal static ReplayFrame SampleCore(ReplaySession session, double time, ReplayTimelineSampler? scratch)
         {
             if (session == null) throw new ArgumentNullException(nameof(session));
             if (double.IsNaN(time) || double.IsInfinity(time)) throw new ArgumentOutOfRangeException(nameof(time));
@@ -27,10 +30,30 @@ namespace LCReplay.Core
             }
             int leftIndex = Math.Max(0, low - 1);
             var left = frames[leftIndex];
-            var result = new ReplayFrame { Time = time, State = Copy(left.State) };
+            var result = new ReplayFrame { Time = time, State = scratch == null ? Copy(left.State) : left.State,
+                ParticleStyles = scratch == null ? new List<ParticleStyleSnapshot>(left.ParticleStyles) : left.ParticleStyles,
+                Particles = scratch == null ? new List<ParticlePose>(left.Particles) : left.Particles };
             ReplayFrame? right = leftIndex + 1 < frames.Count && time > left.Time ? frames[leftIndex + 1] : null;
             double amount = right == null ? 0 : Math.Max(0, Math.Min(1, (time - left.Time) / (right.Time - left.Time)));
-            var rightAnchors = new Dictionary<string, AnchorPose>(StringComparer.Ordinal);
+            var rightLines = scratch?.RightLines ?? new Dictionary<string, LinePose>(StringComparer.Ordinal);
+            rightLines.Clear();
+            if (right != null) foreach (var line in right.Lines) rightLines[line.Id] = line;
+            foreach (var line in left.Lines)
+            {
+                if (!rightLines.TryGetValue(line.Id, out var next) || next.Positions.Length != line.Positions.Length)
+                { result.Lines.Add(line); continue; }
+                var positions = new float[line.Positions.Length];
+                for (var i = 0; i < positions.Length; i++)
+                    positions[i] = (float)(line.Positions[i] + (next.Positions[i] - line.Positions[i]) * amount);
+                result.Lines.Add(new LinePose { Id = line.Id, Positions = positions, IsInterior = line.IsInterior,
+                    MaterialName = line.MaterialName, ShaderName = line.ShaderName,
+                    TextureMode = line.TextureMode, Alignment = line.Alignment,
+                    StartColor = line.StartColor, EndColor = line.EndColor,
+                    StartWidth = (float)(line.StartWidth + (next.StartWidth - line.StartWidth) * amount),
+                    EndWidth = (float)(line.EndWidth + (next.EndWidth - line.EndWidth) * amount) });
+            }
+            var rightAnchors = scratch?.RightAnchors ?? new Dictionary<string, AnchorPose>(StringComparer.Ordinal);
+            rightAnchors.Clear();
             if (right != null) foreach (var anchor in right.Anchors) rightAnchors[anchor.Id] = anchor;
             foreach (var anchor in left.Anchors)
             {
@@ -43,7 +66,22 @@ namespace LCReplay.Core
                     Scale = other == null ? anchor.Scale : Lerp(anchor.Scale, other.Scale, amount)
                 });
             }
-            var rightEntities = new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
+            var rightSceneRenderers = scratch?.RightSceneRenderers ?? new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+            rightSceneRenderers.Clear();
+            if (right != null) foreach (var renderer in right.SceneRenderers) rightSceneRenderers[renderer.Id] = renderer;
+            foreach (var renderer in left.SceneRenderers)
+            {
+                bool match = rightSceneRenderers.TryGetValue(renderer.Id, out var other) && renderer.Active && other.Active;
+                result.SceneRenderers.Add(new RenderPose
+                {
+                    Id = renderer.Id, Active = renderer.Active,
+                    Position = match ? Lerp(renderer.Position, other!.Position, amount) : renderer.Position,
+                    Rotation = match ? Slerp(renderer.Rotation, other!.Rotation, amount) : renderer.Rotation,
+                    Scale = match ? Lerp(renderer.Scale, other!.Scale, amount) : renderer.Scale
+                });
+            }
+            var rightEntities = scratch?.RightEntities ?? new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
+            rightEntities.Clear();
             if (right != null) foreach (var entity in right.Entities) rightEntities[entity.Id] = entity;
             foreach (var entity in left.Entities)
             {
@@ -56,9 +94,10 @@ namespace LCReplay.Core
                     Position = other == null ? entity.Position : Lerp(entity.Position, other.Position, amount),
                     Rotation = other == null ? entity.Rotation : Slerp(entity.Rotation, other.Rotation, amount),
                     Scale = other == null ? entity.Scale : Lerp(entity.Scale, other.Scale, amount),
-                    State = Copy(entity.State)
+                    State = scratch == null ? Copy(entity.State) : entity.State
                 };
-                var rightBones = new Dictionary<string, BonePose>(StringComparer.Ordinal);
+                var rightBones = scratch?.RightBones ?? new Dictionary<string, BonePose>(StringComparer.Ordinal);
+                rightBones.Clear();
                 if (other != null) foreach (var bone in other.Bones) rightBones[bone.Path] = bone;
                 foreach (var bone in entity.Bones)
                 {
@@ -71,7 +110,8 @@ namespace LCReplay.Core
                         Scale = match ? Lerp(bone.Scale, otherBone!.Scale, amount) : bone.Scale
                     });
                 }
-                var rightRenderers = new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+                var rightRenderers = scratch?.RightRenderers ?? new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+                rightRenderers.Clear();
                 if (other != null) foreach (var renderer in other.Renderers) rightRenderers[renderer.Id] = renderer;
                 foreach (var renderer in entity.Renderers)
                 {
@@ -125,5 +165,22 @@ namespace LCReplay.Core
                 (float)(a.X * first + b.X * second), (float)(a.Y * first + b.Y * second),
                 (float)(a.Z * first + b.Z * second), (float)(a.W * first + b.W * second)));
         }
+    }
+
+    /// <summary>
+    /// Reuses interpolation lookup tables during playback. Sampled poses are new,
+    /// but state dictionaries and particle lists are read-only views of the recording.
+    /// A caller must not modify them.
+    /// </summary>
+    public sealed class ReplayTimelineSampler
+    {
+        internal readonly Dictionary<string, LinePose> RightLines = new Dictionary<string, LinePose>(StringComparer.Ordinal);
+        internal readonly Dictionary<string, AnchorPose> RightAnchors = new Dictionary<string, AnchorPose>(StringComparer.Ordinal);
+        internal readonly Dictionary<string, RenderPose> RightSceneRenderers = new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+        internal readonly Dictionary<string, EntitySnapshot> RightEntities = new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
+        internal readonly Dictionary<string, BonePose> RightBones = new Dictionary<string, BonePose>(StringComparer.Ordinal);
+        internal readonly Dictionary<string, RenderPose> RightRenderers = new Dictionary<string, RenderPose>(StringComparer.Ordinal);
+
+        public ReplayFrame Sample(ReplaySession session, double time) => ReplayTimeline.SampleCore(session, time, this);
     }
 }

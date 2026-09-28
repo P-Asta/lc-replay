@@ -78,7 +78,7 @@ namespace LCReplay.Core.Archive
                 FinalizeRun(legacy);
                 result.Runs.Add(legacy);
             }
-            result.Runs = result.Runs.OrderByDescending(r => r.StartedUtc).ThenBy(r => r.DirectoryPath, StringComparer.OrdinalIgnoreCase).ToList();
+            result.Runs = result.Runs.OrderBy(r => r.StartedUtc).ThenBy(r => r.DirectoryPath, StringComparer.OrdinalIgnoreCase).ToList();
             return result;
         }
 
@@ -355,7 +355,9 @@ namespace LCReplay.Core.Archive
 
         private static void FinalizeSession(ArchiveSession session)
         {
-            session.Days = session.Days.OrderByDescending(d => d.StartedUtc).ThenByDescending(d => d.DayNumber).ToList();
+            session.Days = session.Days.OrderBy(d => d.StartedUtc).ThenBy(d => d.DayNumber)
+                .ThenBy(d => d.RecordingStem, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(d => d.DirectoryPath, StringComparer.OrdinalIgnoreCase).ToList();
             session.DurationSeconds = session.Days.Sum(d => d.DurationSeconds);
             session.Bytes = session.Days.Sum(d => d.Bytes);
             if (session.Days.Count > 0)
@@ -371,7 +373,8 @@ namespace LCReplay.Core.Archive
 
         private static void FinalizeRun(ArchiveRun run)
         {
-            run.Sessions = run.Sessions.OrderByDescending(s => s.StartedUtc).ThenByDescending(s => s.SessionNumber).ToList();
+            run.Sessions = run.Sessions.OrderBy(s => s.StartedUtc).ThenBy(s => s.SessionNumber)
+                .ThenBy(s => s.DirectoryPath, StringComparer.OrdinalIgnoreCase).ToList();
             run.DurationSeconds = run.Sessions.Sum(s => s.DurationSeconds);
             run.Bytes = run.Sessions.Sum(s => s.Bytes);
             if (run.Sessions.Count > 0)

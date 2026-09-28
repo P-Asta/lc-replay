@@ -111,8 +111,15 @@ namespace LCReplay.Plugin.Capture
         {
             var shader = material.shader;
             if (!shader) return;
-            for (var i = 0; i < Math.Min(shader.GetPropertyCount(), 96); i++)
+            // HDRP/Lit has more properties than the bounded replay format allows.
+            // Shader declaration order puts many surface maps after internal render
+            // state. Losing the mask/normal maps leaves the shader's smooth defaults.
+            var propertyIndices = Enumerable.Range(0, Math.Min(shader.GetPropertyCount(), 256))
+                .OrderByDescending(index => PropertyPriority(shader, index))
+                .ToArray();
+            foreach (var i in propertyIndices)
             {
+                if (snapshot.Properties.Count >= 96) break;
                 try
                 {
                     var name = shader.GetPropertyName(i);
@@ -140,9 +147,12 @@ namespace LCReplay.Plugin.Capture
                             var colorMap = name.IndexOf("basecolor", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("albedo", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("diffuse", StringComparison.OrdinalIgnoreCase) >= 0;
+                            var surfaceMap = name.IndexOf("normal", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("mask", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("detail", StringComparison.OrdinalIgnoreCase) >= 0;
                             entry.Kind = "texture"; entry.TextureId = CaptureTexture(texture,
                                 ground ? colorMap ? 2048 : 1024 :
-                                IsNaturalSurface(material.name, name) || colorMap ? 512 : 256);
+                                IsNaturalSurface(material.name, name) || colorMap || surfaceMap ? 512 : 256);
                             var scale = material.GetTextureScale(name); var offset = material.GetTextureOffset(name);
                             entry.TextureScaleOffset = new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
                             break;
@@ -152,6 +162,20 @@ namespace LCReplay.Plugin.Capture
                 }
                 catch { /* A custom shader may not expose one property for CPU readback. */ }
             }
+        }
+
+        private static int PropertyPriority(Shader shader, int index)
+        {
+            var name = shader.GetPropertyName(index).ToLowerInvariant();
+            if (shader.GetPropertyType(index) == ShaderPropertyType.Texture) return 5;
+            if (name.Contains("emiss") || name.Contains("smooth") || name.Contains("rough") ||
+                name.Contains("gloss") || name.Contains("specular") || name.Contains("occlusion") ||
+                name.Contains("metal") || name.Contains("normal") || name.Contains("bump") || name.Contains("mask") ||
+                name.Contains("basecolor") || name.Contains("detail") || name.Contains("remap") ||
+                name.Contains("uv") || name.Contains("alpha") || name.Contains("blend") ||
+                name.Contains("cutoff") || name.Contains("surface") || name.Contains("materialid")) return 4;
+            if (shader.GetPropertyType(index) == ShaderPropertyType.Color) return 3;
+            return 1;
         }
 
         private static bool FiniteColor(Color color) => GameAccess.Finite(color.r) && GameAccess.Finite(color.g) &&
@@ -166,6 +190,7 @@ namespace LCReplay.Plugin.Capture
             { OmittedTextures++; return ""; }
             var old = RenderTexture.active;
             bool oldSrgbWrite = GL.sRGBWrite;
+            var linear = !source.isDataSRGB;
             try
             {
                 // Keep a high-resolution base map for close spectator views. If a
@@ -180,17 +205,18 @@ namespace LCReplay.Plugin.Capture
                         float ratio = Math.Min(1f, (float)edge / Math.Max(source.width, source.height));
                         int width = Math.Max(1, Mathf.RoundToInt(source.width * ratio));
                         int height = Math.Max(1, Mathf.RoundToInt(source.height * ratio));
-                        temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                        GL.sRGBWrite = QualitySettings.activeColorSpace == ColorSpace.Linear;
+                        temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32,
+                            linear ? RenderTextureReadWrite.Linear : RenderTextureReadWrite.sRGB);
+                        GL.sRGBWrite = !linear && QualitySettings.activeColorSpace == ColorSpace.Linear;
                         Graphics.Blit(source, temporary);
                         RenderTexture.active = temporary;
-                        copy = new Texture2D(width, height, TextureFormat.RGBA32, false, false);
+                        copy = new Texture2D(width, height, TextureFormat.RGBA32, false, linear);
                         copy.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
                         copy.Apply(false, false);
                         var png = ImageConversion.EncodeToPNG(copy);
                         if (png == null || png.Length == 0 || png.Length > MaxIndividualTextureBytes ||
                             textureBytes + png.Length > MaxTextureBytes) continue;
-                        var snapshot = new TextureSnapshot { Id = "t" + key, Width = width, Height = height, Png = png };
+                        var snapshot = new TextureSnapshot { Id = "t" + key, Width = width, Height = height, Linear = linear, Png = png };
                         world.Textures.Add(snapshot); textureBytes += png.Length; textures[key] = snapshot.Id;
                         return snapshot.Id;
                     }

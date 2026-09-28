@@ -119,11 +119,11 @@ namespace LCReplay.Plugin.Playback
 
         internal void SetIndoor(bool indoor)
         {
-            // Keep the recorded global fog active in either camera zone. Interior
-            // transitions are handled by the captured local fog volumes; disabling
-            // this component removed both exterior fog seen through exits and any
-            // indoor atmosphere from the replay camera.
-            if (fogEnabled != null) SetValue(fogEnabled, recordedFog);
+            // The captured global height fog belongs to the exterior. Generated
+            // rooms can sit hundreds of metres below its base height, making it
+            // far denser there than in the actual game. Recorded local indoor fog
+            // remains active independently in ReplayViewer.
+            if (fogEnabled != null) SetValue(fogEnabled, recordedFog && !indoor);
         }
 
         internal void SetGamma(float gamma)

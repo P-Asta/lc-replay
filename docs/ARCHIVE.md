@@ -20,17 +20,19 @@ BepInEx/replays/
 
 The numeric folder is **remaining profit quota**, calculated as `max(target - fulfilled, 0)`. The `.lcr` stem is **days remaining until the quota deadline**. `130/3.lcr` means 130 credits still needed with three days left. Missing values use `unknown`, never an invented zero.
 
-A run belongs to one game process. A quota directory can be reused within that run. Each day writes one physical `.lcr` directly in the quota directory. Repeated deadline values use a collision-safe suffix (`3-2.lcr`, `3-3.lcr`) so reconnecting cannot overwrite an earlier recording. A changed quota or deadline starts a new recording context. Preparation, departure, return and observed expedition number remain metadata. The `.lci` sidecar contains record offsets and timestamps, not another recording. Keep it when copying an archive for fast opening; if missing or invalid, playback can rebuild the index by scanning the `.lcr` at a slower startup cost.
+A run belongs to one game process. A quota directory can be reused within that run. Each day writes one physical `.lcr` directly in the quota directory. Repeated deadline values use a collision-safe suffix (`3-2.lcr`, `3-3.lcr`) so reconnecting cannot overwrite an earlier recording. The quota and deadline at the start of a day determine its file path; temporary changes while exploring do not split the file. Preparation, departure, return and observed expedition number remain metadata. The `.lci` sidecar contains record offsets and timestamps, not another recording. Keep it when copying an archive for fast opening; if missing or invalid, playback can rebuild the index by scanning the `.lcr` at a slower startup cost.
 
 `ArchiveSession` remains the compatibility model for a quota group. `ArchiveDay` identifies one recording, its deadline and its file stem. Each day has one `ArchiveSegment`; this retains older archive APIs while new files never rotate into numbered parts. Nullable quota/deadline fields preserve unavailable information.
 
 ## Recording and playback
 
-The recorder finalizes the `.lcr` when quota/deadline changes, on disconnect, or on shutdown. It appends independent compressed records to the same file throughout that day. **F8** adds a checkpoint event and frame. If saving fails, the incomplete file remains visible and F8 retry allocates another collision-safe file.
+The recorder finalizes the `.lcr` after the crew returns to orbit, disconnects, or shuts down. It appends independent compressed records to the same file throughout that day. **F8** adds a checkpoint event and frame. If saving fails, the incomplete file remains visible and F8 retry allocates another collision-safe file.
 
 Playback scans the one file's record offsets, then loads bounded time windows into memory on demand. A window carries the preceding frame and latest world capture set, preserving the scene when seeking across a window boundary. These windows do not create more `.lcr` files. The viewer, HUD, camera, one timeline, speed, pause state and selected player persist while the active window changes. The next window is prefetched in the background.
 
 Disk serialization runs on a background worker. At shutdown, accepted records are drained before the file closes. A physically truncated final write leaves a readable complete prefix. A complete malformed record is rejected rather than silently skipped. The single-file index has explicit file, record, duration and expanded-data limits; an extreme recording that reaches them fails visibly rather than producing a hidden second file.
+
+For supported built-in moon scenes, the recording stores compact references to the scene's original baked renderers and terrain plus the level/map/dungeon settings. Generated rooms, dynamic objects and sampled state remain inside the `.lcr`. Playback resolves the baked references against the same installed Lethal Company version; keep that version available when archiving or sharing these recordings. Landing can append a small sky/fog update to the current capture set without another full map copy.
 
 ## Metadata, recovery and compatibility
 

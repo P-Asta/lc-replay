@@ -88,7 +88,8 @@ namespace LCReplay.Plugin.Capture
             var type = Type(name);
             if (type == null || !typeof(Component).IsAssignableFrom(type)) return Array.Empty<Component>();
             return Object.FindObjectsOfType(type, true).OfType<Component>()
-                .Where(c => c && c.gameObject.scene.IsValid() && c.gameObject.scene.isLoaded);
+                .Where(c => c && c.gameObject.scene.IsValid() && c.gameObject.scene.isLoaded &&
+                    !ReplayIsolation.IsReplayScene(c.gameObject.scene));
         }
 
         public static Dictionary<string, string> CaptureFields(Component component, Func<Component, string> identify, int maxFields)

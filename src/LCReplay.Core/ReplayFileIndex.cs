@@ -10,7 +10,7 @@ namespace LCReplay.Core
     /// <summary>A bounded, read-only index for one physical day file. Windows are playback memory budgets, not disk chunks.</summary>
     public sealed class ReplayFileIndex
     {
-        internal static readonly byte[] SidecarMagic = Encoding.ASCII.GetBytes("LCIX0001");
+        internal static readonly byte[] SidecarMagic = Encoding.ASCII.GetBytes("LCIX0002");
         internal static byte KindCode(string kind) => kind switch
         {
             "header" => 0, "frame" => 1, "event" => 2, "world" => 3, "end" => 4,
@@ -25,8 +25,9 @@ namespace LCReplay.Core
         {
             internal long Offset;
             internal int Compressed, Expanded;
-            internal string Kind = "", CaptureSetId = "";
+            internal string Kind = "", CaptureSetId = "", EventCategory = "";
             internal double Time;
+            internal WeakReference<WorldSnapshot>? World;
         }
 
         internal readonly List<Entry> Entries = new List<Entry>();
@@ -35,10 +36,22 @@ namespace LCReplay.Core
         public IReadOnlyList<ReplayFileWindow> Windows { get; internal set; } = Array.Empty<ReplayFileWindow>();
         public double Duration { get; internal set; }
         public bool IsComplete { get; internal set; }
+        /// <summary>Share validated, read-only world payloads between windows while another loaded window still owns them.
+        /// Callers enabling this must not modify the returned WorldSnapshot or its children.</summary>
+        public bool ReuseWorldPayloads { get; set; }
         public int FrameCount => Entries.Count(entry => entry.Kind == "frame");
         public int EventCount => Entries.Count(entry => entry.Kind == "event");
         public int WorldCount => Entries.Count(entry => entry.Kind == "world");
+        /// <summary>Physical offset of the latest world update at the requested file time.</summary>
+        public long WorldRevisionAt(double time)
+        {
+            long revision = -1;
+            foreach (var entry in Entries)
+                if (entry.Kind == "world" && entry.Time <= time) revision = entry.Offset;
+            return revision;
+        }
         internal long FileLength;
+        internal long LastWriteUtcTicks;
     }
 
     public sealed class ReplayFileWindow
@@ -57,14 +70,14 @@ namespace LCReplay.Core
 
         /// <summary>Scans independent records without retaining their decoded frame/world payloads.</summary>
         public static ReplayFileIndex IndexSingleFile(string path, CancellationToken cancellationToken = default,
-            long windowExpandedBytes = 180L * 1024 * 1024)
+            long windowExpandedBytes = 180L * 1024 * 1024, Action<double>? progress = null)
         {
             if (windowExpandedBytes < 1024 || windowExpandedBytes > 360L * 1024 * 1024)
                 throw new ArgumentOutOfRangeException(nameof(windowExpandedBytes));
-            var sidecar = TryReadSidecar(path, cancellationToken, windowExpandedBytes);
+            var sidecar = TryReadSidecar(path, cancellationToken, windowExpandedBytes, progress);
             if (sidecar != null) return sidecar;
             var limits = new ReplayReadLimits();
-            var index = new ReplayFileIndex { FilePath = Path.GetFullPath(path) };
+            var index = new ReplayFileIndex { FilePath = Path.GetFullPath(path), LastWriteUtcTicks = File.GetLastWriteTimeUtc(path).Ticks };
             var starts = new List<double> { 0 };
             long windowBytes = 0, expandedTotal = 0;
             int frames = 0;
@@ -91,7 +104,7 @@ namespace LCReplay.Core
                     if (index.FileLength - input.Position < compressed) break;
                     var payload = reader.ReadBytes(compressed);
                     if (payload.Length != compressed) break;
-                    var record = ReplayFormat.Decode(payload, expanded);
+                    var record = ReplayFormat.Decode(payload, expanded, cancellationToken);
                     ReplayValidation.Record(record, limits);
                     if (index.Entries.Count == 0)
                     {
@@ -100,7 +113,8 @@ namespace LCReplay.Core
                     }
                     else if (record.Kind == "header") throw new InvalidDataException("Duplicate replay header.");
                     var entry = new ReplayFileIndex.Entry { Offset = offset, Compressed = compressed, Expanded = expanded,
-                        Kind = record.Kind, Time = record.Time, CaptureSetId = record.World?.CaptureSetId ?? "" };
+                        Kind = record.Kind, Time = record.Time, CaptureSetId = record.World?.CaptureSetId ?? "",
+                        EventCategory = record.Event?.Category == "visual" ? "visual" : "" };
                     if (record.Kind == "frame")
                     {
                         if (record.Time < lastFrame) throw new InvalidDataException("Frame timestamps are out of order.");
@@ -117,6 +131,7 @@ namespace LCReplay.Core
                     }
                     index.Duration = Math.Max(index.Duration, record.Time);
                     index.Entries.Add(entry);
+                    if ((index.Entries.Count & 255) == 0) progress?.Invoke(Math.Min(1, (double)input.Position / index.FileLength));
                 }
             }
             if (index.Entries.Count == 0) throw new InvalidDataException("Single-file replay has no complete header.");
@@ -126,16 +141,55 @@ namespace LCReplay.Core
                 windows.Add(new ReplayFileWindow { Index = index, Number = i, Start = starts[i],
                     End = i + 1 < starts.Count ? starts[i + 1] : index.Duration });
             index.Windows = windows.AsReadOnly();
+            TryPersistSidecar(index);
+            progress?.Invoke(1);
             return index;
         }
 
-        private static ReplayFileIndex? TryReadSidecar(string path, CancellationToken cancellationToken, long windowExpandedBytes)
+        private static void TryPersistSidecar(ReplayFileIndex index)
+        {
+            if (!index.IsComplete) return;
+            var target = Path.ChangeExtension(index.FilePath, ".lci");
+            var temporary = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536))
+                using (var writer = new BinaryWriter(output, Encoding.UTF8, true))
+                {
+                    writer.Write(ReplayFileIndex.SidecarMagic);
+                    foreach (var entry in index.Entries)
+                    {
+                        var set = Encoding.UTF8.GetBytes(entry.CaptureSetId);
+                        if (set.Length > 96) return;
+                        writer.Write(entry.Offset); writer.Write(entry.Compressed); writer.Write(entry.Expanded);
+                        writer.Write(entry.Time); writer.Write(ReplayFileIndex.KindCode(entry.Kind));
+                        writer.Write((byte)set.Length); writer.Write(set);
+                        writer.Write((byte)(entry.EventCategory == "visual" ? 1 : 0));
+                    }
+                }
+                if (File.Exists(target)) File.Replace(temporary, target, null, true);
+                else File.Move(temporary, target);
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is System.Security.SecurityException)
+            { /* A read-only archive remains playable; only repeat indexing is slower. */ }
+            finally
+            {
+                try { if (File.Exists(temporary)) File.Delete(temporary); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+
+        private static ReplayFileIndex? TryReadSidecar(string path, CancellationToken cancellationToken, long windowExpandedBytes,
+            Action<double>? progress)
         {
             var sidecarPath = Path.ChangeExtension(path, ".lci");
             if (!File.Exists(sidecarPath)) return null;
             try
             {
-                var index = new ReplayFileIndex { FilePath = Path.GetFullPath(path), Header = ReadHeader(path) };
+                var index = new ReplayFileIndex { FilePath = Path.GetFullPath(path), Header = ReadHeader(path),
+                    LastWriteUtcTicks = File.GetLastWriteTimeUtc(path).Ticks };
                 index.FileLength = new FileInfo(path).Length;
                 if (index.FileLength > MaxSingleFileBytes) throw new InvalidDataException("Single-file replay is too large.");
                 using (var input = new FileStream(sidecarPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536))
@@ -149,15 +203,17 @@ namespace LCReplay.Core
                     while (input.Position < input.Length)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        if (index.Entries.Count >= 2000000 || input.Length - input.Position < 26) return null;
+                        if (index.Entries.Count >= 2000000 || input.Length - input.Position < 27) return null;
                         var offset = reader.ReadInt64();
                         var compressed = reader.ReadInt32();
                         var expanded = reader.ReadInt32();
                         var time = reader.ReadDouble();
                         var kind = ReplayFileIndex.KindName(reader.ReadByte());
                         var length = reader.ReadByte();
-                        if (length > 96 || input.Length - input.Position < length) return null;
+                        if (length > 96 || input.Length - input.Position < length + 1) return null;
                         var set = Encoding.UTF8.GetString(reader.ReadBytes(length));
+                        var categoryCode = reader.ReadByte();
+                        if (categoryCode > 1 || categoryCode == 1 && kind != "event") return null;
                         if (offset != expectedOffset || compressed <= 0 || compressed > 48 * 1024 * 1024 ||
                             expanded <= 0 || expanded > 96 * 1024 * 1024 || double.IsNaN(time) ||
                             double.IsInfinity(time) || time < 0 || time > 7 * 24 * 60 * 60 ||
@@ -174,7 +230,9 @@ namespace LCReplay.Core
                         if (expandedTotal > MaxSingleFileExpandedBytes) return null;
                         index.Duration = Math.Max(index.Duration, time);
                         index.Entries.Add(new ReplayFileIndex.Entry { Offset = offset, Compressed = compressed,
-                            Expanded = expanded, Time = time, Kind = kind, CaptureSetId = set });
+                            Expanded = expanded, Time = time, Kind = kind, CaptureSetId = set,
+                            EventCategory = categoryCode == 1 ? "visual" : "" });
+                        if ((index.Entries.Count & 255) == 0) progress?.Invoke(Math.Min(1, (double)input.Position / input.Length));
                     }
                     index.IsComplete = index.Entries.Count != 0 && index.Entries[index.Entries.Count - 1].Kind == "end" &&
                         expectedOffset == index.FileLength;
@@ -194,6 +252,7 @@ namespace LCReplay.Core
                     windows.Add(new ReplayFileWindow { Index = index, Number = i, Start = starts[i],
                         End = i + 1 < starts.Count ? starts[i + 1] : index.Duration });
                 index.Windows = windows.AsReadOnly();
+                progress?.Invoke(1);
                 return index;
             }
             catch (Exception error) when (error is IOException || error is InvalidDataException || error is UnauthorizedAccessException ||
@@ -202,7 +261,8 @@ namespace LCReplay.Core
         }
 
         /// <summary>Loads one spectator window from the indexed day while carrying its latest world and boundary frame.</summary>
-        public static ReplaySession ReadWindow(ReplayFileWindow window, CancellationToken cancellationToken = default)
+        public static ReplaySession ReadWindow(ReplayFileWindow window, CancellationToken cancellationToken = default,
+            Action<double>? progress = null)
         {
             if (window == null || window.Index == null || window.Number < 0 ||
                 window.Number >= window.Index.Windows.Count || !ReferenceEquals(window.Index.Windows[window.Number], window))
@@ -227,6 +287,20 @@ namespace LCReplay.Core
             if (priorWorld >= 0)
             {
                 var set = entries[priorWorld].CaptureSetId;
+                var setStart = priorWorld;
+                for (var i = priorWorld - 1; i >= 0; i--)
+                {
+                    if (entries[i].Kind != "world") continue;
+                    if (entries[i].CaptureSetId != set) break;
+                    setStart = i;
+                }
+                // Visual events are sparse state changes. Carry them across
+                // memory windows so a later seek retains destroyed meshes and
+                // spray marks without loading earlier audio or frame payloads.
+                for (var i = 0; i < entries.Count; i++)
+                    if (entries[i].EventCategory == "visual" && entries[i].Time < window.Start &&
+                        entries[i].Time >= entries[setStart].Time)
+                        selected.Add(i);
                 for (var i = 0; i <= priorWorld; i++)
                     if (entries[i].Kind == "world" && (set.Length == 0 ? i == priorWorld : entries[i].CaptureSetId == set))
                         selected.Add(i);
@@ -236,45 +310,36 @@ namespace LCReplay.Core
                 IsComplete = index.IsComplete && window.Number == index.Windows.Count - 1 };
             session.Warnings.AddRange(index.Header.Warnings);
             if (!index.IsComplete) session.Warnings.Add("Recording has no end marker; recovered data may omit its final moments.");
-            long expandedTotal = 0, entitiesTotal = 0;
-            using (var input = new FileStream(index.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536))
-            using (var reader = new BinaryReader(input, Encoding.UTF8, true))
-                foreach (var position in selected.OrderBy(value => value))
+            long entitiesTotal = 0;
+            var readCount = 0;
+            foreach (var record in ReadWindowRecords(index, selected.OrderBy(value => value), limits, cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                record.Time = Math.Max(0, record.Time - window.Start);
+                if (record.Kind == "frame")
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var entry = entries[position];
-                    expandedTotal += entry.Expanded;
-                    if (expandedTotal > limits.MaxTotalUncompressedBytes) throw new InvalidDataException("Replay playback window exceeds memory budget.");
-                    input.Position = entry.Offset;
-                    if (reader.ReadInt32() != entry.Compressed || reader.ReadInt32() != entry.Expanded)
-                        throw new InvalidDataException("Replay changed after its index was created.");
-                    var payload = reader.ReadBytes(entry.Compressed);
-                    if (payload.Length != entry.Compressed) throw new InvalidDataException("Indexed replay record was truncated.");
-                    var record = ReplayFormat.Decode(payload, entry.Expanded);
-                    ReplayValidation.Record(record, limits);
-                    record.Time = Math.Max(0, record.Time - window.Start);
-                    if (record.Kind == "frame")
-                    {
-                        record.Frame!.Time = record.Time;
-                        entitiesTotal += record.Frame.Entities.Count;
-                        if (session.Frames.Count >= limits.MaxFrames || entitiesTotal > limits.MaxTotalEntitySnapshots)
-                            throw new InvalidDataException("Replay playback window exceeds entity budget.");
-                        session.Frames.Add(record.Frame);
-                    }
-                    else if (record.Kind == "event")
-                    {
-                        record.Event!.Time = record.Time;
-                        if (session.Events.Count >= limits.MaxEvents) throw new InvalidDataException("Replay playback window exceeds event budget.");
-                        session.Events.Add(record.Event);
-                    }
-                    else if (record.Kind == "world")
-                    {
-                        if (session.Worlds.Count >= limits.MaxWorlds) throw new InvalidDataException("Replay playback window exceeds world budget.");
-                        session.Worlds.Add(record);
-                    }
+                    record.Frame!.Time = record.Time;
+                    entitiesTotal += record.Frame.Entities.Count;
+                    if (session.Frames.Count >= limits.MaxFrames || entitiesTotal > limits.MaxTotalEntitySnapshots)
+                        throw new InvalidDataException("Replay playback window exceeds entity budget.");
+                    session.Frames.Add(record.Frame);
                 }
+                else if (record.Kind == "event")
+                {
+                    record.Event!.Time = record.Time;
+                    if (session.Events.Count >= limits.MaxEvents) throw new InvalidDataException("Replay playback window exceeds event budget.");
+                    session.Events.Add(record.Event);
+                }
+                else if (record.Kind == "world")
+                {
+                    if (session.Worlds.Count >= limits.MaxWorlds) throw new InvalidDataException("Replay playback window exceeds world budget.");
+                    session.Worlds.Add(record);
+                }
+                if ((++readCount & 15) == 0) progress?.Invoke((double)readCount / Math.Max(1, selected.Count));
+            }
             session.Worlds = session.Worlds.OrderBy(record => record.Time).ToList();
             session.Events = session.Events.OrderBy(record => record.Time).ToList();
+            progress?.Invoke(1);
             return session;
         }
     }
