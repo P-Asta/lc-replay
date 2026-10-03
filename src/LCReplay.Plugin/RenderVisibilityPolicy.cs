@@ -26,6 +26,14 @@ namespace LCReplay.Plugin
                 name.IndexOf("cliff", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        internal static bool IsArchitectureSurface(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.IndexOf("wall", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("floor", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("ceiling", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         internal static bool IsVegetation(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
@@ -40,7 +48,13 @@ namespace LCReplay.Plugin
 
         internal static bool IsDebugObject(string name) =>
             name.StartsWith("ImpVis_", StringComparison.Ordinal) ||
-            name.StartsWith("ImpGizmo_", StringComparison.Ordinal);
+            name.StartsWith("ImpGizmo_", StringComparison.Ordinal) ||
+            string.Equals(name, "ScanSphere", StringComparison.OrdinalIgnoreCase) ||
+            name == "MapDot" || name.StartsWith("MapDot (", StringComparison.Ordinal);
+
+        internal static bool IsRadarPath(string path) =>
+            path.StartsWith("MapDot[", StringComparison.Ordinal) || path.StartsWith("MapDot (", StringComparison.Ordinal) ||
+            path.IndexOf("/MapDot[", StringComparison.Ordinal) >= 0 || path.IndexOf("/MapDot (", StringComparison.Ordinal) >= 0;
 
         // These are first-person helmet/visor effects in the live scene. They
         // follow the gameplay camera rather than representing world geometry.

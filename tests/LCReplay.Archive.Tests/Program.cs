@@ -37,6 +37,11 @@ var suite = new (string Name, Action Run)[]
     ("Active and escaped replay paths cannot be deleted", DeleteRecordingSafety),
     ("Folder deletion removes its recordings while preserving other quotas", DeleteRecordingFolder),
     ("Folder deletion refuses an active member before changing any file", DeleteRecordingFolderSafety),
+    ("Lobby folder names and member previews survive scans and disappear after last deletion", LobbyMembersAndCleanup),
+    ("A later launch appends the same named lobby without overwriting its quota recording", SameLobbyRelaunch),
+    ("Quota day labels remain Day 1 to Day 3 for preparation and overdue metadata", QuotaDayLabels),
+    ("Fractional native deadlines save consecutive quota days in files, headers and archive labels", FractionalQuotaDays),
+    ("Bookmark totals persist during recording and finalization without reading payloads", BookmarkCounts),
 };
 int failures = 0;
 foreach (var test in suite)
@@ -46,6 +51,39 @@ foreach (var test in suite)
 }
 Console.WriteLine($"{suite.Length - failures}/{suite.Length} archive test groups passed.");
 return failures == 0 ? 0 : 1;
+
+static void QuotaDayLabels()
+{
+    var deadlines = new[] { 3.999f * 1080f, 2.999f * 1080f, 1.999f * 1080f };
+    Check(deadlines.Select(seconds => QuotaDay.Number(QuotaDay.Remaining(seconds, 1080f, null)))
+        .SequenceEqual(new[] { 1, 2, 3 }), "fractional native deadlines never repeat the first day");
+    Check(QuotaDay.Remaining(4 * 1080f, 1080f, null) == 4 &&
+        QuotaDay.Number(QuotaDay.Remaining(4 * 1080f, 1080f, null)) == 1, "new quota preparation clamps to day one");
+    Check(QuotaDay.Remaining(float.NaN, 1080f, 2) == 2 &&
+        QuotaDay.Remaining(1080f, 0, null) == null && QuotaDay.Remaining(0, 1080f, 3) == 0, "invalid time preserves native fallback; due day is zero");
+    Check(QuotaDay.Number(3) == 1 && QuotaDay.Number(2) == 2 && QuotaDay.Number(1) == 3, "expedition day order");
+    foreach (var remaining in new[] { int.MinValue, -1, 0, 4, 5, int.MaxValue })
+        Check(QuotaDay.Number(remaining) is >= 1 and <= 3, "no day zero or five");
+    Check(QuotaDay.Number(new Dictionary<string, string> { ["dayNumber"] = "5" }) == 3 &&
+        QuotaDay.Number(new Dictionary<string, string> { ["deadlineDaysRemaining"] = "3", ["dayNumber"] = "5" }) == 1, "authoritative deadline overrides legacy day");
+}
+
+static void FractionalQuotaDays() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now(), "Fractional deadline lobby");
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 4, DeadlineDaysTotal = 4 };
+    var group = archive.BeginQuota(run, Now(), quota, "host");
+    for (var day = 1; day <= 3; day++)
+    {
+        quota.DeadlineDaysRemaining = QuotaDay.Remaining((4.999f - day) * 1080f, 1080f, null);
+        var clip = archive.BeginQuotaDay(group, day, Now().AddMinutes(day), "Experimentation", quota);
+        var segment = archive.AllocateSegment(clip, 1); Write(archive, segment, 10); archive.EndDay(clip, "saved");
+        Check(Path.GetFileName(segment.FilePath) == (4 - day) + ".lcr", "native remaining-days file stem");
+        Check(QuotaDay.Number(ReplayReader.ReadHeader(segment.FilePath).Metadata) == day, "saved header day");
+    }
+    Check(archive.Scan().Runs.Single().Sessions.Single().Days.Select(day => QuotaDay.Number(day.DeadlineDaysRemaining, day.DayNumber))
+        .SequenceEqual(new[] { 1, 2, 3 }), "archive displays consecutive days");
+});
 
 static void Hierarchy() => WithTemp(root =>
 {
@@ -678,6 +716,75 @@ static void DeleteRecordingFolderSafety() => WithTemp(root =>
     Check(File.Exists(previousFile.FilePath) && File.Exists(active.FilePath), "batch preflight preserves every file");
 });
 static DateTimeOffset Now() => DateTimeOffset.Parse("2026-09-23T12:00:00Z");
+static void LobbyMembersAndCleanup() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root);
+    var run = archive.BeginRun(Now(), "Friends / Titan: crew");
+    Check(run.Label == "Friends / Titan: crew" && Path.GetFileName(run.DirectoryPath).StartsWith("Lobby-Friends _ Titan_ crew-"),
+        "room name is visible while reserved path characters are replaced");
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var group = archive.BeginQuota(run, Now(), quota, "host");
+    var day = archive.BeginQuotaDay(group, 1, Now(), "Titan", quota);
+    Check(archive.UpdateMembers(day, new[] { "Alice", "Bob", "Alice" }), "new roster saved");
+    Check(!archive.UpdateMembers(day, new[] { "bob" }), "unchanged roster skips manifest write");
+    var file = archive.AllocateSegment(day, 1);
+    Write(archive, file, 1);
+    archive.EndDay(day, "saved"); archive.EndSession(group);
+    var emptyQuota = new ArchiveQuotaSnapshot { Target = 90, Fulfilled = 0, DeadlineDaysRemaining = 2 };
+    var emptyGroup = archive.BeginQuota(run, Now(), emptyQuota, "host");
+    var emptyDay = archive.BeginQuotaDay(emptyGroup, 2, Now(), "Company", emptyQuota);
+    archive.EndDay(emptyDay, "preparing"); archive.EndSession(emptyGroup); archive.EndRun(run);
+    var scanned = archive.Scan().Runs.Single();
+    var recording = scanned.Sessions.SelectMany(session => session.Days).Single();
+    Check(scanned.Label == run.Label && recording.Members.SequenceEqual(new[] { "Alice", "Bob" }),
+        "room and members visible from bounded manifests");
+    Check(archive.DeleteRecording(recording) == 1, "last recording removed");
+    Check(!Directory.Exists(run.DirectoryPath), "empty quota and room folders removed");
+});
+
+static void SameLobbyRelaunch() => WithTemp(root =>
+{
+    var first = new ReplayArchive(root);
+    var run = first.BeginRun(Now(), "Friends");
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var group = first.BeginQuota(run, Now(), quota, "host");
+    var day = first.BeginQuotaDay(group, 1, Now(), "Titan", quota);
+    var original = first.AllocateSegment(day, 1);
+    Write(first, original, 1);
+    first.EndDay(day, "saved"); first.EndSession(group); first.EndRun(run);
+
+    var later = new ReplayArchive(root);
+    var resumed = later.BeginRun(Now().AddHours(1), "Friends");
+    var reused = later.BeginQuota(resumed, Now().AddHours(1), quota, "host");
+    var next = later.BeginQuotaDay(reused, 2, Now().AddHours(1), "Titan", quota);
+    var second = later.AllocateSegment(next, 1);
+    Write(later, second, 2);
+    later.EndDay(next, "saved"); later.EndSession(reused); later.EndRun(resumed);
+    Check(resumed.DirectoryPath == run.DirectoryPath && reused.DirectoryPath == group.DirectoryPath,
+        "same lobby and quota directories reused");
+    Check(second.FilePath != original.FilePath && File.Exists(original.FilePath),
+        "deadline suffix protects the earlier recording");
+    Check(later.Scan().Runs.Single().Sessions.Single().Days.Count == 2,
+        "both recordings remain visible in the shared folder");
+});
+
+static void BookmarkCounts() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now(), "Bookmarked lobby");
+    var session = archive.BeginSession(run, Now(), "Friends", "host");
+    var day = archive.BeginDay(session, 1, Now(), "Titan");
+    var segment = archive.AllocateSegment(day, 1);
+    Write(archive, segment, 10);
+    archive.UpdateBookmarkCount(segment, 3);
+    Check(archive.Scan().Runs.Single().Sessions.Single().Days.Single().BookmarkCount == 3, "active manifest survives scan");
+    archive.CompleteSegment(segment, 10, true, null, 2);
+    var reopened = new ReplayArchive(root).Scan().Runs.Single().Sessions.Single().Days.Single();
+    Check(reopened.BookmarkCount == 2 && reopened.Segments.Single().BookmarkCount == 2, "final count uses successfully written markers");
+    Expect<ArgumentOutOfRangeException>(() => archive.UpdateBookmarkCount(segment, -1));
+    archive.UpdateBookmarkCount(segment, 0);
+    Check(archive.Scan().Runs.Single().Sessions.Single().Days.Single().BookmarkCount == 0, "zero markers supports older files");
+});
+
 static void Write(ReplayArchive archive, ArchiveSegment segment, double duration)
 {
     var header = new ReplayHeader { SessionId = segment.SessionId, StartedUtc = segment.StartedUtc.ToString("O"), Metadata = segment.Metadata };

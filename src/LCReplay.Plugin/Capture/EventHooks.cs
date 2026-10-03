@@ -14,6 +14,13 @@ namespace LCReplay.Plugin.Capture
         private readonly Action<string> logger;
         private bool disposed;
         private static Action<ReplayEvent>? sink;
+        private static readonly Dictionary<int, Component> SpawnedEnemies = new Dictionary<int, Component>();
+        internal static Component? TakeSpawnedEnemy(int id)
+        {
+            if (!SpawnedEnemies.TryGetValue(id, out var component)) return null;
+            SpawnedEnemies.Remove(id);
+            return component;
+        }
         public List<string> Installed { get; } = new List<string>();
         public List<string> Missing { get; } = new List<string>();
         private static readonly Dictionary<string, string[]> Methods = new Dictionary<string, string[]>
@@ -21,8 +28,9 @@ namespace LCReplay.Plugin.Capture
             ["StartOfRound"] = new[] { "StartGame", "OnShipLandedMiscEvents", "ShipLeave", "ShipHasLeft", "SetShipReadyToLand", "OnLocalDisconnect" },
             ["RoundManager"] = new[] { "GenerateNewFloor", "FinishGeneratingLevel", "FinishGeneratingNewLevelClientRpc" },
             ["GameNetcodeStuff.PlayerControllerB"] = new[] { "DamagePlayer", "DamageOnOtherClients", "KillPlayer", "KillPlayerClientRpc", "GrabObjectClientRpc", "DropHeldItem", "TeleportPlayer", "SwitchToItemSlot" },
-            ["GrabbableObject"] = new[] { "GrabItem", "DiscardItem", "ItemActivate", "SetScrapValue" },
-            ["EnemyAI"] = new[] { "HitEnemy", "KillEnemy", "SwitchToBehaviourState" },
+            ["GrabbableObject"] = new[] { "GrabItem", "DiscardItem", "PlayDropSFX", "ItemActivate", "SetScrapValue" },
+            ["EnemyAI"] = new[] { "Start", "HitEnemy", "KillEnemy", "SwitchToBehaviourState" },
+            ["SandSpiderAI"] = new[] { "SpawnWebTrapClientRpc" },
             ["DoorLock"] = new[] { "OpenOrCloseDoor", "SetDoorAsOpen", "UnlockDoor", "LockDoor" },
             ["TerminalAccessibleObject"] = new[] { "SetDoorOpen", "CallFunctionFromTerminal" },
             ["Landmine"] = new[] { "Detonate" }, ["Turret"] = new[] { "ToggleTurretEnabled", "SwitchTurretMode" },
@@ -73,9 +81,17 @@ namespace LCReplay.Plugin.Capture
                 var evt = new ReplayEvent { Category = __originalMethod.Name == "AddChatMessage" ? "chat" : "call",
                     Name = (__originalMethod.DeclaringType?.Name ?? "unknown") + "." + __originalMethod.Name };
                 if (__instance is Component c && c) evt.Data["instanceId"] = c.GetInstanceID().ToString();
+                if (__originalMethod.DeclaringType?.Name == "EnemyAI" && __originalMethod.Name == "Start" && __instance is Component enemy && enemy)
+                {
+                    if (SpawnedEnemies.Count >= 256) SpawnedEnemies.Clear();
+                    SpawnedEnemies[enemy.GetInstanceID()] = enemy;
+                }
                 var parameters = __originalMethod.GetParameters();
                 for (var i = 0; i < Math.Min(__args.Length, parameters.Length); i++)
                 { var scalar = GameAccess.Scalar(__args[i]); if (scalar != null) evt.Data[parameters[i].Name ?? ("arg" + i)] = scalar; }
+                if (__originalMethod.Name == "DropHeldItem" && __args.Length != 0 &&
+                    __args[0] is Component dropped && dropped)
+                    evt.Data["itemInstanceId"] = dropped.GetInstanceID().ToString();
                 // A call is an observation, not proof it changed state. Snapshots establish outcomes.
                 currentSink(evt);
             }
@@ -86,6 +102,7 @@ namespace LCReplay.Plugin.Capture
             if (disposed) return;
             disposed = true;
             sink = null;
+            SpawnedEnemies.Clear();
             try { harmony.UnpatchSelf(); }
             catch (Exception ex) { logger("Event hooks could not all be removed: " + ex.Message); }
         }

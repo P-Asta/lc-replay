@@ -74,9 +74,14 @@ namespace LCReplay.Plugin.Playback
             if (style != null)
             {
                 renderer.renderMode = (ParticleSystemRenderMode)style.RenderMode;
+                // Vanilla's BulletParticle is a non-rendering emitter whose
+                // child flare draws the shots. Older files stored only the
+                // parent particles, so render their trajectories as tracers.
+                if (style.Name == "BulletParticle" && renderer.renderMode == ParticleSystemRenderMode.None)
+                    renderer.renderMode = (ParticleSystemRenderMode)1;
                 renderer.alignment = (ParticleSystemRenderSpace)style.Alignment;
-                renderer.lengthScale = style.LengthScale;
-                renderer.velocityScale = style.VelocityScale;
+                renderer.lengthScale = style.Name == "BulletParticle" ? .18f : style.LengthScale;
+                renderer.velocityScale = style.Name == "BulletParticle" ? .08f : style.VelocityScale;
                 renderer.cameraVelocityScale = style.CameraVelocityScale;
                 renderer.pivot = Vec(style.Pivot);
                 if (style.VertexStreams.Length != 0)

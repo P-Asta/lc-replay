@@ -29,15 +29,19 @@ namespace LCReplay.Core.Archive
             RootDirectory = Path.GetFullPath(rootDirectory);
         }
 
-        public ArchiveRun BeginRun(DateTimeOffset now)
+        public ArchiveRun BeginRun(DateTimeOffset now, string? lobbyName = null)
         {
             lock (gate)
             {
                 string id = Guid.NewGuid().ToString("N");
+                var room = Clip(lobbyName?.Trim(), 80);
+                if (room.Length == 0) room = "Unknown lobby";
+                var resumed = string.IsNullOrWhiteSpace(lobbyName) ? null : ResumeRun(room, now);
+                if (resumed != null) return resumed;
                 var run = new ArchiveRun
                 {
-                    Id = id, Label = now.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
-                    DirectoryPath = Path.Combine(RootDirectory, "Run-" + now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + ShortId(id)),
+                    Id = id, Label = room,
+                    DirectoryPath = Path.Combine(RootDirectory, "Lobby-" + SafeFolderName(room) + "-" + ShortId(id)),
                     StartedUtc = now.ToUniversalTime(), LastModifiedUtc = now.ToUniversalTime()
                 };
                 CreateFolder(run, "run.json");
@@ -73,6 +77,29 @@ namespace LCReplay.Core.Archive
             {
                 RequireOwned(run);
                 var existing = run.Sessions.FirstOrDefault(session => session.IsQuotaGroup && session.QuotaRemaining == quota.Remaining);
+                if (existing == null)
+                {
+                    var quotaPath = Path.Combine(run.DirectoryPath, NumericFolder(quota.Remaining));
+                    var manifestPath = Path.Combine(quotaPath, "quota.json");
+                    if (File.Exists(manifestPath))
+                    {
+                        EnsureSafePath(manifestPath);
+                        try
+                        {
+                            var loaded = JsonConvert.DeserializeObject<ArchiveSession>(File.ReadAllText(manifestPath), JsonSettings);
+                            if (loaded != null && loaded.IsQuotaGroup && loaded.QuotaRemaining == quota.Remaining &&
+                                loaded.RunId == run.Id && Guid.TryParseExact(loaded.Id, "N", out _))
+                            {
+                                loaded.DirectoryPath = quotaPath;
+                                run.Sessions.Add(loaded);
+                                owned.Add(loaded, quotaPath);
+                                existing = loaded;
+                            }
+                        }
+                        catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is JsonException)
+                        { /* A damaged old manifest must not overwrite its quota folder. */ }
+                    }
+                }
                 if (existing != null)
                 {
                     RequireOwned(existing);
@@ -118,7 +145,7 @@ namespace LCReplay.Core.Archive
                     Id = id, RunId = group.RunId, SessionId = group.Id, DayNumber = dayNumber, CampaignDay = campaignDay,
                     QuotaRemaining = quota.Remaining, QuotaTarget = NonNegative(quota.Target), QuotaFulfilled = NonNegative(quota.Fulfilled),
                     DeadlineDaysRemaining = deadline, DeadlineDaysTotal = NonNegative(quota.DeadlineDaysTotal), QuotaCycle = NonNegative(quota.QuotaCycle),
-                    Label = deadline.HasValue ? "Deadline " + deadline.Value.ToString(CultureInfo.InvariantCulture) + " days" : "Deadline unknown",
+                    Label = "Day " + QuotaDay.Number(deadline, dayNumber),
                     Moon = Clip(moon, 512),
                     DirectoryPath = group.DirectoryPath,
                     StartedUtc = now.ToUniversalTime(), LastModifiedUtc = now.ToUniversalTime()
@@ -222,7 +249,7 @@ namespace LCReplay.Core.Archive
             }
         }
 
-        public void CompleteSegment(ArchiveSegment segment, double duration, bool successful, string? error)
+        public void CompleteSegment(ArchiveSegment segment, double duration, bool successful, string? error, int? bookmarkCount = null)
         {
             if (double.IsNaN(duration) || double.IsInfinity(duration) || duration < 0) throw new ArgumentOutOfRangeException(nameof(duration));
             lock (gate)
@@ -230,11 +257,24 @@ namespace LCReplay.Core.Archive
                 RequireOwned(segment);
                 EnsureSafePath(segment.FilePath);
                 segment.DurationSeconds = duration;
+                if (bookmarkCount.HasValue) segment.BookmarkCount = Math.Max(0, bookmarkCount.Value);
                 segment.LastModifiedUtc = DateTimeOffset.UtcNow;
                 segment.Bytes = File.Exists(segment.FilePath) ? new FileInfo(segment.FilePath).Length : 0;
                 segment.Status = successful ? "complete" : "incomplete";
                 segment.Error = Clip(error, 2048);
                 activeSegments.Remove(segment.FilePath);
+                WriteManifest(Path.ChangeExtension(segment.FilePath, ".json"), segment);
+            }
+        }
+
+        public void UpdateBookmarkCount(ArchiveSegment segment, int count)
+        {
+            if (count < 0 || count > 1000000) throw new ArgumentOutOfRangeException(nameof(count));
+            lock (gate)
+            {
+                RequireOwned(segment);
+                EnsureSafePath(segment.FilePath);
+                segment.BookmarkCount = count;
                 WriteManifest(Path.ChangeExtension(segment.FilePath, ".json"), segment);
             }
         }
@@ -246,6 +286,22 @@ namespace LCReplay.Core.Archive
                 RequireOwned(day);
                 day.Moon = Clip(moon, 512); day.Status = Clip(status, 64); day.LastModifiedUtc = DateTimeOffset.UtcNow;
                 WriteManifest(DayManifestPath(day), day);
+            }
+        }
+
+        public bool UpdateMembers(ArchiveDay day, IEnumerable<string> names)
+        {
+            if (names == null) throw new ArgumentNullException(nameof(names));
+            lock (gate)
+            {
+                RequireOwned(day);
+                var merged = day.Members.Concat(names).Select(name => Clip(name?.Trim(), 64))
+                    .Where(name => name.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
+                if (merged.Count == day.Members.Count && merged.SequenceEqual(day.Members)) return false;
+                day.Members = merged;
+                day.LastModifiedUtc = DateTimeOffset.UtcNow;
+                WriteManifest(DayManifestPath(day), day);
+                return true;
             }
         }
 
@@ -363,6 +419,17 @@ namespace LCReplay.Core.Archive
                         !string.Equals(current.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root, StringComparison.OrdinalIgnoreCase);
                         current = Path.GetDirectoryName(current))
                         cleanup.Add(current);
+                // A failed or abandoned preparation may leave a metadata-only quota
+                // sibling. Include bounded siblings so the lobby can disappear when
+                // its final actual replay is deleted.
+                foreach (var runDirectory in cleanup.Where(path => File.Exists(Path.Combine(path, "run.json"))).ToArray())
+                    if (!activeFolders.Contains(runDirectory) && Directory.Exists(runDirectory))
+                        foreach (var sibling in Directory.EnumerateDirectories(runDirectory).Take(4096))
+                        {
+                            try { EnsureSafePath(sibling); cleanup.Add(sibling); }
+                            catch (IOException) { /* Never follow a sibling junction or unsafe path. */ }
+                            catch (UnauthorizedAccessException) { /* Leave unrelated protected folders alone. */ }
+                        }
                 foreach (var directory in cleanup.OrderByDescending(path => path.Length))
                 {
                     EnsureSafePath(directory);
@@ -451,7 +518,51 @@ namespace LCReplay.Core.Archive
             throw new IOException("Could not allocate an unused archive folder.");
         }
 
+        private ArchiveRun? ResumeRun(string room, DateTimeOffset now)
+        {
+            if (!Directory.Exists(RootDirectory)) return null;
+            var prefix = "Lobby-" + SafeFolderName(room);
+            ArchiveRun? best = null;
+            foreach (var directory in Directory.EnumerateDirectories(RootDirectory, prefix + "*", SearchOption.TopDirectoryOnly).Take(256))
+            {
+                var leaf = Path.GetFileName(directory);
+                if (!string.Equals(leaf, prefix, StringComparison.OrdinalIgnoreCase) &&
+                    !leaf.StartsWith(prefix + "-", StringComparison.OrdinalIgnoreCase)) continue;
+                var manifest = Path.Combine(directory, "run.json");
+                if (!File.Exists(manifest)) continue;
+                EnsureSafePath(manifest);
+                try
+                {
+                    var candidate = JsonConvert.DeserializeObject<ArchiveRun>(File.ReadAllText(manifest), JsonSettings);
+                    if (candidate == null || !string.Equals(candidate.Label, room, StringComparison.OrdinalIgnoreCase) ||
+                        !Guid.TryParseExact(candidate.Id, "N", out _)) continue;
+                    candidate.DirectoryPath = directory;
+                    if (best == null || candidate.LastModifiedUtc > best.LastModifiedUtc) best = candidate;
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException || error is JsonException)
+                { /* Ignore an incomplete or unrelated folder. */ }
+            }
+            if (best == null) return null;
+            best.Status = "recording";
+            best.LastModifiedUtc = now.ToUniversalTime();
+            owned.Add(best, best.DirectoryPath);
+            activeFolders.Add(best.DirectoryPath);
+            WriteManifest(Path.Combine(best.DirectoryPath, "run.json"), best);
+            return best;
+        }
+
         private static string ShortId(string id) => id.Substring(0, 12);
+        private static string SafeFolderName(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            var cleaned = new string(name.Select(ch => Array.IndexOf(invalid, ch) >= 0 || char.IsControl(ch) ? '_' : ch).ToArray())
+                .Trim(' ', '.');
+            if (cleaned.Length == 0) cleaned = "Unknown lobby";
+            if (cleaned.Length > 48) cleaned = cleaned.Substring(0, 48).TrimEnd(' ', '.');
+            // Windows device names are reserved even when the name is otherwise legal.
+            var reserved = new[] { "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3" };
+            return reserved.Contains(cleaned, StringComparer.OrdinalIgnoreCase) ? "Room_" + cleaned : cleaned;
+        }
         private static string DayManifestPath(ArchiveDay day) => Path.Combine(day.DirectoryPath,
             day.RecordingStem.Length == 0 ? "day.json" : day.RecordingStem + ".day.json");
         private static int? NonNegative(int? value) => value.HasValue && value.Value >= 0 ? value : null;

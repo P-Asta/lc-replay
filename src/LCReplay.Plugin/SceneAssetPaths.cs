@@ -21,6 +21,11 @@ namespace LCReplay.Plugin
                 indices.Add(node.GetSiblingIndex());
             indices.Reverse();
             var siblings = string.Join("/", indices);
+            return For(component, siblings);
+        }
+
+        internal static string For(Component component, string siblings)
+        {
             var components = component.GetComponents(component.GetType());
             var componentIndex = Array.IndexOf(components, component);
             return siblings + ":" + component.GetType().Name + ":" + componentIndex;

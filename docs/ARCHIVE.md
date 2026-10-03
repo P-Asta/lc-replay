@@ -1,10 +1,12 @@
 # Automatic recording archive
 
-Open the native archive through the main menu's **Replay** button or **F9**. Recording begins automatically when a game is hosted or joined. New recordings are organized by **run → remaining quota → deadline file**.
+Open the native archive through the main menu's **Replay** button or **F9**. Recording begins automatically when a game is hosted or joined. New recordings are organized by **lobby name → remaining quota → day**. The UI labels quota days **Day 1**, **Day 2** and **Day 3**, clamped to that range. Physical filenames retain the days-remaining stem for archive compatibility.
+
+Press **backtick (`)** during recording to add a bookmark. With InputUtils installed, change **Replay / Add replay bookmark** in the game's Controls settings; without it, change `Input.BookmarkKey` in the BepInEx configuration. Chat, terminal and menu input does not add markers. Archive rows/details show the count directly from segment manifests. Playback shows cyan clickable timeline markers; their timestamps come from the compact index. Final counts include only events successfully written to the file.
 
 ```text
 BepInEx/replays/
-  Run-20260924-210000-<short-id>/
+  Lobby-Friends-<short-id>/
     run.json
     130/
       quota.json
@@ -18,9 +20,11 @@ BepInEx/replays/
       3-2.lcr              repeated deadline after reconnect
 ```
 
-The numeric folder is **remaining profit quota**, calculated as `max(target - fulfilled, 0)`. The `.lcr` stem is **days remaining until the quota deadline**. `130/3.lcr` means 130 credits still needed with three days left. Missing values use `unknown`, never an invented zero.
+The room name comes from `GameNetworkManager.steamLobbyName`, or from `lobbyHostSettings.lobbyName` for a local host. It is sanitized for Windows. Later launches with the same room name resume its existing lobby and quota folders; recording file suffixes prevent overwrites.
 
-A run belongs to one game process. A quota directory can be reused within that run. Each day writes one physical `.lcr` directly in the quota directory. Repeated deadline values use a collision-safe suffix (`3-2.lcr`, `3-3.lcr`) so reconnecting cannot overwrite an earlier recording. The quota and deadline at the start of a day determine its file path; temporary changes while exploring do not split the file. Preparation, departure, return and observed expedition number remain metadata. The `.lci` sidecar contains record offsets and timestamps, not another recording. Keep it when copying an archive for fast opening; if missing or invalid, playback can rebuild the index by scanning the `.lcr` at a slower startup cost.
+The numeric folder is **remaining profit quota**, calculated as `max(target - fulfilled, 0)`. The `.lcr` stem is **days remaining until the quota deadline**. `130/3.lcr` means 130 credits still needed with three days left, displayed as **Day 1**; stems `2` and `1` display **Day 2** and **Day 3**. Missing values use `unknown`, never an invented zero.
+
+A lobby folder uses the game's room name, sanitized for Windows and given a short unique suffix. The same named room reuses that folder across launches. A quota directory can be reused while recording that room. Each day writes one physical `.lcr` directly in the quota directory. Repeated deadline values use a collision-safe suffix (`3-2.lcr`, `3-3.lcr`) so reconnecting cannot overwrite an earlier recording. The quota and deadline at the start of a day determine its file path; temporary changes while exploring do not split the file. Preparation, departure, return, observed expedition number and participant names remain metadata. The `.lci` sidecar contains record offsets and timestamps, not another recording. Keep it when copying an archive for fast opening; if missing or invalid, playback can rebuild the index by scanning the `.lcr` at a slower startup cost.
 
 `ArchiveSession` remains the compatibility model for a quota group. `ArchiveDay` identifies one recording, its deadline and its file stem. Each day has one `ArchiveSegment`; this retains older archive APIs while new files never rotate into numbered parts. Nullable quota/deadline fields preserve unavailable information.
 

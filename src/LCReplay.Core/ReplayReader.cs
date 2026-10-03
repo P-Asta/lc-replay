@@ -133,6 +133,23 @@ namespace LCReplay.Core
             if (!session.IsComplete) session.Warnings.Add("Recording has no end marker; recovered data may omit its final moments.");
             session.Events = session.Events.OrderBy(item => item.Time).ToList();
             session.Worlds = session.Worlds.OrderBy(item => item.Time).ToList();
+            foreach (var interior in session.Worlds.Where(record => record.World?.Layer == "interior" &&
+                         record.World.Geometry.Any(geometry => geometry.IsMovingSceneRenderer && geometry.Name == "DoorMesh"))
+                         .GroupBy(record => record.World!.CaptureSetId, StringComparer.Ordinal)
+                         .Select(group => group.First()).Take(2))
+            {
+                ReplayFrame? nearest = null;
+                var distance = 5.0;
+                foreach (var frame in session.Frames)
+                {
+                    var captureTime = interior.World!.CaptureCompletedAt > 0 ?
+                        interior.World.CaptureCompletedAt : interior.Time;
+                    var delta = Math.Abs(frame.Time - captureTime);
+                    if (delta >= distance) continue;
+                    nearest = frame; distance = delta;
+                }
+                if (nearest != null) StoreDoorPoseReference(session, interior.World!.CaptureSetId, nearest);
+            }
             progress?.Invoke(1);
             return session;
         }
@@ -143,7 +160,7 @@ namespace LCReplay.Core
             cancellationToken.ThrowIfCancellationRequested();
             var header = ReadHeader(path);
             if (header.Metadata.TryGetValue("singleFile", out var singleFile) && singleFile == "true")
-                return IndexSingleFile(path, cancellationToken).Duration;
+                return IndexSingleFile(path, cancellationToken, deferPayloadValidation: true).Duration;
             var limits = new ReplayReadLimits();
             using (var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096))
             using (var reader = new BinaryReader(input, Encoding.UTF8, true))

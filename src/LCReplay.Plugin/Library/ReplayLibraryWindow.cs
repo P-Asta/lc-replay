@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using LCReplay.Core.Archive;
 using LCReplay.Plugin.UI;
@@ -141,13 +142,13 @@ namespace LCReplay.Plugin.Library
                 () => { if (_day != null) OpenFolderRequested?.Invoke(_day.DirectoryPath); });
             TopButton(window.transform, "Close", 0.87f, 0.98f, RequestClose);
             var tree = Pane(window.transform, "Runs and quotas", new Vector2(0.018f, 0.16f), new Vector2(0.260f, 0.90f));
-            var days = Pane(window.transform, "Deadline recordings", new Vector2(0.272f, 0.16f), new Vector2(0.690f, 0.90f));
+            var days = Pane(window.transform, "Day recordings", new Vector2(0.272f, 0.16f), new Vector2(0.690f, 0.90f));
             var details = Pane(window.transform, "Recording details", new Vector2(0.702f, 0.16f), new Vector2(0.982f, 0.90f));
             PaneTitle(tree, "RUNS / QUOTAS");
             _daysTitle = PaneTitle(days, "RECORDINGS");
             PaneTitle(details, "DETAILS");
             _treeScroll = ui.CreateScroll(tree, "Saved quotas", out _treeContent);
-            _daysScroll = ui.CreateScroll(days, "Recorded deadlines", out _daysContent);
+            _daysScroll = ui.CreateScroll(days, "Recorded days", out _daysContent);
             _detailsScroll = ui.CreateScroll(details, "Recording details", out _detailsContent);
             foreach (var scroll in new[] { _treeScroll, _daysScroll, _detailsScroll })
                 NativeReplayUi.SetRect((RectTransform)scroll.transform, Vector2.zero, Vector2.one, new Vector2(14, 12), new Vector2(-12, -62));
@@ -283,16 +284,18 @@ namespace LCReplay.Plugin.Library
             var top = 0f;
             SetText(_daysTitle, _session == null ? "RECORDINGS" : SessionLabel(_session).ToUpperInvariant());
             if (_session == null || _session.Days.Count == 0)
-                AddText(content, "Select a quota on the left.\n\nRecordings are grouped by the remaining quota and deadline.", ref top, 170, 27);
+                AddText(content, "Select a quota on the left.\n\nEach quota has Day 1, Day 2 and Day 3 recordings.", ref top, 170, 27);
             else foreach (var day in _session.Days)
             {
-                var row = AddRow(content, DayLabel(day), top, 76, () => SelectDay(day.Id), rightInset: 62);
+                var row = AddRow(content, DayLabel(day) + (day.BookmarkCount > 0 ? "  /  Bookmarks: " + day.BookmarkCount : ""), top, 76, () => SelectDay(day.Id), rightInset: 62);
                 var title = row.GetComponentInChildren<TextMeshProUGUI>();
                 NativeReplayUi.SetRect(title.rectTransform, Vector2.zero, Vector2.one, new Vector2(12, 38), new Vector2(-10, -6));
                 title.fontSize = 23;
                 var summary = _ui!.CreateText(row.transform,
                     DateText(day.StartedUtc, "MM-dd HH:mm") + "   ·   " + Duration(day.DurationSeconds) + "   ·   " + Bytes(day.Bytes) + "   ·   " +
-                    (day.Segments.Any(IsRecording) ? "RECORDING" : string.IsNullOrWhiteSpace(day.Moon) ? DayStatus(day) : day.Moon), 18,
+                    (day.Segments.Any(IsRecording) ? "RECORDING" : string.IsNullOrWhiteSpace(day.Moon) ? DayStatus(day) : day.Moon)
+                    + (day.Members.Count == 0 ? "" : "   ·   " + string.Join(", ", day.Members.Take(4))
+                        + (day.Members.Count > 4 ? " +" + (day.Members.Count - 4).ToString(CultureInfo.InvariantCulture) : "")), 18,
                     NativeReplayUi.White);
                 NativeReplayUi.SetRect(summary.rectTransform, Vector2.zero, Vector2.one, new Vector2(12, 8), new Vector2(-14, -45));
                 summary.enableWordWrapping = false;
@@ -323,7 +326,10 @@ namespace LCReplay.Plugin.Library
             }
             AddText(content, "Started\n" + DateText(_day.StartedUtc, "yyyy-MM-dd HH:mm"), ref top, 80);
             AddText(content, "Moon\n" + (string.IsNullOrWhiteSpace(_day.Moon) ? "Not recorded" : _day.Moon), ref top, 78);
+            AddText(content, "Members\n" + (_day.Members.Count == 0 ? "Not recorded" : string.Join(", ", _day.Members)), ref top,
+                _day.Members.Count > 4 ? 112 : 80, 22);
             AddText(content, "Duration  " + Duration(_day.DurationSeconds) + "\nSize  " + Bytes(_day.Bytes), ref top, 78);
+            AddText(content, "Bookmarks  " + _day.BookmarkCount.ToString(CultureInfo.InvariantCulture), ref top, 44, 22);
             AddText(content, _day.Segments.Any(IsRecording) ? "Recording / saving" : DayStatus(_day), ref top, 78);
             if (OpenFolderRequested != null) AddText(content, "PLAY watches from the start\nX beside an item opens delete confirmation", ref top, 82, 22);
             if (_day.Segments.Count > 1)
@@ -332,7 +338,7 @@ namespace LCReplay.Plugin.Library
                 foreach (var segment in _day.Segments)
                 {
                     var part = segment;
-                    var button = AddRow(content, DateText(part.StartedUtc, "HH:mm:ss") + "  >", top, 45, () =>
+                    var button = AddRow(content, DateText(part.StartedUtc, "HH:mm:ss") + "  /  Bookmarks: " + part.BookmarkCount + "  >", top, 45, () =>
                     {
                         _selectedPart = part.FilePath;
                         if (CanPlayPart(part)) PlayRequested?.Invoke(part.FilePath);
@@ -489,19 +495,21 @@ namespace LCReplay.Plugin.Library
         private bool IsRecording(ArchiveSegment segment) => SamePath(segment.FilePath, _recordingPath);
         private static bool SamePath(string a, string b) => a.Length != 0 && b.Length != 0 && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         private static void SetText(TMP_Text? text, string value) { if (text != null && text.text != value) text.text = value; }
-        private static string RunLabel(ArchiveRun run) => (run.Id == "legacy" || run.Status == "recovered") && !string.IsNullOrWhiteSpace(run.Label) ? run.Label : DateText(run.StartedUtc, "MM-dd HH:mm");
+        private static string RunLabel(ArchiveRun run) => !string.IsNullOrWhiteSpace(run.Label) &&
+            (run.Id == "legacy" || run.Status == "recovered" || Path.GetFileName(run.DirectoryPath).StartsWith("Lobby-", StringComparison.OrdinalIgnoreCase))
+                ? run.Label : DateText(run.StartedUtc, "MM-dd HH:mm");
         private static bool IsPreparing(ArchiveDay day) => string.Equals(day.Status, "preparing", StringComparison.OrdinalIgnoreCase);
         private static string SessionLabel(ArchiveSession session) => session.IsQuotaGroup ? "Quota " + Number(session.QuotaRemaining) : "Session " + session.SessionNumber;
         private static string Number(int? value) => value?.ToString(CultureInfo.InvariantCulture) ?? "unknown";
         private string DayLabel(ArchiveDay day)
         {
             if (_session?.IsQuotaGroup == true || day.DeadlineDaysRemaining.HasValue || day.QuotaRemaining.HasValue || day.QuotaCycle.HasValue)
-                return "Deadline: " + (day.DeadlineDaysRemaining.HasValue ? day.DeadlineDaysRemaining.Value.ToString(CultureInfo.InvariantCulture)
-                    + (day.DeadlineDaysRemaining.Value == 1 ? " day" : " days") : "unknown") + (IsPreparing(day) ? " · Lobby" : "");
+                return "Day " + QuotaDay.Number(day.DeadlineDaysRemaining, day.DayNumber) + (IsPreparing(day) ? " · Lobby" : "");
             var generatedLabel = string.Equals(day.Label, "Day " + day.DayNumber, StringComparison.OrdinalIgnoreCase)
                 || day.Label.StartsWith("Day-" + day.DayNumber.ToString("D3", CultureInfo.InvariantCulture) + "-", StringComparison.OrdinalIgnoreCase);
-            if (!string.IsNullOrWhiteSpace(day.Label) && !generatedLabel && (day.Status == "recovered" || day.Id.StartsWith("recovered:", StringComparison.Ordinal))) return day.Label;
-            return (day.DayNumber > 0 ? "Day " + day.DayNumber : "Lobby / preparation") + (IsPreparing(day) ? " · Lobby" : "");
+            if (!string.IsNullOrWhiteSpace(day.Label) && !generatedLabel && !day.Label.StartsWith("Day", StringComparison.OrdinalIgnoreCase) &&
+                (day.Status == "recovered" || day.Id.StartsWith("recovered:", StringComparison.Ordinal))) return day.Label;
+            return "Day " + QuotaDay.Number(null, day.DayNumber) + (IsPreparing(day) ? " · Lobby" : "");
         }
         private static string DayStatus(ArchiveDay day) => IsPreparing(day) ? "Lobby · No expedition" : day.Segments.Count == 0 ? "No recording files" : day.Segments.Any(segment => !segment.HeaderReadable) ? "Some files need attention" : day.Segments.All(segment => segment.Status == "complete") ? "Saved" : "Recoverable recording";
         private static string DateText(DateTimeOffset value, string format) => value == default ? "Unknown date" : value.ToLocalTime().ToString(format, CultureInfo.InvariantCulture);

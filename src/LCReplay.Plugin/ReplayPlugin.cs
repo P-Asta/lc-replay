@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -8,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using BepInEx;
 using BepInEx.Configuration;
+using HarmonyLib;
 using LCReplay.Core;
 using LCReplay.Core.Archive;
 using LCReplay.Core.Lifecycle;
@@ -21,20 +23,31 @@ using UnityEngine.SceneManagement;
 namespace LCReplay.Plugin
 {
     [BepInPlugin(Guid, "LC Replay", Version)]
+    [BepInDependency(ReplayBookmarkInput.InputUtilsGuid, BepInDependency.DependencyFlags.SoftDependency)]
     public sealed class ReplayPlugin : BaseUnityPlugin
     {
         public const string Guid = "io.lcreplay.recorder";
-        public const string Version = "0.23.0";
+        public const string Version = "0.25.24";
         private GUIStyle? overlayLabel;
-        private ConfigEntry<bool> bones = null!, world = null!, chat = null!, captureAudio = null!, captureVoiceChat = null!, disableInteriorCulling = null!, mutePlayerAudio = null!;
+        private GUIStyle? errorNoticeLabel;
+        private ConfigEntry<bool> bones = null!, world = null!, chat = null!, disableInteriorCulling = null!, noShadow = null!, showDebugOverlay = null!, cinematicMove = null!, showFog = null!;
         private ConfigEntry<int> rate = null!, maxFields = null!, maxObjects = null!, maxVertices = null!;
-        private ConfigEntry<float> replayResolution = null!, replayGamma = null!;
+        private ConfigEntry<float> replayResolution = null!, replayGamma = null!, cameraSpeed = null!;
         private ConfigEntry<string> folder = null!, extraTypes = null!;
+        private ReplayBookmarkInput? bookmarkInput;
         private EventHooks? hooks;
         private Recorder? recorder;
         private ReplayViewer? viewer;
+        private ReplayViewer? cachedViewer;
+        private string? viewerPath, cachedViewerPath;
+        private int cachedSceneHandle;
+        private bool cachedConnected;
+        private List<(string Path, long Length, DateTime ModifiedUtc)>? cachedFiles;
         private ReplayLibraryWindow? library;
         private ReplayMenuButton? menuButton;
+        private ReplayPauseMenuButton? pauseMenuButton;
+        private Harmony? inputHarmony;
+        private static ReplayPlugin? activeInputGuard;
         private ReplayRuntime? runtime;
         private ReplayArchive? archive;
         private ArchiveIndex index = new ArchiveIndex();
@@ -45,8 +58,8 @@ namespace LCReplay.Plugin
         private IReadOnlyList<WorldSnapshot>? reusableWorld;
         private readonly List<Task<SaveResult>> pendingSaves = new List<Task<SaveResult>>();
         private DayLifecycle dayLifecycle = new DayLifecycle();
-        private readonly DateTimeOffset launchedAt = DateTimeOffset.Now;
         private Component? sessionRound;
+        private Component? deletedLobbyRound;
         private Task<ArchiveIndex>? scanning;
         private Task<LoadedRecording>? loading;
         private CancellationTokenSource? loadingCancellation;
@@ -56,9 +69,14 @@ namespace LCReplay.Plugin
         private bool inputReported, inputReadyReported;
         private Component? playbackPlayer;
         private bool savedMoveInput, savedLookInput;
+        private LiveReplayInput? liveReplayInput;
         private int part;
+        private float nextMemberScan;
         private string status = "Gameplay is recorded and saved automatically.";
         private string recordingFailure = "";
+        private string errorNotice = "";
+        private float errorNoticeUntil;
+        private bool errorNoticePending;
         private string? loadingPath;
         private float loadingSpeed = 1f;
         private int loadingPercent;
@@ -67,14 +85,12 @@ namespace LCReplay.Plugin
 
         private void Awake()
         {
+            activeInputGuard = this;
             rate = Config.Bind("Recording", "SampleRate", 10, new ConfigDescription("Automatic recording snapshots per second.", new AcceptableValueRange<int>(1, 60)));
-            bones = Config.Bind("Recording", "CaptureBones", true, "Record up to 128 bone poses per actor.");
+            bones = Config.Bind("Recording", "CaptureBones", false,
+                "Record actor bone poses on every frame. Off records Animator state and parameter changes with short reusable motion tracks.");
             world = Config.Bind("Recording", "CaptureWorld", true, "Save bounded geometry, textures and actor appearance for offline replay.");
             chat = Config.Bind("Recording", "CaptureChat", false, "Capture displayed text chat. Restart required.");
-            captureAudio = Config.Bind("Recording", "CaptureAudio", true,
-                "Record observed game sound effects, player footsteps and music. New recordings only.");
-            captureVoiceChat = Config.Bind("Recording", "CaptureVoiceChat", false,
-                "Also record player voice chat. This may store other players' conversations. New recordings only.");
             maxFields = Config.Bind("Limits", "FieldsPerEntity", 192, new ConfigDescription("Primitive fields per component.", new AcceptableValueRange<int>(32, 512)));
             maxObjects = Config.Bind("Limits", "WorldObjects", 4000, new ConfigDescription("Render object budget per world snapshot.", new AcceptableValueRange<int>(100, 20000)));
             maxVertices = Config.Bind("Limits", "WorldVertices", 500000, new ConfigDescription("Unique mesh vertex budget per world snapshot; repeated room meshes share data.", new AcceptableValueRange<int>(1000, 1000000)));
@@ -83,6 +99,17 @@ namespace LCReplay.Plugin
             {
                 if (maxVertices.Value == 120000) maxVertices.Value = 500000;
                 captureSettingsVersion.Value = 4;
+            }
+            if (captureSettingsVersion.Value < 5)
+            {
+                // Existing profiles were created with a true default. Apply the
+                // lean recording profile once; users can opt back in afterward.
+                bones.Value = false;
+                captureSettingsVersion.Value = 5;
+            }
+            if (captureSettingsVersion.Value < 6)
+            {
+                captureSettingsVersion.Value = 6;
             }
             folder = Config.Bind("Storage", "ReplayDirectory", "replays", "Absolute folder, or relative to BepInEx. Restart after changing.");
             extraTypes = Config.Bind("Compatibility", "ExtraTrackedTypes", "", "Comma-separated full Unity Component names supplied by other mods.");
@@ -101,14 +128,27 @@ namespace LCReplay.Plugin
                 new ConfigDescription("Replay image gamma; 1.0 is neutral.", new AcceptableValueRange<float>(0.5f, 2f)));
             disableInteriorCulling = Config.Bind("Playback", "DisableInteriorCulling", false,
                 "Show every recorded interior tile from both outside and inside. This can reduce playback performance.");
-            mutePlayerAudio = Config.Bind("Playback", "MutePlayerAudio", false,
-                "Mute all player-origin sounds in replay, including your own footsteps and equipment. New recordings carry source tags.");
+            noShadow = Config.Bind("Playback", "NoShadow", false,
+                "Keep outside illumination inside the facility and disable replay light shadows.");
+            showFog = Config.Bind("Playback", "ShowFog", true,
+                "Render recorded HDRP fog, local fog and fog-named scenery in replay.");
+            cinematicMove = Config.Bind("Playback", "CinematicMove", false,
+                "Use smooth acceleration and deceleration for the replay free camera. Press C in replay to toggle.");
+            cameraSpeed = Config.Bind("Playback", "CameraSpeed", 8f,
+                new ConfigDescription("Free camera speed in replay.", new AcceptableValueRange<float>(1f, 30f)));
+            showDebugOverlay = Config.Bind("Debug", "ShowOverlay", false,
+                "Show the recording status in the top-left corner during gameplay. Errors appear briefly in the top-right corner regardless of this setting.");
+            var bookmarkKey = Config.Bind("Input", "BookmarkKey", KeyCode.BackQuote,
+                "Recording bookmark key when InputUtils is absent. With InputUtils, change Add replay bookmark in the game's Controls menu.");
+            bookmarkInput = new ReplayBookmarkInput(bookmarkKey, message => Logger.LogInfo(message));
             try
             {
                 archive = new ReplayArchive(ReplayDirectory);
                 Logger.LogInfo("Replay archive directory: " + archive.RootDirectory);
                 library = new ReplayLibraryWindow();
                 menuButton = new ReplayMenuButton(OpenLibrary, message => Logger.LogWarning(message), message => Logger.LogInfo(message));
+                pauseMenuButton = new ReplayPauseMenuButton(OpenLibrary, message => Logger.LogWarning(message));
+                InstallInputGuards();
                 library.RefreshRequested += RefreshArchive;
                 library.PlayRequested += path => LoadReplay(path);
                 library.OpenFolderRequested += OpenFolder;
@@ -119,6 +159,7 @@ namespace LCReplay.Plugin
                     recorder?.Event(evt);
                     if (evt.Name.Contains("OnShipLanded")) recorder?.RefreshEnvironmentAfterLanding();
                     else if (evt.Name.Contains("StartGame")) recorder?.MarkWorldDirty();
+                    else if (evt.Name == "SandSpiderAI.SpawnWebTrapClientRpc") recorder?.NoticeSpiderWeb();
                 }, chat.Value, message => Logger.LogWarning(message));
                 Logger.LogInfo($"LC Replay {Version}: automatic quota/deadline archive; {hooks.Installed.Count} event hooks active.");
             }
@@ -139,9 +180,13 @@ namespace LCReplay.Plugin
             if (quitting || shutdownCompleted || runtime) return;
             try
             {
-                runtime = ReplayRuntime.Create(RunFrame, DrawUi,
+                runtime = ReplayRuntime.Create(RunFrame, DrawUi, () => viewer?.RefreshCursor(),
                     () => Logger.LogInfo("Replay runtime active: independent persistent frame and UI driver."),
-                    (stage, ex) => Logger.LogError("Replay runtime " + stage + " failed: " + ex));
+                    (stage, ex) =>
+                    {
+                        ShowErrorNotice("Replay runtime " + stage + " failed: " + ex.Message);
+                        Logger.LogError("Replay runtime " + stage + " failed: " + ex);
+                    });
                 Logger.LogInfo("Replay runtime created after scene load: " + SceneManager.GetActiveScene().name + ".");
             }
             catch (Exception ex) { ReportRecordingFailure("Replay runtime initialization failed", ex); }
@@ -150,6 +195,8 @@ namespace LCReplay.Plugin
         private void RunFrame()
         {
             if (quitting) return;
+            if (cachedViewer != null && (cachedConnected != GameAccess.Connected ||
+                cachedSceneHandle != SceneManager.GetActiveScene().handle)) DiscardCachedViewer();
             var inputAvailable = ReplayInput.Available;
             if (!inputReported || (inputAvailable && !inputReadyReported))
             {
@@ -167,6 +214,7 @@ namespace LCReplay.Plugin
             CompleteSaves();
             CompleteScan();
             menuButton?.Tick(!connected && viewer == null && library?.IsOpen != true && loading == null);
+            pauseMenuButton?.Tick(connected && viewer == null && library?.IsOpen != true && loading == null);
             if (viewer != null)
             {
                 if (hooks != null && archive != null && GameAccess.CanRecord)
@@ -178,13 +226,14 @@ namespace LCReplay.Plugin
                 if (viewer.CloseRequested || ReplayInput.WasPressed("Escape") || ReplayInput.WasPressed("F11"))
                 { CloseViewer(true); return; }
                 try { viewer.Tick(Time.unscaledDeltaTime); }
-                catch (Exception ex) { Logger.LogError(ex); CloseViewer(true); status = "Playback error: " + ex.Message; }
+                catch (Exception ex) { Logger.LogError(ex); CloseViewer(true, false); status = "Playback error: " + ex.Message; ShowErrorNotice(status); }
                 if (viewer?.Error != null)
                 {
                     var error = viewer.Error;
                     Logger.LogError(error);
-                    CloseViewer(true);
+                    CloseViewer(true, false);
                     status = "A recording part could not be loaded: " + error.Message;
+                    ShowErrorNotice(status);
                 }
                 return;
             }
@@ -227,11 +276,7 @@ namespace LCReplay.Plugin
                 }
                 catch (Exception ex) { StopSegment(); ReportRecordingFailure("Save checkpoint failed", ex); }
             }
-            if (ReplayInput.WasPressed("F10"))
-            {
-                recorder?.Event(new ReplayEvent { Category = "marker", Name = "bookmark" });
-                status = recorder == null ? "No active recording." : "Bookmark saved automatically.";
-            }
+            if (bookmarkInput?.WasPressed() == true) AddRecordingBookmark();
             if (ReplayInput.WasPressed("F11")) OpenLibrary();
             if (hooks != null && archive != null && GameAccess.CanRecord)
             {
@@ -249,6 +294,11 @@ namespace LCReplay.Plugin
             if (recordingBlocked) return;
             if (!(GameAccess.Read(round, "inShipPhase") is bool inShipPhase))
                 throw new InvalidOperationException("This game version does not expose round phase (inShipPhase).");
+            if (deletedLobbyRound != null)
+            {
+                if (ReferenceEquals(round, deletedLobbyRound) && inShipPhase) return;
+                deletedLobbyRound = null;
+            }
             var quota = CurrentQuota();
             // TimeOfDay exists before the save is applied. Creating a quota
             // folder in that interval permanently labels the first day 0/2.
@@ -258,7 +308,14 @@ namespace LCReplay.Plugin
                 !(GameAccess.Read(GameAccess.Singleton("TimeOfDay"), "timeUntilDeadline") is float deadlineTime && deadlineTime > 0))) return;
             if (session == null)
             {
-                run = run ?? archive!.BeginRun(launchedAt);
+                var network = GameAccess.Singleton("GameNetworkManager");
+                var lobbyName = (GameAccess.Read(network, "steamLobbyName") as string)?.Trim();
+                if (string.IsNullOrWhiteSpace(lobbyName) && GameAccess.IsHost)
+                    lobbyName = (GameAccess.Read(GameAccess.Read(network, "lobbyHostSettings"), "lobbyName") as string)?.Trim();
+                if (string.IsNullOrWhiteSpace(lobbyName)) lobbyName = "Unknown lobby";
+                if (run != null && !string.Equals(run.Label, lobbyName, StringComparison.Ordinal))
+                { archive!.EndRun(run); run = null; }
+                run = run ?? archive!.BeginRun(DateTimeOffset.UtcNow, lobbyName);
                 session = archive!.BeginQuota(run, DateTimeOffset.UtcNow, quota, GameAccess.IsHost ? "host-observed" : "client-observed");
                 sessionRound = round as Component;
                 dayLifecycle = new DayLifecycle();
@@ -288,6 +345,11 @@ namespace LCReplay.Plugin
             }
             if (day == null) BeginDay(round, quota);
             if (day == null) return;
+            if (Time.realtimeSinceStartup >= nextMemberScan)
+            {
+                nextMemberScan = Time.realtimeSinceStartup + 2f;
+                if (archive!.UpdateMembers(day, CurrentMembers(round))) RefreshArchiveIfOpen();
+            }
             var moon = CurrentMoon(round);
             if ((!dayLifecycle.HasReturned && moon != day.Moon) || transition != DayTransition.None)
                 archive!.UpdateDay(day, dayLifecycle.HasReturned ? day.Moon : moon,
@@ -308,6 +370,7 @@ namespace LCReplay.Plugin
             if (GameAccess.IsHost && GameAccess.Read(GameAccess.Read(round, "gameStats"), "daysSpent") is int days && days >= 0 && days < 1000000)
                 campaignDay = days + 1;
             day = archive!.BeginQuotaDay(session!, dayLifecycle.DayNumber, DateTimeOffset.UtcNow, CurrentMoon(round), quota, campaignDay);
+            nextMemberScan = 0f;
             reusableWorld = null;
             archive.UpdateDay(day, day.Moon, dayLifecycle.HasReturned ? "returned" : dayLifecycle.HasDeparted ? "exploring" : "preparing");
             part = 0;
@@ -321,10 +384,8 @@ namespace LCReplay.Plugin
             int? remainingDays = NonnegativeInt(GameAccess.Read(time, "daysUntilDeadline"));
             var remainingTime = GameAccess.Read(time, "timeUntilDeadline");
             var totalTime = GameAccess.Read(time, "totalTime");
-            if (remainingTime is float seconds && totalTime is float daySeconds &&
-                seconds >= 0 && daySeconds > 0 && !float.IsNaN(seconds) && !float.IsInfinity(seconds) &&
-                !float.IsNaN(daySeconds) && !float.IsInfinity(daySeconds))
-                remainingDays = Math.Max(0, (int)Math.Ceiling(seconds / daySeconds));
+            if (remainingTime is float seconds && totalTime is float daySeconds)
+                remainingDays = QuotaDay.Remaining(seconds, daySeconds, remainingDays);
             return new ArchiveQuotaSnapshot { Target = NonnegativeInt(GameAccess.Read(time, "profitQuota")),
                 Fulfilled = NonnegativeInt(GameAccess.Read(time, "quotaFulfilled")),
                 DeadlineDaysRemaining = remainingDays,
@@ -339,16 +400,28 @@ namespace LCReplay.Plugin
             catch { return null; }
         }
 
+        private static IEnumerable<string> CurrentMembers(object? round)
+        {
+            if (!(GameAccess.Read(round, "allPlayerScripts") is IEnumerable players)) yield break;
+            foreach (var player in players)
+            {
+                if (player == null || !GameAccess.Bool(player, "isPlayerControlled")) continue;
+                if (GameAccess.Read(player, "playerUsername") is string name && !string.IsNullOrWhiteSpace(name))
+                    yield return name;
+            }
+        }
+
         private void StartSegment()
         {
             if (recorder != null || recordingBlocked || day == null || hooks == null) return;
             segment = archive!.AllocateSegment(day, ++part);
+            if (day.Members.Count != 0) segment.Metadata["members"] = string.Join(", ", day.Members);
             part = segment.Part;
             try
             {
                 recorder = new Recorder(day.DirectoryPath, rate.Value, bones.Value, world.Value, maxFields.Value, maxObjects.Value,
                     maxVertices.Value, extraTypes.Value, hooks, chat.Value, message => Logger.LogInfo(message), day.Id, part,
-                    segment.FilePath, segment.Metadata, reusableWorld, captureAudio.Value, captureVoiceChat.Value);
+                    segment.FilePath, segment.Metadata, reusableWorld);
                 ReplayApi.EventSink = recorder.Event;
                 recordingFailure = "";
                 library?.SetRecordingPath(segment.FilePath);
@@ -363,6 +436,22 @@ namespace LCReplay.Plugin
                 throw;
             }
         }
+        private void AddRecordingBookmark()
+        {
+            if (recorder == null || segment == null || recorder.Error != null || viewer != null || loading != null || library?.IsOpen == true) return;
+            var player = GameAccess.Read(GameAccess.Singleton("GameNetworkManager"), "localPlayerController");
+            if (GameAccess.Bool(player, "isTypingChat") || GameAccess.Bool(player, "inTerminalMenu") ||
+                GameAccess.Find("QuickMenuManager").Any(menu => GameAccess.Bool(menu, "isMenuOpen"))) return;
+            var before = recorder.BookmarkCount;
+            recorder.Event(new ReplayEvent { Category = "marker", Name = "bookmark" });
+            if (recorder.BookmarkCount == before) return;
+            try { archive?.UpdateBookmarkCount(segment, recorder.BookmarkCount); }
+            catch (Exception error) { Logger.LogWarning("Bookmark event was queued; count metadata update failed: " + error.Message); }
+            status = "Bookmark " + recorder.BookmarkCount + " saved at " + TimeSpan.FromSeconds(recorder.Duration).ToString(@"mm\:ss") + ".";
+            ShowBookmarkNotice(status);
+            RefreshArchiveIfOpen();
+        }
+
         private void StopSegment()
         {
             ReplayApi.EventSink = null;
@@ -371,19 +460,32 @@ namespace LCReplay.Plugin
             recorder = null; segment = null;
             library?.SetRecordingPath(null);
             if (stopped == null) return;
-            reusableWorld = stopped.ReusableWorld;
+            reusableWorld = stopped.Error == null ? stopped.ReusableWorld : null;
             var flush = stopped.FinishAsync();
             var target = archive;
             pendingSaves.Add(Task.Run(async () =>
             {
                 await flush.ConfigureAwait(false);
                 var error = stopped.Error;
+                var savedDuration = stopped.RecordedDuration;
+                var savedBookmarks = stopped.WrittenBookmarkCount;
+                if (error != null)
+                {
+                    // FileStream can fail while flushing already buffered bytes.
+                    // Archive only the prefix physically present after closing.
+                    try
+                    {
+                        var recovered = ReplayReader.IndexSingleFile(stopped.FilePath, deferPayloadValidation: true);
+                        savedDuration = recovered.Duration; savedBookmarks = recovered.Bookmarks.Count;
+                    }
+                    catch (Exception recoveryError) { Logger.LogWarning("Recording prefix metadata could not be refreshed; file is preserved: " + recoveryError.Message); }
+                }
                 try
                 {
-                    if (completed != null) target!.CompleteSegment(completed, stopped.RecordedDuration, error == null, error?.Message);
+                    if (completed != null) target!.CompleteSegment(completed, savedDuration, error == null, error?.Message, savedBookmarks);
                 }
-                catch (Exception ex) { return new SaveResult(stopped.FilePath, stopped.RecordedDuration, ex, true); }
-                return new SaveResult(stopped.FilePath, stopped.RecordedDuration, error, false);
+                catch (Exception ex) { return new SaveResult(stopped.FilePath, savedDuration, ex, true); }
+                return new SaveResult(stopped.FilePath, savedDuration, error, false);
             }));
             status = "Saving the completed replay in the background.";
         }
@@ -434,6 +536,7 @@ namespace LCReplay.Plugin
         {
             recordingBlocked = true;
             recordingFailure = status = message + ": " + error.Message;
+            ShowErrorNotice(status);
             Logger.LogError(message + ": " + error);
         }
 
@@ -448,7 +551,21 @@ namespace LCReplay.Plugin
             { status = "The current day's recording cannot be deleted while it is active."; return; }
             try
             {
+                Component? closedRound = null;
+                if (run != null && day == null && recorder == null && pendingSaves.All(save => save.IsCompleted) &&
+                    selected.Any(candidate => candidate.RunId == run.Id) &&
+                    index.Runs.Where(candidate => candidate.Id == run.Id).SelectMany(candidate => candidate.Sessions)
+                        .SelectMany(group => group.Days).Where(candidate => candidate.Segments.Count > 0)
+                        .All(candidate => selected.Any(item => item.Id == candidate.Id)))
+                {
+                    closedRound = sessionRound;
+                    EndSession();
+                    archive.EndRun(run);
+                    run = null;
+                }
                 var count = archive.DeleteRecordings(selected);
+                DiscardCachedViewer();
+                if (closedRound != null) deletedLobbyRound = closedRound;
                 status = "Deleted " + count + (count == 1 ? " replay file." : " replay files.");
                 Logger.LogInfo(status);
                 RefreshArchive();
@@ -456,6 +573,7 @@ namespace LCReplay.Plugin
             catch (Exception error)
             {
                 status = "Could not delete the recording: " + error.Message;
+                ShowErrorNotice(status);
                 Logger.LogWarning(status);
                 RefreshArchive();
             }
@@ -471,7 +589,7 @@ namespace LCReplay.Plugin
         {
             if (scanning == null || !scanning.IsCompleted) return;
             var task = scanning; scanning = null;
-            if (task.IsFaulted) { status = "Cannot read the archive: " + task.Exception?.GetBaseException().Message; Logger.LogWarning(status); }
+            if (task.IsFaulted) { status = "Cannot read the archive: " + task.Exception?.GetBaseException().Message; ShowErrorNotice(status); Logger.LogWarning(status); }
             else
             {
                 index = task.Result;
@@ -480,13 +598,15 @@ namespace LCReplay.Plugin
             }
             if (rescanRequested) { rescanRequested = false; RefreshArchive(); }
         }
-        private void OpenLibrary()
+        private void OpenLibrary() => OpenLibrary(true);
+
+        private void OpenLibrary(bool refresh)
         {
             if (library == null || viewer != null) return;
             library.Open();
             BlockLocalPlayerInput();
             library.SetRecordingPath(recorder?.FilePath);
-            RefreshArchive();
+            if (refresh) RefreshArchive();
         }
         private void CloseLibrary()
         {
@@ -499,7 +619,10 @@ namespace LCReplay.Plugin
             if (loading != null || viewer != null) return;
             if (!GameAccess.NetworkStateKnown)
             { status = "Replay playback is unavailable until the game network is initialized."; return; }
-            loadingPath = Path.GetFullPath(path);
+            var fullPath = Path.GetFullPath(path);
+            if (TryResumeCachedViewer(fullPath, speed)) return;
+            DiscardCachedViewer();
+            loadingPath = fullPath;
             loadingSpeed = speed;
             loadCancelled = false;
             status = "Loading recording...";
@@ -514,6 +637,7 @@ namespace LCReplay.Plugin
                 Volatile.Write(ref loadingStage, stage);
                 Volatile.Write(ref loadingPercent, Math.Max(0, Math.Min(99, (int)Math.Round(fraction * 100))));
             }), cancellation);
+            BlockLocalPlayerInput();
         }
         private void CompleteLoad(bool connected)
         {
@@ -526,7 +650,7 @@ namespace LCReplay.Plugin
                 status = "Recording load cancelled.";
                 return;
             }
-            if (task.IsFaulted) { status = "Recording file error: " + task.Exception?.GetBaseException().Message; OpenLibrary(); }
+            if (task.IsFaulted) { status = "Recording file error: " + task.Exception?.GetBaseException().Message; ShowErrorNotice(status); OpenLibrary(); }
             else if (loadCancelled || !GameAccess.NetworkStateKnown)
             { status = "Playback cancelled."; }
             else
@@ -539,21 +663,119 @@ namespace LCReplay.Plugin
                         replayResolution.Value, replayGamma.Value,
                         value => replayResolution.Value = value, value => replayGamma.Value = value,
                         disableInteriorCulling.Value, value => disableInteriorCulling.Value = value,
-                        mutePlayerAudio.Value, value => mutePlayerAudio.Value = value) { Speed = loadingSpeed };
+                        false, null,
+                        cinematicMove.Value, cameraSpeed.Value,
+                        value => cinematicMove.Value = value, value => cameraSpeed.Value = value,
+                        showFog.Value, value => showFog.Value = value,
+                        connected, noShadow.Value, value => noShadow.Value = value) { Speed = loadingSpeed };
+                    viewerPath = loadingPath;
                     status = "Recording loaded.";
                     BlockLocalPlayerInput();
                     foreach (var warning in task.Result.Session.Warnings) Logger.LogWarning(warning);
                 }
-                catch (Exception ex) { Logger.LogError(ex); CloseViewer(true); status = "Cannot start playback: " + ex.Message; }
+                catch (Exception ex) { Logger.LogError(ex); CloseViewer(true, false); status = "Cannot start playback: " + ex.Message; ShowErrorNotice(status); }
             }
             loadingPath = null;
         }
-        private void CloseViewer(bool reopenLibrary)
+        private bool TryResumeCachedViewer(string path, float speed)
         {
-            try { viewer?.Dispose(); }
-            finally { viewer = null; ReplayIsolation.PlaybackActive = false; }
-            if (reopenLibrary && !quitting) OpenLibrary();
-            else RestoreLocalPlayerInput();
+            if (cachedViewer == null || cachedViewerPath == null || cachedFiles == null ||
+                !string.Equals(cachedViewerPath, path, StringComparison.OrdinalIgnoreCase) ||
+                cachedConnected != GameAccess.Connected || cachedSceneHandle != SceneManager.GetActiveScene().handle)
+                return false;
+            var current = CaptureFileStamps(cachedFiles.Select(file => file.Path));
+            if (current == null || current.Count != cachedFiles.Count ||
+                current.Where((file, index) => file != cachedFiles[index]).Any()) return false;
+            var ready = cachedViewer;
+            cachedViewer = null;
+            cachedFiles = null;
+            cachedViewerPath = null;
+            cachedSceneHandle = 0;
+            try
+            {
+                library?.Close();
+                ReplayIsolation.PlaybackActive = true;
+                ready.Resume();
+                ready.Speed = speed;
+                viewer = ready;
+                viewerPath = path;
+                status = "Recording restored from memory.";
+                BlockLocalPlayerInput();
+                return true;
+            }
+            catch (Exception error)
+            {
+                Logger.LogWarning("Cached replay could not resume: " + error);
+                ready.Dispose();
+                ReplayIsolation.PlaybackActive = false;
+                OpenLibrary();
+                return false;
+            }
+        }
+
+        private static List<(string Path, long Length, DateTime ModifiedUtc)>? CaptureFileStamps(IEnumerable<string> paths)
+        {
+            try
+            {
+                var result = new List<(string Path, long Length, DateTime ModifiedUtc)>();
+                foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var file = new FileInfo(Path.GetFullPath(path));
+                    file.Refresh();
+                    if (!file.Exists) return null;
+                    result.Add((file.FullName, file.Length, file.LastWriteTimeUtc));
+                }
+                return result.Count == 0 ? null : result;
+            }
+            catch (Exception error) when (error is IOException || error is UnauthorizedAccessException ||
+                error is ArgumentException || error is NotSupportedException) { return null; }
+        }
+
+        private void DiscardCachedViewer()
+        {
+            var old = cachedViewer;
+            cachedViewer = null;
+            cachedViewerPath = null;
+            cachedSceneHandle = 0;
+            cachedFiles = null;
+            old?.Dispose();
+        }
+
+        private void CloseViewer(bool reopenLibrary, bool allowCache = true)
+        {
+            var closing = viewer;
+            viewer = null;
+            try
+            {
+                if (closing != null && allowCache && !quitting && closing.CanPark && viewerPath != null)
+                {
+                    var files = CaptureFileStamps(closing.SourceFiles);
+                    if (files != null)
+                    {
+                        try
+                        {
+                            DiscardCachedViewer();
+                            closing.Park();
+                            cachedViewer = closing;
+                            cachedViewerPath = viewerPath;
+                            cachedFiles = files;
+                            cachedConnected = GameAccess.Connected;
+                            cachedSceneHandle = SceneManager.GetActiveScene().handle;
+                            closing = null;
+                        }
+                        catch (Exception error) { Logger.LogWarning("Replay could not be cached: " + error); }
+                    }
+                }
+                closing?.Dispose();
+            }
+            finally
+            {
+                viewerPath = null;
+                ReplayIsolation.PlaybackActive = false;
+                // A failed scene/cache cleanup must still return live controls.
+                RestoreLocalPlayerInput();
+            }
+            if (reopenLibrary && !quitting) OpenLibrary(cachedViewer == null);
         }
 
         private void BlockLocalPlayerInput()
@@ -569,16 +791,56 @@ namespace LCReplay.Plugin
             }
             SetPlayerInputFlag(player!, "disableMoveInput", true);
             SetPlayerInputFlag(player!, "disableLookInput", true);
+            (liveReplayInput ??= new LiveReplayInput()).Block(player!);
         }
 
         private void RestoreLocalPlayerInput()
         {
-            if (playbackPlayer)
+            var restoring = liveReplayInput;
+            liveReplayInput = null;
+            try { restoring?.Dispose(); }
+            finally
             {
-                SetPlayerInputFlag(playbackPlayer!, "disableMoveInput", savedMoveInput);
-                SetPlayerInputFlag(playbackPlayer!, "disableLookInput", savedLookInput);
+                if (playbackPlayer)
+                {
+                    SetPlayerInputFlag(playbackPlayer!, "disableMoveInput", savedMoveInput);
+                    SetPlayerInputFlag(playbackPlayer!, "disableLookInput", savedLookInput);
+                }
+                playbackPlayer = null;
             }
-            playbackPlayer = null;
+        }
+
+        private void InstallInputGuards()
+        {
+            var playerType = GameAccess.Type("GameNetcodeStuff.PlayerControllerB");
+            if (playerType == null) return;
+            inputHarmony = new Harmony(Guid + ".input");
+            var guard = new HarmonyMethod(typeof(ReplayPlugin), nameof(AllowPlayerAction));
+            foreach (var method in AccessTools.GetDeclaredMethods(playerType))
+                // Disable sends cancellation to release held item actions.
+                // Blocking canceled callbacks leaves tools stuck after closing.
+                if (method.Name.EndsWith("_performed", StringComparison.Ordinal))
+                    inputHarmony.Patch(method, prefix: guard);
+            var update = AccessTools.Method(playerType, "Update");
+            if (update != null) inputHarmony.Patch(update, prefix: new HarmonyMethod(typeof(ReplayPlugin), nameof(ProtectPlayerUpdate)));
+        }
+
+        private static bool AllowPlayerAction(object __instance)
+        {
+            var owner = activeInputGuard;
+            if (ReferenceEquals(owner, null) || owner.liveReplayInput == null)
+                return true;
+            var localPlayer = GameAccess.Read(GameAccess.Singleton("GameNetworkManager"), "localPlayerController");
+            return !ReferenceEquals(__instance, localPlayer) &&
+                !(__instance is Component component && component == owner.playbackPlayer);
+        }
+
+        private static void ProtectPlayerUpdate(object __instance)
+        {
+            var owner = activeInputGuard;
+            if (ReferenceEquals(owner, null) || !owner.playbackPlayer || !ReferenceEquals(__instance, owner.playbackPlayer)) return;
+            SetPlayerInputFlag(owner.playbackPlayer!, "disableMoveInput", true);
+            SetPlayerInputFlag(owner.playbackPlayer!, "disableLookInput", true);
         }
 
         private static void SetPlayerInputFlag(Component player, string name, bool value)
@@ -597,23 +859,57 @@ namespace LCReplay.Plugin
                 if (!Directory.Exists(target)) throw new DirectoryNotFoundException("The recording folder does not exist.");
                 Process.Start(new ProcessStartInfo { FileName = target, UseShellExecute = true });
             }
-            catch (Exception ex) { status = "Cannot open the recording folder: " + ex.Message; Logger.LogWarning(status); }
+            catch (Exception ex) { status = "Cannot open the recording folder: " + ex.Message; ShowErrorNotice(status); Logger.LogWarning(status); }
         }
         private void DrawUi()
         {
             if (quitting) return;
+            DrawErrorNotice();
             if (viewer != null) { viewer.DrawGui(); return; }
-            if (library?.IsOpen != true)
-            {
-                if (recordingFailure.Length > 0)
-                    DrawOverlay(new Rect(12, 12, Math.Min(900, Screen.width - 24), 54), "LC Replay: " + recordingFailure +
-                        (hooks == null || archive == null ? "\nRestart the game after resolving the initialization error." : "\nF9: details / F8: retry"));
-                else if (recorder != null)
-                    DrawOverlay(new Rect(12, 12, 570, 32), $"AUTO REC / SAVING  |  Quota {day?.QuotaRemaining?.ToString() ?? "?"} / Deadline {day?.DeadlineDaysRemaining?.ToString() ?? "?"}  |  F9 Replays");
-            }
+            if (!showDebugOverlay.Value) return;
+            if (library?.IsOpen != true && recorder != null)
+                DrawOverlay(new Rect(12, 12, 570, 32), $"AUTO REC / SAVING  |  Quota {day?.QuotaRemaining?.ToString() ?? "?"} / Deadline {day?.DeadlineDaysRemaining?.ToString() ?? "?"}  |  F9 Replays");
         }
 
-        private void DrawOverlay(Rect rect, string message)
+        private void ShowErrorNotice(string message)
+        {
+            var detail = (message ?? "Unknown error").Replace('\r', ' ').Replace('\n', ' ').Trim();
+            if (detail.Length > 200) detail = detail.Substring(0, 197) + "...";
+            errorNotice = "LC Replay error\n" + detail;
+            errorNoticePending = true;
+        }
+
+        private void ShowBookmarkNotice(string message)
+        {
+            // Use the same short top-right notification surface as errors.
+            errorNotice = "LC Replay bookmark saved\n" + message;
+            errorNoticePending = true;
+        }
+
+        private void DrawErrorNotice()
+        {
+            if (errorNotice.Length == 0) return;
+            var width = Mathf.Min(640f, Screen.width - 24f);
+            if (width <= 0) return;
+            if (errorNoticePending)
+            {
+                errorNoticeUntil = Time.realtimeSinceStartup + 3.5f;
+                errorNoticePending = false;
+            }
+            if (Time.realtimeSinceStartup >= errorNoticeUntil) return;
+            if (errorNoticeLabel == null)
+            {
+                errorNoticeLabel = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 16, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft,
+                    wordWrap = true, clipping = TextClipping.Clip, padding = new RectOffset(12, 10, 5, 5)
+                };
+                errorNoticeLabel.normal.textColor = NativeReplayUi.White;
+            }
+            DrawOverlay(new Rect(Screen.width - width - 12f, 12f, width, 88f), errorNotice, errorNoticeLabel);
+        }
+
+        private void DrawOverlay(Rect rect, string message, GUIStyle? labelStyle = null)
         {
             var tint = GUI.color;
             GUI.color = NativeReplayUi.Orange;
@@ -621,7 +917,7 @@ namespace LCReplay.Plugin
             GUI.color = NativeReplayUi.Black;
             GUI.DrawTexture(new Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height - 4), Texture2D.whiteTexture);
             GUI.color = tint;
-            if (overlayLabel == null)
+            if (labelStyle == null && overlayLabel == null)
             {
                 overlayLabel = new GUIStyle(GUI.skin.label)
                 {
@@ -630,7 +926,7 @@ namespace LCReplay.Plugin
                 };
                 overlayLabel.normal.textColor = NativeReplayUi.White;
             }
-            GUI.Label(rect, message, overlayLabel);
+            GUI.Label(rect, message, labelStyle ?? overlayLabel);
         }
         private void ApplicationQuitting() { quitting = true; Shutdown(); }
         private void OnApplicationQuit() => ApplicationQuitting();
@@ -656,9 +952,14 @@ namespace LCReplay.Plugin
             try { if (run != null) archive?.EndRun(run); }
             catch (Exception ex) { Logger.LogError("Run metadata save failed: " + ex); }
             CloseViewer(false);
+            DiscardCachedViewer();
+            pauseMenuButton?.Dispose(); pauseMenuButton = null;
             menuButton?.Dispose(); menuButton = null;
+            inputHarmony?.UnpatchSelf(); inputHarmony = null;
+            if (ReferenceEquals(activeInputGuard, this)) activeInputGuard = null;
             library?.Dispose(); library = null;
             hooks?.Dispose(); hooks = null;
+            bookmarkInput?.Dispose(); bookmarkInput = null;
         }
     }
 }

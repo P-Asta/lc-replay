@@ -31,8 +31,10 @@ namespace LCReplay.Plugin.Playback
             {
                 progress?.Invoke("Indexing recording", 0.03);
                 var fileIndex = ReplayReader.IndexSingleFile(full, cancellation, 48L * 1024 * 1024,
-                    value => progress?.Invoke("Indexing recording", 0.03 + value * 0.17));
+                    value => progress?.Invoke("Indexing recording", 0.03 + value * 0.17), initialWindowExpandedBytes: 4L * 1024 * 1024,
+                    deferPayloadValidation: true);
                 fileIndex.ReuseWorldPayloads = true;
+                fileIndex.TrimInactiveActorState = true;
                 var windows = fileIndex.Windows.Select(window => new ReplayRecordingPart
                 {
                     FilePath = full,
@@ -42,7 +44,7 @@ namespace LCReplay.Plugin.Playback
                 }).ToArray();
                 progress?.Invoke("Reading first section", 0.20);
                 var firstWindow = ReplayReader.ReadWindow(fileIndex.Windows[0], cancellation,
-                    value => progress?.Invoke("Reading first section", 0.20 + value * 0.65));
+                    value => progress?.Invoke("Reading first section", 0.20 + value * 0.65), preloadInitialMap: true);
                 progress?.Invoke("Preparing scene", 0.85);
                 return new LoadedRecording { Session = firstWindow,
                     Timeline = new ReplayRecordingTimeline(windows), PartIndex = 0 };

@@ -16,6 +16,7 @@ namespace LCReplay.Plugin.Capture
     {
         private static readonly Dictionary<string, Type?> Types = new Dictionary<string, Type?>();
         private static readonly Dictionary<Type, FieldInfo[]> Fields = new Dictionary<Type, FieldInfo[]>();
+        private static readonly Dictionary<(Type, string), FieldInfo[]> SelectedFields = new Dictionary<(Type, string), FieldInfo[]>();
         private static readonly Dictionary<(Type, string), (FieldInfo? Field, PropertyInfo? Property)> Members =
             new Dictionary<(Type, string), (FieldInfo?, PropertyInfo?)>();
         private static readonly HashSet<string> EssentialFields = new HashSet<string>(new[]
@@ -33,10 +34,30 @@ namespace LCReplay.Plugin.Capture
         private static readonly KeyValuePair<string, string[]>[] NestedFields =
         {
             new KeyValuePair<string, string[]>("insertedBattery", new[] { "charge", "empty" }),
-            new KeyValuePair<string, string[]>("itemProperties", new[] { "itemId", "itemName", "isScrap", "requiresBattery", "weight" }),
+            new KeyValuePair<string, string[]>("itemProperties", new[] { "itemId", "itemName", "isScrap", "requiresBattery", "weight",
+                "positionOffset", "rotationOffset", "twoHandedAnimation" }),
             new KeyValuePair<string, string[]>("enemyType", new[] { "enemyName", "isOutsideEnemy", "isDaytimeEnemy" }),
             new KeyValuePair<string, string[]>("currentLevel", new[] { "levelID", "PlanetName", "sceneName", "currentWeather" })
         };
+        private static readonly Dictionary<string, HashSet<string>> RecordedFields = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal)
+        {
+            ["player"] = Set("playerClientId", "actualClientId", "health", "isPlayerControlled", "isPlayerDead", "causeOfDeath",
+                "isSprinting", "isCrouching", "isInsideFactory", "isInHangarShipRoom", "currentSuitID", "currentItemSlot",
+                "currentlyHeldObjectServer", "playerHeldBy", "twoHandedAnimation", "inVehicleAnimation",
+                "inSpecialInteractAnimation", "inShockingMinigame", "IsInspectingItem"),
+            ["enemy"] = Set("enemyHP", "isEnemyDead", "currentBehaviourStateIndex", "targetPlayer", "stunNormalizedTimer",
+                "ventAnimationFinished", "hive", "beesZappingMode"),
+            ["item"] = Set("isHeld", "isHeldByEnemy", "isBeingUsed", "itemUsedUp", "scrapValue", "isInShipRoom", "attaching", "finishedAttaching", "isLungDocked"),
+            ["door"] = Set("isLocked", "isDoorOpened", "isPickingLock"),
+            ["facility"] = Set("isDoorOpen", "objectCode", "isPoweredOn"),
+            ["hazard"] = Set("hasExploded", "mineActivated", "turretMode", "turretActive", "enteringBerserkMode"),
+            ["vehicle"] = Set("carHP", "carDestroyed", "gear", "speed"),
+            ["mechanism"] = Set("isPoweredOn", "isDoorOpen"),
+            ["round"] = Set("inShipPhase", "shipHasLanded"),
+            ["time"] = Set("currentDayTime", "normalizedTimeOfDay", "profitQuota", "quotaFulfilled", "daysUntilDeadline", "timeUntilDeadline"),
+            ["terminal"] = Set("groupCredits")
+        };
+        private static HashSet<string> Set(params string[] names) => new HashSet<string>(names, StringComparer.Ordinal);
         public static Type? Type(string name)
         {
             if (!Types.TryGetValue(name, out var result)) Types[name] = result = AccessTools.TypeByName(name);
@@ -92,7 +113,7 @@ namespace LCReplay.Plugin.Capture
                     !ReplayIsolation.IsReplayScene(c.gameObject.scene));
         }
 
-        public static Dictionary<string, string> CaptureFields(Component component, Func<Component, string> identify, int maxFields)
+        public static Dictionary<string, string> CaptureFields(Component component, Func<Component, string> identify, int maxFields, string kind = "mod")
         {
             var type = component.GetType();
             if (!Fields.TryGetValue(type, out var fields))
@@ -108,9 +129,21 @@ namespace LCReplay.Plugin.Capture
                 Fields[type] = fields = list.OrderByDescending(f => EssentialFields.Contains(f.Name))
                     .ThenBy(f => f.Name, StringComparer.Ordinal).ToArray();
             }
+            var builtIn = kind != "mod";
+            if (builtIn)
+            {
+                if (!SelectedFields.TryGetValue((type, kind), out var selected))
+                {
+                    RecordedFields.TryGetValue(kind, out var names);
+                    SelectedFields[(type, kind)] = selected = names == null
+                        ? Array.Empty<FieldInfo>() : fields.Where(field => names.Contains(field.Name)).ToArray();
+                }
+                fields = selected;
+            }
             var result = new Dictionary<string, string>();
             foreach (var path in NestedFields)
             {
+                if (builtIn && !(kind == "item" && path.Key == "insertedBattery")) continue;
                 var parent = Read(component, path.Key);
                 if (parent == null) continue;
                 foreach (var name in path.Value)
@@ -129,9 +162,20 @@ namespace LCReplay.Plugin.Capture
                 }
                 catch { /* Destroyed Unity objects and removed fields are optional data. */ }
             }
-            result["$type"] = type.FullName ?? type.Name;
-            var networkId = Read(component, "NetworkObjectId");
-            if (networkId != null) result["$networkId"] = Convert.ToString(networkId, CultureInfo.InvariantCulture) ?? "";
+            if (!builtIn)
+            {
+                result["$type"] = type.FullName ?? type.Name;
+                // Unspawned slots/prefabs can throw from NetworkBehaviour's
+                // convenience getter. Read the actual NetworkObject instead of
+                // creating and swallowing an exception for every sampled actor.
+                var networkType = Type("Unity.Netcode.NetworkObject");
+                var networkBehaviour = Type("Unity.Netcode.NetworkBehaviour");
+                var networkObject = networkType != null && networkBehaviour?.IsInstanceOfType(component) == true
+                    ? component.GetComponentInParent(networkType) : null;
+                var networkId = networkObject != null && Bool(networkObject, "IsSpawned")
+                    ? Read(networkObject, "NetworkObjectId") : null;
+                if (networkId != null) result["$networkId"] = Convert.ToString(networkId, CultureInfo.InvariantCulture) ?? "";
+            }
             return result;
         }
 

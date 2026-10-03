@@ -23,6 +23,10 @@ namespace LCReplay.Plugin.Capture
                 if (vertices.Length != mesh.vertexCount * 3 || vertices.Any(value => !GameAccess.Finite(value))) return false;
                 var normals = mesh.isReadable ? Flatten(mesh.normals) : Attribute(mesh, VertexAttribute.Normal, 3, streams);
                 var uv = mesh.isReadable ? Flatten(mesh.uv) : Attribute(mesh, VertexAttribute.TexCoord0, 2, streams);
+                target.Uvs1 = Attribute(mesh, VertexAttribute.TexCoord1, 2, streams);
+                target.Uvs2 = Attribute(mesh, VertexAttribute.TexCoord2, 2, streams);
+                target.Uvs3 = Attribute(mesh, VertexAttribute.TexCoord3, 2, streams);
+                target.Tangents = Attribute(mesh, VertexAttribute.Tangent, 4, streams);
                 var submeshes = new List<int[]>();
                 byte[]? indexData = null;
                 if (!mesh.isReadable)
@@ -87,7 +91,7 @@ namespace LCReplay.Plugin.Capture
                         long indices = 0;
                         if (mesh.vertexCount > 1000000 || mesh.subMeshCount > 8192) { unavailable.Add(key); return false; }
                         for (int i = 0; i < mesh.subMeshCount; i++) indices += mesh.GetIndexCount(i);
-                        long bytes = 32L * mesh.vertexCount + 8L * indices + 64L * mesh.subMeshCount;
+                        long bytes = 96L * mesh.vertexCount + 8L * indices + 64L * mesh.subMeshCount;
                         if (indices > 6000000 || bytes + cacheBytes > MaxCacheBytes) { unavailable.Add(key); return false; }
                         source = new GeometrySnapshot();
                         if (!MeshSnapshotReader.Read(mesh, source, 1000000, 6000000, 8192)) { unavailable.Add(key); return false; }
@@ -114,6 +118,8 @@ namespace LCReplay.Plugin.Capture
                     var vertices = new List<float>();
                     var normals = new List<float>();
                     var uvs = new List<float>();
+                    var uv1 = new List<float>(); var uv2 = new List<float>(); var uv3 = new List<float>();
+                    var tangents = new List<float>();
                     var submeshes = new List<int[]>();
                     var bounds = new Bounds();
                     bool hasNormals = source.Normals.Length == source.Vertices.Length;
@@ -140,6 +146,14 @@ namespace LCReplay.Plugin.Capture
                                     normals.Add(normal.x); normals.Add(normal.y); normals.Add(normal.z);
                                 }
                                 if (hasUvs) { uvs.Add(source.Uvs[old * 2]); uvs.Add(source.Uvs[old * 2 + 1]); }
+                                CopyUv(source.Uvs1, uv1, old); CopyUv(source.Uvs2, uv2, old); CopyUv(source.Uvs3, uv3, old);
+                                if (source.Tangents.Length == source.Vertices.Length / 3 * 4)
+                                {
+                                    var tangent = conversion.MultiplyVector(new Vector3(source.Tangents[old * 4],
+                                        source.Tangents[old * 4 + 1], source.Tangents[old * 4 + 2])).normalized;
+                                    tangents.Add(tangent.x); tangents.Add(tangent.y); tangents.Add(tangent.z);
+                                    tangents.Add(source.Tangents[old * 4 + 3] * (conversion.determinant < 0f ? -1f : 1f));
+                                }
                             }
                             output[i] = index;
                         }
@@ -149,12 +163,18 @@ namespace LCReplay.Plugin.Capture
                     target.MeshName = source.MeshName + " [batch slice " + first + "]";
                     if (worldSpace) { target.Position = new Vec3(0, 0, 0); target.Rotation = Quat.Identity; target.Scale = Vec3.One; }
                     target.Vertices = vertices.ToArray(); target.Normals = normals.ToArray(); target.Uvs = uvs.ToArray();
+                    target.Uvs1 = uv1.ToArray(); target.Uvs2 = uv2.ToArray(); target.Uvs3 = uv3.ToArray(); target.Tangents = tangents.ToArray();
                     target.SubmeshTriangles = submeshes; target.Triangles = submeshes.SelectMany(indices => indices).ToArray();
                     target.BoundsCenter = GameAccess.Vec(bounds.center); target.BoundsSize = GameAccess.Vec(bounds.size);
                     target.IsBoundsProxy = false;
                     return true;
                 }
                 catch { return false; }
+            }
+            private static void CopyUv(float[] values, List<float> target, int vertex)
+            {
+                if (values.Length < vertex * 2 + 2) return;
+                target.Add(values[vertex * 2]); target.Add(values[vertex * 2 + 1]);
             }
         }
 
@@ -190,6 +210,51 @@ namespace LCReplay.Plugin.Capture
                 var rootBone = renderer.rootBone;
                 if (rootBone && (rootBone == entityRoot || rootBone.IsChildOf(entityRoot)))
                     target.RootBonePath = EntityTracker.RelativePath(entityRoot, rootBone);
+                var hierarchy = new HashSet<Transform>();
+                foreach (var bone in bones)
+                    for (var node = bone; node && node != entityRoot && node.IsChildOf(entityRoot); node = node.parent)
+                        hierarchy.Add(node);
+                var animator = renderer.GetComponentInParent<Animator>();
+                var externalHumanoidAnimator = animator != null && animator && animator.isHuman && animator.transform != entityRoot &&
+                    !animator.transform.IsChildOf(entityRoot) ? animator : null;
+                if (animator != null && animator && animator.transform != entityRoot && !animator.transform.IsChildOf(entityRoot)) animator = null;
+                var boneAnimator = entityRoot.GetComponentsInChildren<Animator>(true)
+                    .Where(candidate => candidate && candidate.runtimeAnimatorController)
+                    .Select(candidate => new { Animator = candidate,
+                        Matches = bones.Count(bone => bone &&
+                            (bone == candidate.transform || bone.IsChildOf(candidate.transform))),
+                        Depth = EntityTracker.RelativePath(entityRoot, candidate.transform).Length })
+                    .Where(candidate => candidate.Matches > 0)
+                    .OrderByDescending(candidate => candidate.Matches)
+                    .ThenByDescending(candidate => candidate.Depth)
+                    .Select(candidate => candidate.Animator).FirstOrDefault();
+                if (boneAnimator) animator = boneAnimator;
+                if (!animator) animator = entityRoot.GetComponentInChildren<Animator>(true);
+                if (animator != null && animator && (animator.transform == entityRoot || animator.transform.IsChildOf(entityRoot)))
+                    for (var node = animator.transform; node && node != entityRoot; node = node.parent)
+                        hierarchy.Add(node);
+                if (hierarchy.Count > 512) return false;
+                target.RigBones = hierarchy.OrderBy(node => EntityTracker.RelativePath(entityRoot, node), System.StringComparer.Ordinal)
+                    .Select(node => new BonePose { Path = EntityTracker.RelativePath(entityRoot, node),
+                        Position = GameAccess.Vec(node.localPosition), Rotation = GameAccess.Rot(node.localRotation),
+                        Scale = GameAccess.Vec(node.localScale) }).ToList();
+                if (animator != null && animator && (animator.transform == entityRoot || animator.transform.IsChildOf(entityRoot)))
+                {
+                    target.AnimatorPath = EntityTracker.RelativePath(entityRoot, animator.transform);
+                    target.AnimatorController = animator.runtimeAnimatorController ? animator.runtimeAnimatorController.name : "";
+                    target.AnimatorAvatar = animator.avatar ? animator.avatar.name : "";
+                    AnimationAssetRegistry.Remember(animator);
+                }
+                else if (externalHumanoidAnimator != null && externalHumanoidAnimator &&
+                    externalHumanoidAnimator.runtimeAnimatorController && externalHumanoidAnimator.avatar)
+                {
+                    // A player rig can be nested below an Animator owned by a
+                    // parent prefab. A humanoid Avatar can drive the copied
+                    // rig from its replay root without reproducing that parent.
+                    target.AnimatorController = externalHumanoidAnimator.runtimeAnimatorController.name;
+                    target.AnimatorAvatar = externalHumanoidAnimator.avatar.name;
+                    AnimationAssetRegistry.Remember(externalHumanoidAnimator);
+                }
                 return true;
             }
             catch { return false; }
@@ -214,6 +279,7 @@ namespace LCReplay.Plugin.Capture
             var output = new float[mesh.vertexCount * dimensions];
             for (int vertex = 0; vertex < mesh.vertexCount; vertex++)
                 for (int d = 0; d < dimensions; d++) output[vertex * dimensions + d] = Decode(bytes, vertex * stride + offset + d * size, format);
+            if (output.Any(value => !GameAccess.Finite(value))) return Array.Empty<float>();
             return output;
         }
 

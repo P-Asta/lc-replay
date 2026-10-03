@@ -15,8 +15,11 @@ namespace LCReplay.Plugin.Playback
 
         public static bool WasPressed(string key) => ReadButton(Keyboard, KeyProperty(key), "wasPressedThisFrame");
         public static bool IsPressed(string key) => ReadButton(Keyboard, KeyProperty(key), "isPressed");
-        public static bool RightMousePressed => ReadButton(Mouse, "rightButton", "isPressed");
+        public static bool IsMousePressed(string button) => ReadButton(Mouse, button, "isPressed");
+        public static bool WasMousePressed(string button) => ReadButton(Mouse, button, "wasPressedThisFrame");
         public static Vector2 MouseDelta => ReadVector(ReadProperty(Mouse, "delta"));
+        public static Vector2 MousePosition => ReadVector(ReadProperty(Mouse, "position"));
+        public static Vector2 MouseScroll => ReadVector(ReadProperty(Mouse, "scroll"));
         public static bool Available => Keyboard != null;
 
         private static object? Keyboard => ReadCurrent(ref _keyboardType, "UnityEngine.InputSystem.Keyboard");

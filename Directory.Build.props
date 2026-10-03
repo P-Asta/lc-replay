@@ -3,6 +3,6 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <Deterministic>true</Deterministic>
-    <Version>0.23.0</Version>
+    <Version>0.25.24</Version>
   </PropertyGroup>
 </Project>

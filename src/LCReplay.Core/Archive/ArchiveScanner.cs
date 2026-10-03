@@ -224,6 +224,8 @@ namespace LCReplay.Core.Archive
             if (segment.Status == "recording" && !activeSegments.Contains(file)) segment.Status = "interrupted";
             if (activeSegments.Contains(file)) segment.Status = "recording";
             if (segment.Part < 1) segment.Part = 1;
+            if (segment.BookmarkCount < 0 || segment.BookmarkCount > 1000000)
+            { segment.BookmarkCount = 0; Warn("Invalid bookmark count in manifest: " + file); }
             return segment;
         }
 
@@ -345,6 +347,8 @@ namespace LCReplay.Core.Archive
             }
             if (day.DayNumber < 1) day.DayNumber = 1;
             day.Moon = ReplayArchive.Clip(day.Moon, 512);
+            day.Members = (day.Members ?? new List<string>()).Where(name => !string.IsNullOrWhiteSpace(name))
+                .Select(name => ReplayArchive.Clip(name.Trim(), 64)).Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
             day.QuotaRemaining = NonNegative(day.QuotaRemaining);
             day.QuotaTarget = NonNegative(day.QuotaTarget);
             day.QuotaFulfilled = NonNegative(day.QuotaFulfilled);

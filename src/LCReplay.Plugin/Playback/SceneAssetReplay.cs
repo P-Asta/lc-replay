@@ -5,6 +5,7 @@ using System.Linq;
 using LCReplay.Core;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.Playables;
 
 namespace LCReplay.Plugin.Playback
 {
@@ -20,15 +21,20 @@ namespace LCReplay.Plugin.Playback
         private readonly Dictionary<Renderer, string> renderers = new Dictionary<Renderer, string>();
         private readonly Dictionary<Terrain, string> terrains = new Dictionary<Terrain, string>();
         private readonly HashSet<string> pendingScenes = new HashSet<string>(StringComparer.Ordinal);
+        private readonly List<Animator> suns = new List<Animator>();
+        private readonly List<Light> sunLights = new List<Light>();
+        private readonly Dictionary<Light, Light> sunTargets = new Dictionary<Light, Light>();
+        private int sunTargetSignature;
+        private float lastSunTime = -1f;
         private Scene scene;
         private AsyncOperation? loading;
         private string sceneName = "";
-        private bool indoor, disposed;
+        private bool indoor, fogEnabled = true, suspended, disposed;
 
         internal Scene Scene => scene;
         internal int RenderedCount => renderers.Count(entry => entry.Key && entry.Key.enabled) +
             terrains.Count(entry => entry.Key && entry.Key.enabled);
-        internal bool IsLoading => loading != null;
+        internal bool IsLoading => sceneName.Length != 0 && pendingScenes.Contains(sceneName);
 
         internal SceneAssetReplay(int replayLayer, Action changed)
         { this.replayLayer = replayLayer; this.changed = changed; }
@@ -40,11 +46,12 @@ namespace LCReplay.Plugin.Playback
             if (world.AssetScene.Length == 0 || world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count == 0)
             {
                 sceneName = "";
+                loading = null;
                 foreach (var renderer in renderers.Keys) if (renderer) renderer.enabled = false;
                 foreach (var terrain in terrains.Keys) if (terrain) terrain.enabled = false;
                 ReplayIsolation.Unregister(scene);
                 if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
-                renderers.Clear(); terrains.Clear(); scene = default;
+                renderers.Clear(); terrains.Clear(); ClearSun(); scene = default;
                 return;
             }
             if (world.AssetGameVersion != Application.version || world.AssetBuildIndex < 0)
@@ -60,7 +67,7 @@ namespace LCReplay.Plugin.Playback
             foreach (var terrain in terrains.Keys) if (terrain) terrain.enabled = false;
             ReplayIsolation.Unregister(scene);
             if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
-            renderers.Clear(); terrains.Clear(); scene = default;
+            renderers.Clear(); terrains.Clear(); ClearSun(); scene = default;
             sceneName = world.AssetScene;
             if (pendingScenes.Contains(sceneName)) return;
             if (pendingScenes.Count == 0) SceneManager.sceneLoaded += OnSceneLoaded;
@@ -94,6 +101,16 @@ namespace LCReplay.Plugin.Playback
                         case Camera camera: camera.enabled = false; break;
                         case Light light: light.enabled = false; break;
                         case AudioSource audio: audio.enabled = false; break;
+                        case Animator animator:
+                            if (current && animator.runtimeAnimatorController && animator.parameters.Any(parameter =>
+                                parameter.name == "timeOfDay" && parameter.type == AnimatorControllerParameterType.Float))
+                            {
+                                animator.fireEvents = false; animator.applyRootMotion = false;
+                                animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+                                suns.Add(animator);
+                            }
+                            else animator.enabled = false;
+                            break;
                         case Renderer renderer:
                             renderer.enabled = false;
                             if (current)
@@ -115,14 +132,61 @@ namespace LCReplay.Plugin.Playback
             }
             if (!current) { SceneManager.UnloadSceneAsync(loaded); return; }
             scene = loaded;
+            foreach (var sun in suns) sunLights.AddRange(sun.GetComponentsInChildren<Light>(true).Where(light => light.type == LightType.Directional));
             ReplayIsolation.Register(scene);
             loading = null;
             ApplyVisibility();
             changed();
         }
 
+        private void ClearSun()
+        { suns.Clear(); sunLights.Clear(); sunTargets.Clear(); sunTargetSignature = 0; lastSunTime = -1f; }
+
+        // Older recordings already contain the game clock. Evaluate the moon's
+        // installed sun curves in this isolated scene, never the live round.
+        internal void ApplyTimeOfDay(double normalized, IReadOnlyList<KeyValuePair<Light, LightSnapshot>> targets)
+        {
+            if (suspended || suns.Count == 0 || targets.Count == 0) return;
+            var signature = targets[0].Key ? targets[0].Key.GetInstanceID() : 0;
+            if (signature != sunTargetSignature)
+            {
+                sunTargetSignature = signature; sunTargets.Clear(); lastSunTime = -1f;
+                foreach (var source in sunLights.Where(light => light))
+                {
+                    var candidates = targets.Where(pair => pair.Key && !pair.Value.IsInterior && pair.Value.Type == "Directional" &&
+                        !sunTargets.ContainsValue(pair.Key)).ToArray();
+                    var match = candidates.FirstOrDefault(pair => pair.Value.Name == source.name);
+                    if (!match.Key) match = candidates.OrderBy(pair =>
+                        (pair.Value.Shadows == (source.shadows != LightShadows.None) ? 0 : 10) +
+                        Math.Abs(Math.Log(1 + pair.Value.Intensity) - Math.Log(1 + source.intensity))).FirstOrDefault();
+                    if (match.Key) sunTargets[source] = match.Key;
+                }
+            }
+            var value = Mathf.Clamp((float)normalized, 0f, .99f);
+            if (value == lastSunTime) return;
+            lastSunTime = value;
+            foreach (var sun in suns.Where(animator => animator))
+            {
+                sun.enabled = true; sun.speed = 1f;
+                sun.SetFloat("timeOfDay", value);
+                sun.Update(0f);
+                if (sun.playableGraph.IsValid()) sun.playableGraph.SetTimeUpdateMode(DirectorUpdateMode.Manual);
+            }
+            foreach (var pair in sunTargets) if (pair.Key && pair.Value)
+            {
+                SunLighting.Capture(pair.Key, normalized).Apply(pair.Value);
+                pair.Key.enabled = false;
+            }
+        }
+
         internal void SetIndoor(bool value)
         { indoor = value; ApplyVisibility(); }
+
+        internal void SetFogEnabled(bool value)
+        { fogEnabled = value; ApplyVisibility(); }
+
+        internal void SetSuspended(bool value)
+        { if (suspended != value) { suspended = value; ApplyVisibility(); } }
 
         internal void SetHiddenRendererPaths(IEnumerable<string> paths)
         {
@@ -138,13 +202,16 @@ namespace LCReplay.Plugin.Playback
                 {
                     // Later exterior records can introduce more installed surfaces.
                     // Keep the whole scene lookup, not only the first record's subset.
-                    entry.Key.enabled = rendererPaths.Contains(entry.Value);
-                    entry.Key.forceRenderingOff = indoor || hiddenRendererPaths.Contains(entry.Value);
+                    entry.Key.enabled = !suspended && rendererPaths.Contains(entry.Value);
+                    entry.Key.forceRenderingOff = indoor || hiddenRendererPaths.Contains(entry.Value) ||
+                        !fogEnabled && (entry.Key.name.IndexOf("fog", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            entry.Key.sharedMaterials.Any(material => material &&
+                                material.name.IndexOf("fog", StringComparison.OrdinalIgnoreCase) >= 0));
                 }
             foreach (var entry in terrains)
                 if (entry.Key)
                 {
-                    entry.Key.enabled = terrainPaths.Contains(entry.Value);
+                    entry.Key.enabled = !suspended && terrainPaths.Contains(entry.Value);
                     entry.Key.drawHeightmap = !indoor;
                 }
         }
@@ -152,10 +219,13 @@ namespace LCReplay.Plugin.Playback
         public void Dispose()
         {
             disposed = true;
+            sceneName = "";
+            loading = null;
             ReplayIsolation.Unregister(scene);
             if (pendingScenes.Count == 0) SceneManager.sceneLoaded -= OnSceneLoaded;
             if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
             rendererPaths.Clear(); hiddenRendererPaths.Clear(); terrainPaths.Clear(); renderers.Clear(); terrains.Clear();
+            ClearSun();
         }
     }
 }

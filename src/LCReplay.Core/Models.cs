@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace LCReplay.Core
@@ -21,6 +22,8 @@ namespace LCReplay.Core
     {
         public string Kind { get; set; } = "";
         public double Time { get; set; }
+        [Newtonsoft.Json.JsonIgnore]
+        public double? SourceTime { get; set; }
         public ReplayHeader? Header { get; set; }
         public ReplayFrame? Frame { get; set; }
         public ReplayEvent? Event { get; set; }
@@ -90,6 +93,17 @@ namespace LCReplay.Core
         public Vec3 Scale { get; set; } = Vec3.One;
         public Quat Rotation { get; set; } = Quat.Identity;
         public bool Active { get; set; } = true;
+        public Quat? ViewRotation { get; set; }
+        public Vec3? ViewPosition { get; set; }
+        public bool ShouldSerializeViewRotation() => ViewRotation.HasValue;
+        public bool ShouldSerializeViewPosition() => ViewPosition.HasValue;
+        // Item poses can be reconstructed from sparse item/pose events. Keep
+        // ordinary poses for held or otherwise unpredictable items.
+        public bool PoseFromItemEvents { get; set; }
+        public bool ShouldSerializePoseFromItemEvents() => PoseFromItemEvents;
+        public bool ShouldSerializePosition() => !PoseFromItemEvents;
+        public bool ShouldSerializeRotation() => !PoseFromItemEvents;
+        public bool ShouldSerializeScale() => !PoseFromItemEvents;
         public Dictionary<string, string> State { get; set; } = new Dictionary<string, string>();
         public List<BonePose> Bones { get; set; } = new List<BonePose>();
         public List<RenderPose> Renderers { get; set; } = new List<RenderPose>();
@@ -139,6 +153,52 @@ namespace LCReplay.Core
         public string Name { get; set; } = "";
         public string EntityId { get; set; } = "";
         public Dictionary<string, string> Data { get; set; } = new Dictionary<string, string>();
+        // One short, reusable motion track learned during the clip's first
+        // occurrence. It lets a fresh menu process replay an actor whose game
+        // AnimatorController has not yet been loaded.
+        public AnimationTrackSnapshot? AnimationTrack { get; set; }
+        public ItemMotionSnapshot? ItemMotion { get; set; }
+        // Full blended HDRP component only when its effective values changed.
+        public EnvironmentComponentSnapshot? PostProcess { get; set; }
+    }
+
+    // A resting item needs one pose; a dropped item needs its start and floor
+    // target plus a small sampled copy of the game's shared fall curve.
+    public sealed class ItemMotionSnapshot
+    {
+        public string Mode { get; set; } = "";
+        public string AnchorId { get; set; } = "";
+        public Vec3 Position { get; set; }
+        public Quat Rotation { get; set; } = Quat.Identity;
+        public Vec3 Scale { get; set; } = Vec3.One;
+        public Vec3 Target { get; set; }
+        public Quat TargetRotation { get; set; } = Quat.Identity;
+        public float FallTime { get; set; }
+        public float FallRate { get; set; }
+        public float[] Curve { get; set; } = new float[0];
+        public bool ShouldSerializeAnchorId() => AnchorId.Length != 0;
+        public bool ShouldSerializeTarget() => Mode == "fall";
+        public bool ShouldSerializeTargetRotation() => Mode == "fall";
+        public bool ShouldSerializeFallTime() => Mode == "fall";
+        public bool ShouldSerializeFallRate() => Mode == "fall";
+        public bool ShouldSerializeCurve() => Mode == "fall";
+    }
+
+    public sealed class AnimationTrackSnapshot
+    {
+        public string Clip { get; set; } = "";
+        // Identifies the Animator on actors with independent body/prop rigs.
+        // Empty in older recordings, which used one Animator per actor.
+        public string AnimatorPath { get; set; } = "";
+        // Full Animator state path distinguishes a shared clip used by different states.
+        public int StateHash { get; set; }
+        public int Layer { get; set; }
+        public bool Looping { get; set; }
+        public List<string> BonePaths { get; set; } = new List<string>();
+        public float[] Phases { get; set; } = new float[0];
+        // Sample-major local transform arrays; scale comes from RigBones.
+        public float[] Positions { get; set; } = new float[0];
+        public float[] Rotations { get; set; } = new float[0];
     }
 
     public sealed class WorldSnapshot
@@ -146,6 +206,10 @@ namespace LCReplay.Core
         public string Scene { get; set; } = "";
         public string CaptureSetId { get; set; } = "";
         public string Layer { get; set; } = "";
+        // Observation time of this world payload; ReplayRecord.Time may be
+        // earlier so generated scenery is available when the round begins.
+        public double CaptureCompletedAt { get; set; }
+        public bool ShouldSerializeCaptureCompletedAt() => CaptureCompletedAt > 0;
         // Built-in scene renderers can be loaded from the installed matching game.
         // Procedural and moving objects remain embedded below.
         public string AssetScene { get; set; } = "";
@@ -186,6 +250,25 @@ namespace LCReplay.Core
         public float[] AmbientSkyColor { get; set; } = new[] { 0.15f, 0.20f, 0.28f, 1f };
         public List<EnvironmentComponentSnapshot> Components { get; set; } = new List<EnvironmentComponentSnapshot>();
         public List<TextureSnapshot> SkyFaces { get; set; } = new List<TextureSnapshot>();
+        public string SkyFaceEncoding { get; set; } = "";
+        public bool ShouldSerializeSkyFaceEncoding() => SkyFaceEncoding.Length != 0;
+        public List<PostProcessPassSnapshot> CustomPasses { get; set; } = new List<PostProcessPassSnapshot>();
+        public bool CustomPassCaptureComplete { get; set; }
+        public bool ShouldSerializeCustomPasses() => CustomPasses.Count != 0;
+        public bool ShouldSerializeCustomPassCaptureComplete() => CustomPassCaptureComplete;
+    }
+
+    public sealed class PostProcessPassSnapshot
+    {
+        public string Name { get; set; } = "";
+        public string ShaderName { get; set; } = "";
+        public string MaterialName { get; set; } = "";
+        public string InjectionPoint { get; set; } = "";
+        public string MaterialPassName { get; set; } = "";
+        public bool? FetchColorBuffer { get; set; }
+        public List<EnvironmentParameterSnapshot> Properties { get; set; } = new List<EnvironmentParameterSnapshot>();
+        public bool ShouldSerializeMaterialName() => MaterialName.Length != 0;
+        public bool ShouldSerializeFetchColorBuffer() => FetchColorBuffer.HasValue;
     }
 
     public sealed class EnvironmentComponentSnapshot
@@ -200,12 +283,19 @@ namespace LCReplay.Core
         public string Kind { get; set; } = "";
         public float[] Values { get; set; } = new float[0];
         public string Text { get; set; } = "";
+        // TextureCurve: up to 32 keyframes, seven floats per key.
+        public float[] CurveKeys { get; set; } = new float[0];
+        public bool ShouldSerializeText() => Text.Length != 0;
+        public bool ShouldSerializeCurveKeys() => CurveKeys.Length != 0;
     }
 
     public sealed class LightSnapshot
     {
         public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public bool ShouldSerializeName() => Name.Length != 0;
         public string AnchorId { get; set; } = "";
+        public string EntityId { get; set; } = "";
         public bool IsInterior { get; set; }
         public string Type { get; set; } = "Point";
         public Vec3 Position { get; set; }
@@ -214,9 +304,18 @@ namespace LCReplay.Core
         public bool UseColorTemperature { get; set; }
         public float ColorTemperature { get; set; } = 6500f;
         public float Intensity { get; set; } = 1f;
+        public float LightDimmer { get; set; } = 1f;
         public float Range { get; set; } = 10f;
         public float SpotAngle { get; set; } = 30f;
         public bool Shadows { get; set; }
+        public float ShadowStrength { get; set; } = 1f;
+        public float ShadowDimmer { get; set; } = 1f;
+        // Older recordings did not distinguish realtime from baked fixtures.
+        public string BakeType { get; set; } = "";
+        public bool ShouldSerializeShadowStrength() => ShadowStrength != 1f;
+        public bool ShouldSerializeLightDimmer() => LightDimmer != 1f;
+        public bool ShouldSerializeShadowDimmer() => ShadowDimmer != 1f;
+        public bool ShouldSerializeBakeType() => BakeType.Length != 0;
     }
 
     public sealed class ParticleEmitterSnapshot
@@ -295,11 +394,16 @@ namespace LCReplay.Core
     public sealed class TextureSnapshot
     {
         public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public bool ShouldSerializeName() => Name.Length != 0;
         public int Width { get; set; }
         public int Height { get; set; }
         // Older captures encoded every PNG through an sRGB target. False retains
         // that interpretation; new normal/mask maps keep their linear channels.
         public bool Linear { get; set; }
+        // -1 keeps the legacy replay filtering for recordings without this field.
+        public int FilterMode { get; set; } = -1;
+        public bool ShouldSerializeFilterMode() => FilterMode >= 0;
         public byte[] Png { get; set; } = new byte[0];
     }
 
@@ -341,10 +445,21 @@ namespace LCReplay.Core
         public int[] Triangles { get; set; } = new int[0];
         public float[] Color { get; set; } = new[] { 0.6f, 0.6f, 0.6f, 1f };
         public bool IsBoundsProxy { get; set; }
+        // Preserve the source renderer's shadow behavior. Defaults keep old recordings compatible.
+        public int ShadowCastingMode { get; set; } = -1;
+        public bool ReceiveShadows { get; set; } = true;
+        public bool ShouldSerializeShadowCastingMode() => ShadowCastingMode != -1;
+        public bool ShouldSerializeReceiveShadows() => !ReceiveShadows;
         public string EntityId { get; set; } = "";
         public string AnchorId { get; set; } = "";
         public string MeshName { get; set; } = "";
         public string MeshSourceId { get; set; } = "";
+        // Installed prefab render assets. Only identifiers are recorded; playback
+        // resolves the matching game mesh, skin and materials without running AI.
+        public string PrefabKey { get; set; } = "";
+        public string PrefabRendererPath { get; set; } = "";
+        public bool ShouldSerializePrefabKey() => PrefabKey.Length != 0;
+        public bool ShouldSerializePrefabRendererPath() => PrefabRendererPath.Length != 0;
         public bool IsInterior { get; set; }
         public string RoomId { get; set; } = "";
         // Optional pose stream for moving furniture and doors in generated tiles.
@@ -356,6 +471,14 @@ namespace LCReplay.Core
         public Vec3 LodCenter { get; set; }
         public float LodSwitchDistance { get; set; }
         public float[] Uvs { get; set; } = new float[0];
+        public float[] Uvs1 { get; set; } = new float[0];
+        public float[] Uvs2 { get; set; } = new float[0];
+        public float[] Uvs3 { get; set; } = new float[0];
+        public float[] Tangents { get; set; } = new float[0];
+        public bool ShouldSerializeUvs1() => Uvs1.Length != 0;
+        public bool ShouldSerializeUvs2() => Uvs2.Length != 0;
+        public bool ShouldSerializeUvs3() => Uvs3.Length != 0;
+        public bool ShouldSerializeTangents() => Tangents.Length != 0;
         public float[] Normals { get; set; } = new float[0];
         // Optional world-space matrices for procedural GPU-instanced geometry.
         // Sixteen column-major floats describe each instance.
@@ -363,10 +486,19 @@ namespace LCReplay.Core
         public List<int[]> SubmeshTriangles { get; set; } = new List<int[]>();
         public List<string> MaterialIds { get; set; } = new List<string>();
         public List<string> BonePaths { get; set; } = new List<string>();
+        // Optional parent for rigid details attached to a skinned actor bone.
+        // Their pose is stored in that bone's local space.
+        public string AttachedBonePath { get; set; } = "";
         public string RootBonePath { get; set; } = "";
         public float[] BindPoses { get; set; } = new float[0];
         public int[] BoneIndices { get; set; } = new int[0];
         public float[] BoneWeights { get; set; } = new float[0];
+        // One rig pose per captured skin. Runtime animation states can then be
+        // replayed without a bone transform stream in every gameplay frame.
+        public List<BonePose> RigBones { get; set; } = new List<BonePose>();
+        public string AnimatorPath { get; set; } = "";
+        public string AnimatorController { get; set; } = "";
+        public string AnimatorAvatar { get; set; } = "";
     }
 
     public sealed class ReplaySession
@@ -375,6 +507,11 @@ namespace LCReplay.Core
         public List<ReplayFrame> Frames { get; set; } = new List<ReplayFrame>();
         public List<ReplayEvent> Events { get; set; } = new List<ReplayEvent>();
         public List<ReplayRecord> Worlds { get; set; } = new List<ReplayRecord>();
+        // Playback-only poses at the time a late map snapshot was captured.
+        // They let a moving door mesh follow the door's earlier recorded motion.
+        [Newtonsoft.Json.JsonIgnore]
+        public Dictionary<string, List<EntitySnapshot>> DoorPoseReferences { get; set; } =
+            new Dictionary<string, List<EntitySnapshot>>(StringComparer.Ordinal);
         public List<string> Warnings { get; set; } = new List<string>();
         public double Duration { get; set; }
         public bool IsComplete { get; set; }

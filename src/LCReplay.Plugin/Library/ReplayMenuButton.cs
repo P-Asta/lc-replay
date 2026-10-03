@@ -176,9 +176,7 @@ namespace LCReplay.Plugin.Library
             var settingsIndex = rows.FindIndex(r => r.Button == settings);
             if (settingsIndex < 0 || settingsIndex == rows.Count - 1 || rows.Count < 3)
                 throw new InvalidOperationException("The Settings menu row cannot be positioned safely.");
-            var top = rows[0].Position.y;
-            var bottom = rows[rows.Count - 1].Position.y;
-            var step = (top - bottom) / rows.Count;
+            var step = rows.Zip(rows.Skip(1), (a, b) => a.Position.y - b.Position.y).Where(gap => gap > 1f).DefaultIfEmpty(0f).Min();
             var maxHeight = rows.Max(r => r.Rect.rect.height * Mathf.Abs(r.Rect.localScale.y));
             if (step < maxHeight || step <= 0)
                 throw new InvalidOperationException("There is no free vertical space for another menu row.");
@@ -200,30 +198,27 @@ namespace LCReplay.Plugin.Library
                     GetType().GetMethod(nameof(Open), BindingFlags.Instance | BindingFlags.NonPublic)!);
                 addListener.Invoke(clickEvent, new object[] { callback });
                 onClick.SetValue(replayButton, clickEvent, null);
+                // Spatial navigation includes buttons injected later by other mods.
+                var navigation = GameAccess.Read(replayButton, "navigation") ?? throw new InvalidOperationException("Button navigation is unavailable.");
+                var mode = Property(navigation, "mode");
+                mode.SetValue(navigation, Enum.Parse(mode.PropertyType, "Automatic"), null);
+                Set(replayButton!, "navigation", navigation);
                 var labels = clone.GetComponentsInChildren(textType, true).OfType<Component>().ToArray();
                 if (labels.Length != 1) throw new InvalidOperationException("Settings has an unsupported label layout.");
                 Set(labels[0], "text", "> Replay");
                 // The Settings clone keeps the game's font, colors and hover animation.
                 clone.transform.SetParent(parent, false);
                 clone.transform.SetSiblingIndex(settings.transform.GetSiblingIndex() + 1);
-                var replayRow = new Row((RectTransform)clone.transform, replayButton!);
-                rows.Insert(settingsIndex + 1, replayRow);
-                changed.AddRange(rows.Where(r => r != replayRow));
-                for (var i = 0; i < rows.Count; i++)
+                ((RectTransform)clone.transform).localPosition = rows[settingsIndex].Position;
+                // Match LethalConfig's upward expansion without compressing/repositioning
+                // its row or Quit. Both injection orders leave a full gap for each button.
+                var offset = new Vector3(0, step, 0);
+                for (var i = 0; i <= settingsIndex; i++)
                 {
                     var row = rows[i];
-                    row.Rect.localPosition = new Vector3(row.Position.x, top - step * i, row.Position.z);
-                }
-                var navigationRows = rows.Where(r => GameAccess.Read(r.Button, "interactable") is bool enabled && enabled).ToArray();
-                for (var i = 0; i < navigationRows.Length; i++)
-                {
-                    var row = navigationRows[i];
-                    var navigation = GameAccess.Read(row.Button, "navigation") ?? throw new InvalidOperationException("Button navigation is unavailable.");
-                    var mode = Property(navigation, "mode");
-                    mode.SetValue(navigation, Enum.Parse(mode.PropertyType, "Explicit"), null);
-                    Set(navigation, "selectOnUp", navigationRows[(i + navigationRows.Length - 1) % navigationRows.Length].Button);
-                    Set(navigation, "selectOnDown", navigationRows[(i + 1) % navigationRows.Length].Button);
-                    Set(row.Button, "navigation", navigation);
+                    row.Offset = offset;
+                    changed.Add(row);
+                    row.Rect.localPosition += offset;
                 }
                 Set(replayButton!, "interactable", allowed);
                 clone.SetActive(true);
@@ -263,12 +258,7 @@ namespace LCReplay.Plugin.Library
             replayButton = null;
             foreach (var row in changed)
             {
-                if (row.Rect) row.Rect.localPosition = row.Position;
-                if (row.Button && row.Navigation != null)
-                {
-                    try { Set(row.Button, "navigation", row.Navigation); }
-                    catch { /* Scene teardown may have already destroyed the selectable. */ }
-                }
+                if (row.Rect) row.Rect.localPosition -= row.Offset;
             }
             changed.Clear();
         }
@@ -294,13 +284,12 @@ namespace LCReplay.Plugin.Library
             public readonly RectTransform Rect;
             public readonly Component Button;
             public readonly Vector3 Position;
-            public readonly object? Navigation;
+            public Vector3 Offset;
             public Row(RectTransform rect, Component button)
             {
                 Rect = rect;
                 Button = button;
                 Position = rect.localPosition;
-                Navigation = GameAccess.Read(button, "navigation");
             }
         }
     }

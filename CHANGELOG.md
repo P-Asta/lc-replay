@@ -1,3 +1,216 @@
+# 0.25.24
+
+- Restore a visible fallback sky when an older HDRI recording contains six black, quantized cubemap faces. New recordings store RGBE-encoded sky faces so dim HDR sky colors survive PNG capture; replay keeps the restored cubemap when later sky settings change.
+- Hide the moon's recorded exterior fog while replaying the prelanding ship phase, then restore it after departure or on a seek back and forth. This prevents the detached free camera from showing the orbit scene through dense white surface fog.
+- Schedule live snapshots, frozen snapshot output and scene maintenance on different game frames. Keep player, held-item and camera poses at one observation time. Under pressure, do not starve new frames behind the entire method-event backlog.
+- Drain at most eight hook events with a cooperative 0.3 ms budget. Pending output transfers at most four records/0.15 ms; snapshot publication processes at most eight records/128 comparison units with a cooperative 0.4 ms budget. Unchanged entities still yield comparison work.
+- Cycle sparse animation bindings with their actual observation times. Reuse clip lists, skip unchanged native actor clip queries, and allocate parameter change dictionaries only when values change.
+- Reuse one recorder-owned HDRP volume stack, updating and reading it in separate steps; dispose it on stop. Slice visual renderer/decal scans and late-geometry discovery/verification. Limit world/scene work on each maintenance frame.
+- Avoid exception-driven NetworkObjectId reads for unspawned player slots. Stream the final frozen snapshot and queued events asynchronously instead of building a final main-thread queue burst.
+- Defer texture export from material inspection. Allow one GPU readback/worker PNG at a time, copy transient GPU data in its completion callback, reuse pooled RGBA storage, and perform PNG compression outside Unity's main thread. Preserve completed geometry/texture data when stopping without waiting for GPU work.
+- Keep a bounded motion tail while a large world record is being written; the world alone does not pause every new motion sample. The tail still pauses/resumes at its count/byte watermarks.
+- Apply these small work slices only to recording. Replay keeps its separate fast scene-building loop, asynchronous file loading and full per-render animation updates.
+- Replace the player outline's 2.5% whole-body enlargement with a thin offset along the animated surface. Weld duplicate vertex normals, preserve body transforms and cap protrusion at 5 mm; retain opaque black outlines.
+- Release build has zero warnings/errors; 97 automated groups pass. Native test measurements and the limitations of cooperative work budgets are documented in docs/TESTING.md.
+
+# 0.25.23
+
+- Reduce the production writer from 256 records/64 MiB to 64 records/16 MiB and overflow from 64 MiB to 8 MiB. Pause capture at 48 queued records or 4 MiB; resume below 12 records and 1 MiB with no overflow.
+- Reuse estimated record weights during retries. Drain at most 16 pending records per tick with a cooperative 0.75 ms budget, and process at most 48 hook events per tick. Preserve an initial frame and asynchronously finish accepted records.
+- Run compression and disk output on a dedicated worker with optional below-normal priority.
+- Release compilation passes without warnings/errors; all 94 automated groups and the muted native pressure test pass. Sampling density can temporarily decrease under pressure; these limits are not a whole-process memory cap or a guarantee against every game hitch.
+
+# 0.25.22
+
+- Treat a full disk queue as temporary backpressure. Preserve an ordered bounded overflow, pause new capture sampling while saving catches up, then resume on the same file. Async completion drains accepted overflow without blocking Unity's main thread on disk writes.
+- Account for queued/in-flight snapshot memory as well as record count, reduce the writer queue from 1024 to 256, and cap the optional whole-world reuse cache at 32 MiB. Release queued payloads after output failure. Bounded event overflow records an explicit storage gap instead of aborting the day; unaccepted bookmarks are not counted.
+- Stream JSON directly into gzip. Remove expanded UTF-16/UTF-8 record copies and the final compressed ToArray copy, retaining the existing replay schema and incremental size limits.
+- Preserve readable completed records after write/allocation failure and torn final writes. Refresh failed-save archive metadata from the physical prefix. Failure to create/write an optional index does not stop the primary replay; playback rebuilds it.
+- Flush stream buffers periodically, finish accepted records even if capture cleanup fails, and use actual written duration/bookmark totals for final metadata.
+- Release build has zero warnings/errors; 92 automated groups pass, including stalled/full-disk and injected allocation failure. A muted native recorder test verifies pause/resume, event overflow reporting, bookmark preservation and released queue memory. See docs/TESTING.md for measurements and limits.
+# 0.25.21
+
+- Compute deadline days with the native TimeOfDay floor formula. Fractional deadlines now label newly saved quota recordings Day 1, Day 2 and Day 3 instead of 1, 1 and 2. Preserve the existing remaining-deadline file naming and previously written files.
+- Evaluate the installed player controller and RigBuilder outputs in one manually sampled PlayableGraph. The previous separate PreviousInputs stream left crouching leg IK in a default pose and buried the feet. Keep sparse animation states/parameters; add no bone recording.
+- Select the recorded local/remote player controller from verified player assets. Apply view rotation to gameplayCamera, matching PlayerControllerB, and reset both sampled transition poses before blending.
+- Set the expanded player outline material to opaque black. Release owned animation graphs when an actor retires or playback is disposed, including cached reactivation.
+- Release solution compilation succeeds without warnings/errors; 85 automated test groups pass. Muted native comparisons verify crouch idle/walk/down, looking, pause and reactivation. See docs/TESTING.md for the native reference measurements and limits.
+# 0.25.20
+
+- Spread each discovered type's component registration over multiple frames, with at most two registrations per step and a 2 ms cooperative work budget. Skip unused player-slot animation setup. Retain discovery membership correctly through partial and repeated scans.
+- Reference matching native player skins instead of repeatedly exporting their meshes, bindings and default maps for every lobby member. Keep custom mesh/material capture as fallback. Share the installed player sound catalog across players.
+- Disable and retain the exact enabled state of both globally polled gameplay actions and the local player's separate look asset while the archive/loading/viewer owns controls. Keep replay raw-device and UI input active, and allow cancellation to release held item actions.
+- Reassert movement/look flags before the player's Update. Release input in cleanup finally paths, reacquire it on cached resume/archive transitions, and restore the live round's current camera rather than the camera from entry.
+- Muted native tests cover 32 player clones, device-injected WASD/click isolation, restored live movement, camera switching, cache/archive/eviction and continuing live recording. Release build has zero warnings/errors; 84 automated groups pass. This fixture does not establish multiplayer FPS or zero startup pauses.
+
+# 0.25.19
+
+- Remove generic prefab renderer/mesh matching and default scene-source copying for ambience. Rain, mine-entrance and campfire sounds cannot be authorized by an unrelated matching object. Older recordings retain only the narrow native BreakerBoxHum fallback, rejecting ambiguous or inactive geometry.
+- Capture actual static spatial source actions and changed loop state, gain and pitch. Store installed clip references, emitter points, native range/rolloff and ship-relative anchors; never audio samples. Stopped/inactive configured sources do not start replay loops.
+- Isolate one-shots from configured looping clips, deduplicate forwarded Play calls and remove static ownership when an actor owns the source. Restore loop/stop state on seek without replaying historical one-shots.
+- Bound static tracking to 256 sources, discover at most 32 transform nodes and check at most eight cached emitters per frame. Clear unloaded/destroyed sources and guard reused Unity instance IDs.
+- Validate 84 automated groups plus muted native emitter, legacy false-match, seek, distance and cleanup checks. Existing files cannot recover unrecorded ambience actions.
+
+# 0.25.18
+
+- Exclude every GrabbableObject and EnemyAI audio source from passive structure ambience, including LungProp's component-local hum. Stop stale apparatus loops after undocking, including older ship/held-item state, while retaining action one-shots.
+- Gate derived rain ambience on the recorded level weather. Dry and unknown weather cannot start template rain loops; rain matching respects word boundaries so terrain and drains retain their ordinary ambience.
+- Keep exterior direct/indirect lighting enabled while the camera is in the ship, matching TimeOfDay's factory check. Preserve factory night vision and ship floodlight/fog handling.
+- Connect native circuit-bee VFX targets to the reconstructed hive pose. Record a small hive/self/override decision so the game's line-of-sight choice survives playback; older recordings can find a nearby hive.
+- Restore bee electricity using the installed ThunderAndLightning path script and materials. Use the native zap modes, intervals and four-unit target box; clear bolts on pause/seek and isolate their render layer without extra live-world lights or retained scene subscriptions.
+
+# 0.25.17
+
+- Restrict derived structure ambience to active passive sources. Exclude controller-owned turret, mine, item and enemy sounds, inactive scene branches and distant/unbounded prefab attachment scopes; keep native breaker-box hum and source attenuation.
+- Check recorded turret audio against current Detection/Charging/Firing/Berserk state. Stop stale firing loops even when an older recording lacks its stop event; backward seeks cannot restore a firing loop while idle.
+- Reconstruct the installed landmine Animator, fire its native startIdle trigger and advance it with the replay clock. Keep pause/seek behaviour deterministic, hide overlapping snapshot meshes and stop the idle visual after explosion.
+- Record only mask attachment flags and mine activation state. Gate Comedy/Tragedy eye meshes and attached lights on attachment, with legacy Animator-parameter fallback. Exclude conditional mask emission and moving entities from synthesized room illumination. Audio waveforms remain unrecorded.
+
+# 0.25.16
+
+- Apply PlayerControllerB's script-driven camera/arm IK weights as well as native Animator states. Use the cloned ServerItemHolder and the game's unscaled item offsets for third-person holding; store essential item offsets for modded items.
+- Copy the native night-vision radius, attenuation and specular settings into the spectator light. Exclude duplicate player/radar night-vision fixtures, including older recordings, to prevent concentrated highlights on nearby walls.
+- Cycle living players with left-click while following. Remove Player sounds from Settings/config, rename Fog / Fake Fog, and add persistent No shadow to keep outside illumination inside while disabling light shadows.
+- Interpolate recorded particles by emitter/seed/birth, extrapolate retiring particles only while alive, and interpolate native emitter clocks. Reuse particle/style buffers during playback.
+- Copy the turret's complete native bullet/flare hierarchy, restore state-driven detection/firing sounds with native distance limits, and soften the replay aim beam with a transparent glow profile. Resolve sibling hazard sound references without substituting unrelated clips.
+- Play installed loop ambience at matching static structures and inert moon scenery, including BreakerBoxHum. Preserve native range, pause on replay pause, and destroy playback sources during world/viewer cleanup. No audio waveform is recorded.
+- Replace mesh-sphere swarm substitutes with the installed bees/locusts FlyingBugs VFX Graph, textures, native targets and behaviour parameters; disable gameplay scripts and retain pause/speed controls.
+
+# 0.25.15
+
+- Reset native animation defaults before sampling so spawn-only transform changes cannot bury the Giant during locomotion or after seeking.
+- Render player bodies from their original bone/bind-pose matrices, using reusable buffers. Remove the center-to-pelvis position guess and Unity BakeMesh offset/scale errors.
+- Suppress every original renderer in native animation copies even when animations or LOD enable it. Exclude radar MapDot animations from new recordings and legacy playback.
+- Draw clickable cyan bookmarks as the same centered 6-by-34 bar used for player deaths. Show a bookmark-saved confirmation at the top right for 3.5 seconds.
+
+# 0.25.14
+
+- Record bookmarks with backtick by default. InputUtils exposes Replay / Add replay bookmark in Controls; otherwise Input.BookmarkKey is configurable. Ignore bookmarks while chatting, using the terminal or menus/viewer. Persist accepted/written counts in small archive manifests and show clickable timeline marks.
+- Use the complete installed player Animator/IK hierarchy, as for enemies, instead of replaying a short learned player pose. Stop learning per-bone player tracks in new default captures. Retain legacy tracks and explicit CaptureBones playback.
+- Preserve the short animation transition by evaluating both poses through the native rig, and feed recorded player view rotation into the native camera-look target.
+- Parent restored skinned meshes to their native renderer transform. Avoid applying a flattened animated mesh offset a second time, which buried monsters and shifted player skins.
+- Display the native game clock in playback and game/recording start times in Details. Save changed direct/indirect sun values at most once per second and interpolate them while seeking/playing; retain sky changes. Older installed-scene captures drive the isolated moon's original timeOfDay sun curves.
+- Upgrade the compact index to LCIX0007 with bookmark times and independent sunlight state. Old indexes rebuild once using the fast metadata scanner; the .lcr schema stays compatible.
+
+# 0.25.13
+
+- Rebuild missing, outdated or damaged replay indexes from record metadata. Avoid decompressing and allocating every future frame's entities/bones and every world's meshes/textures before opening playback. Keep the existing sidecar format and bounded startup windows.
+- Validate complete payloads when their playback window is decoded. Retain strict scanning for inspection callers, cancellation, physical truncation recovery, state carry and record/index consistency checks. Archive duration queries also use metadata scanning.
+
+# 0.25.12
+
+- Keep each enemy's complete native animation hierarchy, IK targets and RigBuilder constraints. Drive its original Animator states and blend-tree parameters manually at replay time; fix frozen Sapsucker legs and the Giant's T pose without adding per-frame bone recording. Suppress cloned gameplay, animation callbacks, audio, colliders and particle emission.
+- Resolve sound clips using the owning enemy/item prefab and serialized clip field/array entry. Avoid selecting another enemy's same-named clip; older action recordings also search within their owning enemy before any global lookup.
+- Restore the original AudioSource attenuation and custom distance curve, spatialize world effects and silence them beyond the original maximum distance. Connected replay uses the retained live player listener; standalone replay uses the spectator camera. Apply maximum-distance suppression to older spatial audio and item drops as well.
+- Decode a 4 MiB startup frame/event window before opening playback, then continue using bounded 48 MiB windows and prefetch. Reuse native prefab/audio lookups instead of repeatedly scanning hierarchies for every effect or world rebuild.
+
+# 0.25.11
+
+- Remove waveform and voice capture. Save installed clip identifiers and native play/stop actions; resolve footsteps, monster, item-use and hazard effects during playback, including automatic looping effects. Older waveform recordings remain readable.
+- Destroy native sound objects when replacing a playback window; prune destroyed actor/render/animation/audio tracking and expired window actor models, and bound native mesh caches to 64 MiB. Reduce frame/event windows to 48 MiB and carry only the latest independent state into later windows. Rebuild older sidecars using LCIX0006. Consume skipped one-shot sounds during fast forwarding to prevent bursts on resume.
+- Reference native item/enemy assets without exporting their mesh, skin or textures at spawn. Restore native bone scales, controllers, UV channels and tangents, repairing Butler, Thumper and Giant skins in matching older recordings. Select native materials by their actual asset identity to avoid shared-name collisions; preserve custom runtime materials.
+- Reconstruct native one-hand/two-hand rig poses, including the game's arm rig constraints; replace the earlier finger-only correction. Preserve real live-game effects/voice and the original player listener while connected replay input stays isolated.
+- Exclude TZP, fear, poison, flashbang, underwater and death-screen filters from world post-processing capture. Ignore personal-filter changes in older replay files while retaining world fog and grading.
+- Hide repeated Loading overlays for entity additions within the same world, reuse known actor visuals, and present quota days as Day 1–3.
+
+# 0.25.10
+
+- Rebuild the one-hand item grip from the installed game's observed `HoldOneHandedItem` finger pose while the player's locomotion controls both arms. This repairs older recordings where the learned one-hand track had captured a two-hand arm pose.
+- Click a visible player or enemy in Freecam to follow them. Mouse wheel changes Freecam movement speed; while following, it continues to change camera distance and enters first person when close.
+- Expand the main and pause menus upward when adding Replay, preserving LethalConfig's row, button spacing and click listeners. Restore only Replay's own position offsets so later mod injections keep their layout; use automatic navigation for the added row.
+- Release the cached playback HUD's menu input lock when playback closes. Reacquire it on resume and avoid restoring stale input state when the cache is evicted, keeping LethalConfig and other game buttons usable after replay playback.
+
+# 0.25.9
+
+- Keep the most recently loaded replay scene and decoded recording in memory after closing playback. Reopening that recording restores its camera, timeline position and world immediately, without a second file read, world build or Loading Replay screen.
+- Hide the parked replay's camera, HUD, installed scenery and audio while the archive or live game is visible. Evict the cache when another recording is selected, the source file changes, the game scene/connection changes or the game exits.
+
+# 0.25.8
+
+- Attach third-person held items to the reconstructed right hand using the installed game's `Item.positionOffset` and `rotationOffset` and the native `ServerItemHolder` placement. Existing recordings that stored the recorder's first-person item pose now show that item in the player's hand from outside; first-person follow restores the recorded view-model pose immediately when the camera changes.
+- Preserve the existing sparse replay format: the hand and Item asset supply the third-person pose without recording another per-frame item transform.
+
+# 0.25.7
+
+- Choose the player's one-hand or two-hand replay pose from the held item's `twoHandedAnimation` flag. Earlier recordings resolve this flag from the installed game item asset; new recordings save the player flag directly.
+- Restore locomotion and the free left arm beneath one-hand item poses. Avoid learning a reusable one-hand track while the game's two-hand layer is still active.
+
+# 0.25.6
+
+- Continue recording a named lobby in its existing archive folder across launches. Reuse its quota folder and allocate a new deadline file suffix without overwriting earlier recordings.
+- Capture short monster spawn states at `EnemyAI.Start`, prefetch their later mesh for playback before the first world snapshot, and retain native mesh/animator facing poses.
+- Capture turret bullet flare subemitters and the turret's aim ray. Show a replay tracer and beam in older recordings when their bullet particle samples are available.
+- Restore a player silhouette on the replay mesh without the broken fullscreen outline pass. Smooth cinematic camera look as well as movement and enforce cursor lock just before rendering.
+
+# 0.25.5
+
+- Reconstruct held scrap between capture samples from its position relative to the holder. New recordings include the holder ID; older recordings can use a nearby player when the match is unambiguous.
+- Record the game's player camera position and rotation for first-person following. Older recordings retain the head/body fallback.
+- Put Replay in the in-game pause menu. While an in-game replay is open, keep the live player's audio listener and voice sources at the player's actual position, and block local gameplay input callbacks.
+- Move Replay Settings below the top dock, scroll its controls, and align the top and bottom bars to the Details panel's 28-pixel side margin.
+- Replace Left Alt with B for cursor toggle; holding right mouse while the cursor is visible temporarily enables replay-camera movement.
+
+# 0.25.4
+
+- Keep the baked player mesh at its recorded size by removing duplicate rig scaling, and align its center with the animated spine.
+- Attach the recorded ship fog-exclusion volume to the moving cabin. With Fog enabled, retain exterior fog inside that volume instead of disabling all cabin fog; turning Fog off still hides both global and local effects.
+
+# 0.25.3
+
+- Narrow the replay dock and bottom bar. Keep Settings, Details and X above; place Play, speed and one Camera selector below. Dead players are dimmed and cannot be selected.
+- Switch a followed player to free camera at the recorded death position, including after seeking past death, and mark that death on the timeline. Place first person at the recorded head bone.
+- Restore landmine visuals from the installed game while the recorded world mesh is unavailable. Render the recorded player bone pose through a bounded baked mesh with refreshed visibility bounds so HDRP shows the body.
+
+# 0.25.2
+
+- Replace the replay dock's Archive button with X. Keep only time and seeking in the bottom bar; click the top controls to play/pause, change speed, choose free/follow camera, and select a player to focus.
+- Add a persisted playback Fog setting, enabled by default. Turning it off hides recorded HDRP fog, local volumetric fog, and fog-named mesh, particle, and installed scenery renderers.
+- Reapply the replay cursor lock and visibility after game updates and UI drawing so movement mode keeps the cursor hidden until the UI cursor is requested.
+
+# 0.25.1
+
+- Show the selected player's body in free and third-person cameras; hide it only when follow zoom enters first person.
+- Hide the turret placeholder when its recorded model is present. Capture its actual `bulletParticles` even when the emitter is a sibling of `TurretScript`, and replay sampled bullets only while firing.
+- Stop adding realtime shadows from lights in older recordings that never saved bake mode. New recordings keep the source light's bake mode, shadow strength and HDRP light/shadow dimmers. Keep the ship's exterior floodlights and sun out of its cabin view.
+- Restore recorded local fog color directly, classify dungeon fog by room bounds, and track changes to HDRP fog, visual environment and shadow settings alongside other sparse post-processing events.
+- Suppress the game's `LethalSponge` fullscreen pass on the detached replay camera: its scene-buffer sampling painted large black patches across surfaces even with the original material and color-fetch setting. Other captured passes remain available; the outline effect needs a separate replay-safe implementation.
+
+# 0.25.0
+
+- Save new recordings under the game's lobby name and show participant names in the archive before playback.
+- Move the replay camera without holding right mouse. Left Alt toggles the UI cursor; the follow camera wheel changes distance and enters first person up close.
+- Restore each recorded renderer's shadow settings and prevent camera fill light shadows from blocking areas incorrectly.
+- Remove empty lobby and quota folders after deleting their final recording.
+
+# 0.24.1
+
+- Keep exterior height fog and the spectator fill light out of the ship cabin so its interior is no longer washed out.
+- Attach native spider fangs to their animated head bone in old recordings and in new captures. Preserve the spider's script-driven mesh root and leg joints as the only extra per-frame bone poses; its other motion still uses the game's Animator states and reusable clip track. Older files use their available native spider track.
+- Settle to a neutral stance when an old player recording lacks an idle track, instead of freezing one stride of a walk clip. Capture settled clips with `Idle` anywhere in their name, including `SpiderIdle`.
+- Add a persistent Cinematic movement setting and C shortcut for smooth replay camera acceleration and deceleration, plus a camera-speed slider. Shift still increases movement speed.
+
+# 0.24.0
+
+- Keep captured spider body meshes even when game visibility temporarily suppresses their renderers. Retry incomplete late actor geometry and scan promptly after a spider spawns a web, tracking the trap as a transient entity with its installed mesh. For older files missing the body, reconstruct its native render mesh and rig from the installed spider prefab.
+- Anchor item lights to moving items, add a small local light for strongly emissive scrap without a native light, and reconstruct that light from material data in older recordings. Cull local lights by spectator distance as items cross indoor boundaries.
+- Keep recorded local fog for generated dungeon rooms and preserve the exterior fog outside the ship cabin.
+- Show errors in the top-right corner for 3.5 seconds, including recording, save, archive and playback failures. Keep the top-left recording status behind `Debug.ShowOverlay` (off by default). During playback, press L to hide or restore the replay UI, including its dock and open panels.
+- Restore the game's active HDRP volume effects, bounded color curves and `LethalSponge` fullscreen outline pass using the recorded shader and outline settings. Save later filter changes only when their blended values change, and apply them at their recorded times. Older recordings use the installed game's outline shader when available.
+- Carry the latest changed value for each HDRP effect across bounded seek windows. The `LCIX0005` sidecar stores effect keys; older sidecars are rebuilt from the recording.
+- Keep an upright fallback pose when an old recording has no idle motion track; capture a settled idle pose for new recordings. Blend adjacent recorded actor poses over 0.18 seconds instead of snapping between clips.
+- Capture short pose tracks for active upper Animator layers, including player spawn and emotes, and give those layers priority during replay. Do not learn a reusable idle or walk while an overlay is active; reject interrupted base loops and record overlay fade-out across the active-weight boundary. Existing recordings without upper-layer poses still rely on a working installed Animator for those actions.
+- Replay observed player and monster bone motion directly from the game's recorded clip output when a controller does not animate the rebuilt rig. Rebind installed controllers after world bones are created for states without an observed track.
+- Store resting item poses once and reconstruct ordinary drops from the game's start/target and sampled fall curve. Record player drop actions and floor impacts as events and play the installed drop sound when no matching audio block was captured. Keep frame transforms for held or irregularly moving items. The `LCIX0004` sidecar carries item-pose state across seek windows.
+
+- Capture and replay each active Animator on an enemy separately. Skin rigs now match the Animator that drives their bones, so monsters with separate adult, baby, mask or effect animation no longer collapse to the first controller. State, parameter and reusable motion-track records carry the Animator's path; older recordings remain readable.
+- Capture changed Animator parameters and apply them to matching installed player and enemy controllers. Choose the dominant weighted clip for controller-free motion tracks and identify each track by state hash. Resolve enemy controllers that share a name by their recorded clip set and paired avatar.
+- Spread entity and effect discovery across frames, cache stable item names, and capture only selected gameplay fields for built-in objects. Extra tracked mod components retain their bounded general field capture.
+- Index installed moon-scene assets in small steps and write stable renderer and terrain references while the dungeon generates. Capture generated geometry after generation completes.
+- Record only active player and enemy Animator layer changes, keeping one bounded rig pose with each skinned mesh. Learn short motion tracks from observed clips, so menu replay can animate an actor even before its original controller has loaded. Per-frame bone capture is off by default, with a one-time migration for existing recording profiles.
+- Omit unchanged moving-scene renderer poses from frames, spread room/LOD visibility discovery across frames, and group late spawned entities into fewer world records.
+- Skip unused player slots and unchanged entity-child renderer poses in frame snapshots, while retaining explicit visibility tombstones for destroyed renderers. Carry prior visual events only from the current map capture set. The `LCIX0004` sidecar distinguishes animation, item poses and visual state; older sidecars are regenerated from the replay file.
+- Tolerate sub-nanosecond JSON rounding differences between replay records and their binary sidecar timestamps.
+
 # 0.23.0
 
 - Reconstruct Unity particle effects with their installed source renderer, material, atlas, mesh and vertex streams instead of combining different effects into a generic white billboard. New frame data retains emitter identity, velocity, lifetime and 3D size/rotation; turret tracers replay their firing loop so short-lived bullets are not missed between samples.

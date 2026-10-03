@@ -26,8 +26,8 @@ namespace LCReplay.Plugin.UI
         private readonly Dictionary<Selectable, bool> _selectableStates = new Dictionary<Selectable, bool>();
         private readonly List<Object> _ownedAssets = new List<Object>();
         private readonly bool _modal;
-        private readonly CursorLockMode _cursorLock;
-        private readonly bool _cursorVisible;
+        private CursorLockMode _cursorLock;
+        private bool _cursorVisible;
         private EventSystem? _eventSystem;
         private EventSystem? _previousEventSystem;
         private GameObject? _previousSelection;
@@ -42,7 +42,7 @@ namespace LCReplay.Plugin.UI
         private MethodInfo? _addGlyph;
         private Texture2D? _fontAtlas;
         private float _nextScan;
-        private bool _disposed;
+        private bool _disposed, _inputReleased;
         public GameObject Root { get; private set; } = null!;
         public RectTransform Rect => (RectTransform)Root.transform;
 
@@ -100,7 +100,7 @@ namespace LCReplay.Plugin.UI
 
         public void Tick()
         {
-            if (_disposed) return;
+            if (_disposed || _inputReleased) return;
             var fontChanged = false;
             foreach (var text in _textValues.Keys.ToArray())
             {
@@ -411,6 +411,39 @@ namespace LCReplay.Plugin.UI
             }
         }
 
+        internal void ReleaseInput()
+        {
+            if (_inputReleased) return;
+            _inputReleased = true;
+            foreach (var pair in _suspended) if (pair.Key != null) pair.Key.enabled = pair.Value;
+            _suspended.Clear();
+            foreach (var pair in _selectableStates) if (pair.Key != null) pair.Key.interactable = pair.Value;
+            _selectableStates.Clear();
+            if (_previousEventSystem != null)
+            {
+                EventSystem.current = _previousEventSystem;
+                if (_previousSelection != null && _previousSelection.activeInHierarchy)
+                    _previousEventSystem.SetSelectedGameObject(_previousSelection);
+            }
+            _previousEventSystem = null;
+            _previousSelection = null;
+            if (_modal) { Cursor.lockState = _cursorLock; Cursor.visible = _cursorVisible; }
+        }
+
+        internal void AcquireInput()
+        {
+            if (_disposed || !_inputReleased) return;
+            _inputReleased = false;
+            _previousEventSystem = EventSystem.current;
+            _previousSelection = _previousEventSystem != null ? _previousEventSystem.currentSelectedGameObject : null;
+            _cursorLock = Cursor.lockState;
+            _cursorVisible = Cursor.visible;
+            if (_modal) SuspendOtherInput();
+            SuspendOtherSelectables();
+            if (_eventSystem != null) EventSystem.current = _eventSystem;
+            _nextScan = 0;
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -424,16 +457,7 @@ namespace LCReplay.Plugin.UI
             }
             finally
             {
-                foreach (var pair in _suspended) if (pair.Key != null) pair.Key.enabled = pair.Value;
-                _suspended.Clear();
-                foreach (var pair in _selectableStates) if (pair.Key != null) pair.Key.interactable = pair.Value;
-                _selectableStates.Clear();
-                if (_previousEventSystem != null)
-                {
-                    EventSystem.current = _previousEventSystem;
-                    if (_previousSelection != null && _previousSelection.activeInHierarchy) _previousEventSystem.SetSelectedGameObject(_previousSelection);
-                }
-                if (_modal) { Cursor.lockState = _cursorLock; Cursor.visible = _cursorVisible; }
+                ReleaseInput();
             }
         }
     }

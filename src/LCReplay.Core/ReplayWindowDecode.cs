@@ -87,8 +87,12 @@ namespace LCReplay.Core
                 var record = ReplayFormat.Decode(item.Payload!, item.Entry.Expanded, cancellation);
                 item.Payload = null;
                 ReplayValidation.Record(record, limits);
-                if (record.Kind != item.Entry.Kind || record.Time != item.Entry.Time ||
-                    (record.World?.CaptureSetId ?? "") != item.Entry.CaptureSetId)
+                // Newtonsoft's default float formatting can shorten the last
+                // decimal digits of a Double written in the binary sidecar.
+                if (record.Kind != item.Entry.Kind || Math.Abs(record.Time - item.Entry.Time) > 1e-9 ||
+                    (record.World?.CaptureSetId ?? "") != item.Entry.CaptureSetId ||
+                    ReplayEventIndex.Category(record.Event) != item.Entry.EventCategory ||
+                    ReplayEventIndex.Key(record.Event) != item.Entry.EventKey)
                     throw new InvalidDataException("Replay record disagrees with its index.");
                 item.Record = record;
                 if (reuseWorlds && record.World != null)

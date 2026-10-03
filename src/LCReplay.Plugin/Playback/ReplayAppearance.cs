@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using LCReplay.Core;
 using UnityEngine;
@@ -15,6 +16,7 @@ namespace LCReplay.Plugin.Playback
         private readonly Dictionary<string, Material> materials = new Dictionary<string, Material>(StringComparer.Ordinal);
         private readonly Dictionary<string, MaterialSnapshot> particleMaterials = new Dictionary<string, MaterialSnapshot>(StringComparer.Ordinal);
         private readonly Dictionary<string, Material> installedMaterials = new Dictionary<string, Material>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Material> installedInstances = new Dictionary<string, Material>(StringComparer.Ordinal);
         private readonly Dictionary<string, Material> particleSourceCopies = new Dictionary<string, Material>(StringComparer.Ordinal);
         private static readonly string[] MainMapNames = { "_BaseColorMap", "_UnlitColorMap", "_MainTex", "_BaseMap", "_BaseColorTexture" };
         private static readonly MethodInfo? HdrpValidator = Type.GetType("UnityEngine.Rendering.HighDefinition.HDMaterial, Unity.RenderPipelines.HighDefinition.Runtime")?
@@ -27,16 +29,27 @@ namespace LCReplay.Plugin.Playback
         internal IEnumerable<float> BuildSteps(WorldSnapshot world, Shader shader)
         {
             IndexInstalledMaterials();
+            var recordedTextures = world.Textures.ToDictionary(texture => texture.Id, StringComparer.Ordinal);
+            var namedTextures = Resources.FindObjectsOfTypeAll<Texture>().Where(texture => texture &&
+                !texture.name.StartsWith("Replay ", StringComparison.Ordinal)).GroupBy(texture => texture.name, StringComparer.Ordinal)
+                .Where(group => group.Count() == 1).ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+            Texture? RecordedMap(Texture? native, string id)
+            {
+                if (!recordedTextures.TryGetValue(id, out var captured) || captured.Name.Length == 0) return native;
+                if (native && native!.name == captured.Name) return native;
+                return namedTextures.TryGetValue(captured.Name, out var installed) ? installed : null;
+            }
             var originals = new Dictionary<string, Material>(StringComparer.Ordinal);
             var requiredTextures = new HashSet<string>(StringComparer.Ordinal);
             foreach (var snapshot in world.Materials)
             {
-                var original = FindInstalledMaterial(snapshot.Name, snapshot.ShaderName);
+                var original = installedInstances.TryGetValue(snapshot.Id, out var exactNative) && exactNative
+                    ? exactNative : FindInstalledMaterial(snapshot.Name, snapshot.ShaderName);
                 if (original) originals[snapshot.Id] = original!;
-                if (snapshot.TextureId.Length != 0 && !MainMap(original)) requiredTextures.Add(snapshot.TextureId);
+                if (snapshot.TextureId.Length != 0 && !RecordedMap(MainMap(original), snapshot.TextureId)) requiredTextures.Add(snapshot.TextureId);
                 foreach (var property in snapshot.Properties)
                     if (property.Kind == "texture" && property.TextureId.Length != 0 &&
-                        !GetMap(original, property.Name)) requiredTextures.Add(property.TextureId);
+                        !RecordedMap(GetMap(original, property.Name), property.TextureId)) requiredTextures.Add(property.TextureId);
             }
             Dictionary<string, Shader>? loadedShaders = null;
             var alphaCutoffs = new Dictionary<string, float>(StringComparer.Ordinal);
@@ -79,6 +92,9 @@ namespace LCReplay.Plugin.Playback
             yield return .02f;
             foreach (var snapshot in world.Textures)
             {
+                // A prepared map may already own this decoded texture. Keep its
+                // Unity object when a later world pass adds native actor assets.
+                if (textures.ContainsKey(snapshot.Id)) { completed++; continue; }
                 // A loaded game material already owns the full-resolution maps and
                 // importer state. Do not decode/upload a PNG that no renderer needs.
                 if (!requiredTextures.Contains(snapshot.Id)) { completed++; continue; }
@@ -91,7 +107,8 @@ namespace LCReplay.Plugin.Playback
                     if (!ground && alphaCutoffs.TryGetValue(snapshot.Id, out var cutoff)) PreserveAlphaCoverage(texture, cutoff);
                     texture.Apply(false, true);
                     texture.wrapMode = TextureWrapMode.Repeat;
-                    texture.filterMode = ground ? FilterMode.Bilinear : FilterMode.Trilinear;
+                    texture.filterMode = snapshot.FilterMode >= 0 ? (FilterMode)snapshot.FilterMode :
+                        ground ? FilterMode.Bilinear : FilterMode.Trilinear;
                     texture.anisoLevel = ground || vegetationTextures.Contains(snapshot.Id) ? 8 : 4;
                     texture.mipMapBias = vegetationTextures.Contains(snapshot.Id) && !ground ? -1.5f : -0.15f;
                     textures[snapshot.Id] = texture;
@@ -101,6 +118,7 @@ namespace LCReplay.Plugin.Playback
             }
             foreach (var snapshot in world.Materials)
             {
+                if (materials.ContainsKey(snapshot.Id)) { completed++; continue; }
                 originals.TryGetValue(snapshot.Id, out var original);
                 var shaderName = snapshot.ShaderName ?? "";
                 var validName = !string.IsNullOrWhiteSpace(shaderName) &&
@@ -145,7 +163,7 @@ namespace LCReplay.Plugin.Playback
                             case "vector" when value.Length == 4:
                                 material.SetVector(property.Name, new Vector4(value[0], value[1], value[2], value[3])); break;
                             case "texture":
-                                var nativeMap = GetMap(original, property.Name);
+                                var nativeMap = RecordedMap(GetMap(original, property.Name), property.TextureId);
                                 if (nativeMap) material.SetTexture(property.Name, nativeMap);
                                 else if (textures.TryGetValue(property.TextureId, out var map)) material.SetTexture(property.Name, map);
                                 material.SetTextureScale(property.Name, new Vector2(property.TextureScaleOffset[0], property.TextureScaleOffset[1]));
@@ -156,13 +174,15 @@ namespace LCReplay.Plugin.Playback
                     catch { /* Unsupported property combinations fall back to the other recorded values. */ }
                 }
                 foreach (var keyword in snapshot.Keywords) material.EnableKeyword(keyword);
-                if (!MainMap(original) && textures.TryGetValue(snapshot.TextureId, out var texture))
+                var mainTexture = RecordedMap(MainMap(original), snapshot.TextureId);
+                if (!mainTexture && textures.TryGetValue(snapshot.TextureId, out var decoded)) mainTexture = decoded;
+                if (mainTexture && mainTexture != MainMap(original))
                 {
                     var uv = snapshot.TextureScaleOffset;
                     foreach (var property in new[] { "_UnlitColorMap", "_BaseColorMap", "_MainTex", "_BaseMap" })
                     {
                         if (!material.HasProperty(property)) continue;
-                        material.SetTexture(property, texture);
+                        material.SetTexture(property, mainTexture);
                         material.SetTextureScale(property, new Vector2(uv[0], uv[1]));
                         material.SetTextureOffset(property, new Vector2(uv[2], uv[3]));
                     }
@@ -206,11 +226,13 @@ namespace LCReplay.Plugin.Playback
         private void IndexInstalledMaterials()
         {
             installedMaterials.Clear();
+            installedInstances.Clear();
             foreach (var material in Resources.FindObjectsOfTypeAll<Material>())
             {
                 if (!material || !material.shader || !material.shader.isSupported ||
                     material.name.StartsWith("Replay ", StringComparison.Ordinal) ||
                     material.name.StartsWith("LC Replay", StringComparison.Ordinal)) continue;
+                installedInstances["native-prefab:" + material.GetInstanceID()] = material;
                 var exact = MaterialKey(material.name, material.shader.name);
                 if (!installedMaterials.ContainsKey(exact)) installedMaterials.Add(exact, material);
                 var shared = MaterialKey(SharedName(material.name), material.shader.name);
@@ -341,7 +363,7 @@ namespace LCReplay.Plugin.Playback
             foreach (var material in particleSourceCopies.Values) if (material) Object.Destroy(material);
             foreach (var texture in textures.Values) if (texture) Object.Destroy(texture);
             materials.Clear(); textures.Clear();
-            particleMaterials.Clear(); particleSourceCopies.Clear(); installedMaterials.Clear();
+            particleMaterials.Clear(); particleSourceCopies.Clear(); installedMaterials.Clear(); installedInstances.Clear();
         }
     }
 }

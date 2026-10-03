@@ -14,9 +14,13 @@ namespace LCReplay.Plugin.Capture
         private readonly Dictionary<string, TrackedRenderer> renderers = new Dictionary<string, TrackedRenderer>(StringComparer.Ordinal);
         private readonly Dictionary<int, SprayState> decals = new Dictionary<int, SprayState>();
         private double nextScan;
+        private double scanTime;
+        private readonly List<KeyValuePair<string, TrackedRenderer>> scanOrder = new List<KeyValuePair<string, TrackedRenderer>>();
+        private IEnumerator<ReplayEvent?>? scan;
 
         internal void Reset()
         {
+            scan?.Dispose(); scan = null; scanOrder.Clear();
             renderers.Clear();
             decals.Clear();
             nextScan = 0;
@@ -27,21 +31,39 @@ namespace LCReplay.Plugin.Capture
             if (!renderer || renderers.Count >= 8192 || renderers.ContainsKey(id)) return;
             renderers.Add(id, new TrackedRenderer(renderer, asset, cullerManaged,
                 renderer.gameObject.activeInHierarchy && (cullerManaged || renderer.enabled)));
+            scanOrder.Add(new KeyValuePair<string, TrackedRenderer>(id, renderers[id]));
         }
 
         internal IEnumerable<ReplayEvent> Scan(double now, string captureSetId)
         {
             if (captureSetId.Length == 0 || now < nextScan) yield break;
-            nextScan = now + .2;
-            foreach (var pair in renderers)
+            scanTime = now;
+            scan ??= ScanSteps(now, captureSetId).GetEnumerator();
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            for (var count = 0; count < 32; count++)
             {
+                if (!scan.MoveNext())
+                { scan.Dispose(); scan = null; nextScan = now + .2; yield break; }
+                if (scan.Current != null) yield return scan.Current;
+                if ((System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 /
+                    System.Diagnostics.Stopwatch.Frequency >= .4) yield break;
+            }
+        }
+
+        private IEnumerable<ReplayEvent?> ScanSteps(double now, string captureSetId)
+        {
+            var rendererCount = scanOrder.Count;
+            for (var rendererIndex = 0; rendererIndex < rendererCount; rendererIndex++)
+            {
+                yield return null;
+                var pair = scanOrder[rendererIndex];
                 var tracked = pair.Value;
                 var renderer = tracked.Renderer;
                 var visible = renderer && renderer.gameObject.activeInHierarchy &&
                     (tracked.CullerManaged || renderer.enabled);
                 if (visible == tracked.Visible) continue;
                 tracked.Visible = visible;
-                yield return new ReplayEvent { Time = now, Category = "visual", Name = "renderer",
+                yield return new ReplayEvent { Time = scanTime, Category = "visual", Name = "renderer",
                     EntityId = pair.Key, Data = new Dictionary<string, string>
                     {
                         ["set"] = captureSetId, ["asset"] = tracked.Asset ? "true" : "false",
@@ -54,13 +76,14 @@ namespace LCReplay.Plugin.Capture
             var count = Math.Min(list.Count, 1000);
             for (var index = 0; index < count; index++)
             {
+                yield return null;
                 if (!(list[index] is GameObject obj)) continue;
                 if (!obj)
                 {
                     if (decals.TryGetValue(index, out var vanished) && vanished.Active)
                     {
                         decals[index] = new SprayState(false, Vector3.zero, Quaternion.identity, 0, "");
-                        yield return new ReplayEvent { Time = now, Category = "visual", Name = "spray",
+                        yield return new ReplayEvent { Time = scanTime, Category = "visual", Name = "spray",
                             EntityId = index.ToString(CultureInfo.InvariantCulture), Data = new Dictionary<string, string>
                             { ["set"] = captureSetId, ["visible"] = "false" } };
                     }
@@ -83,7 +106,7 @@ namespace LCReplay.Plugin.Capture
                 if (!active)
                 {
                     if (existed && previous.Active)
-                        yield return new ReplayEvent { Time = now, Category = "visual", Name = "spray",
+                        yield return new ReplayEvent { Time = scanTime, Category = "visual", Name = "spray",
                             EntityId = index.ToString(CultureInfo.InvariantCulture), Data = new Dictionary<string, string>
                             { ["set"] = captureSetId, ["visible"] = "false" } };
                     continue;
@@ -96,7 +119,7 @@ namespace LCReplay.Plugin.Capture
                 if (material != null && material)
                     foreach (var property in new[] { "_BaseColor", "_Color" })
                         if (material!.HasProperty(property)) { color = material.GetColor(property); break; }
-                yield return new ReplayEvent { Time = now, Category = "visual", Name = "spray",
+                yield return new ReplayEvent { Time = scanTime, Category = "visual", Name = "spray",
                     EntityId = index.ToString(CultureInfo.InvariantCulture), Data = new Dictionary<string, string>
                     {
                         ["set"] = captureSetId, ["visible"] = "true",

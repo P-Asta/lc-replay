@@ -1,4 +1,7 @@
 using System;
+using System.Buffers;
+using System.Threading.Tasks;
+using Unity.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using LCReplay.Core;
@@ -9,7 +12,7 @@ using Object = UnityEngine.Object;
 namespace LCReplay.Plugin.Capture
 {
     // Per-world deduplication keeps PNGs out of per-frame samples. No assets are fetched or distributed with the plugin.
-    internal sealed class AppearanceCapture
+    internal sealed class AppearanceCapture : IDisposable
     {
         private const int MaxTextureBytes = 32 * 1024 * 1024;
         private const int MaxIndividualTextureBytes = 5 * 1024 * 1024;
@@ -80,6 +83,8 @@ namespace LCReplay.Plugin.Capture
                 var snapshot = new MaterialSnapshot { Id = "m" + key, Name = GameAccess.Scalar(material.name) ?? "",
                     ShaderName = material.shader ? GameAccess.Scalar(material.shader.name) ?? "" : "" };
                 var ground = RenderVisibilityPolicy.IsGroundSurface(rendererName) || RenderVisibilityPolicy.IsGroundSurface(material.name);
+                var architecture = RenderVisibilityPolicy.IsArchitectureSurface(rendererName) ||
+                    RenderVisibilityPolicy.IsArchitectureSurface(material.name);
                 var property = TextureProperty(material);
                 var color = Color.white;
                 foreach (var candidate in new[] { "_BaseColor", "_UnlitColor", "_Color" })
@@ -89,7 +94,7 @@ namespace LCReplay.Plugin.Capture
                 {
                     var texture = material.GetTexture(property);
                     if (texture) snapshot.TextureId = CaptureTexture(texture,
-                        ground ? 2048 : skinned || IsNaturalSurface(rendererName, material.name) ? 1024 : 512);
+                        ground ? 2048 : architecture || skinned || IsNaturalSurface(rendererName, material.name) ? 1024 : 512);
                     var scale = material.GetTextureScale(property); var offset = material.GetTextureOffset(property);
                     snapshot.TextureScaleOffset = new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
                 }
@@ -102,12 +107,12 @@ namespace LCReplay.Plugin.Capture
                 if (!GameAccess.Finite(snapshot.Cutoff)) snapshot.Cutoff = 0.5f;
                 snapshot.RenderQueue = Mathf.Clamp(material.renderQueue, -1, 5000);
                 snapshot.Keywords = material.shaderKeywords.Where(keyword => keyword.Length <= 128).Take(64).ToList();
-                CaptureProperties(material, snapshot, ground);
+                CaptureProperties(material, snapshot, ground, architecture);
                 world.Materials.Add(snapshot); materials[key] = snapshot.Id; geometry.MaterialIds.Add(snapshot.Id);
             }
         }
 
-        private void CaptureProperties(Material material, MaterialSnapshot snapshot, bool ground)
+        private void CaptureProperties(Material material, MaterialSnapshot snapshot, bool ground, bool architecture)
         {
             var shader = material.shader;
             if (!shader) return;
@@ -152,6 +157,7 @@ namespace LCReplay.Plugin.Capture
                                 name.IndexOf("detail", StringComparison.OrdinalIgnoreCase) >= 0;
                             entry.Kind = "texture"; entry.TextureId = CaptureTexture(texture,
                                 ground ? colorMap ? 2048 : 1024 :
+                                architecture ? colorMap || surfaceMap ? 1024 : 512 :
                                 IsNaturalSurface(material.name, name) || colorMap || surfaceMap ? 512 : 256);
                             var scale = material.GetTextureScale(name); var offset = material.GetTextureOffset(name);
                             entry.TextureScaleOffset = new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
@@ -181,57 +187,155 @@ namespace LCReplay.Plugin.Capture
         private static bool FiniteColor(Color color) => GameAccess.Finite(color.r) && GameAccess.Finite(color.g) &&
             GameAccess.Finite(color.b) && GameAccess.Finite(color.a);
 
+        private sealed class TextureWork
+        {
+            internal Texture Source = null!;
+            internal string Id = "", Name = "";
+            internal int Edge, Width, Height;
+            internal bool Linear, Requested, Failed;
+            internal int FilterMode;
+            internal AsyncGPUReadbackRequest Request;
+            internal Task<byte[]>? Png;
+        }
+        private readonly Queue<TextureWork> textureWork = new Queue<TextureWork>();
+        private TextureWork? activeTexture;
         private string CaptureTexture(Texture source, int requestedEdge)
         {
-            int key = source.GetInstanceID();
+            var key = source.GetInstanceID();
             if (textures.TryGetValue(key, out var known)) return known;
-            textures[key] = "";
-            if (world.Textures.Count >= 256 || textureBytes >= MaxTextureBytes || source.width < 1 || source.height < 1)
-            { OmittedTextures++; return ""; }
-            var old = RenderTexture.active;
-            bool oldSrgbWrite = GL.sRGBWrite;
-            var linear = !source.isDataSRGB;
+            if (textures.Count >= 256 || textureBytes >= MaxTextureBytes || source.width < 1 || source.height < 1)
+            { textures[key] = ""; OmittedTextures++; return ""; }
+            var id = "t" + key; textures[key] = id;
+            textureWork.Enqueue(new TextureWork { Source = source, Id = id, Name = GameAccess.Scalar(source.name) ?? "",
+                Edge = Math.Min(2048, Math.Max(256, requestedEdge)), Linear = !source.isDataSRGB,
+                FilterMode = (int)source.filterMode });
+            return id;
+        }
+        // One in-flight readback/encode keeps raw texture memory bounded. Capture
+        // only registers references; finalization resumes here on later frames.
+        internal bool StepTextures()
+        {
+            if (activeTexture == null)
+            {
+                if (textureWork.Count == 0) return true;
+                activeTexture = textureWork.Dequeue();
+            }
+            var work = activeTexture;
             try
             {
-                // Keep a high-resolution base map for close spectator views. If a
-                // complex PNG would exceed either bound, fall back by one mip-sized
-                // step instead of losing the material texture altogether.
-                for (var edge = Math.Min(2048, Math.Max(256, requestedEdge)); edge >= 256; edge /= 2)
+                if (work.Png != null)
                 {
-                    RenderTexture? temporary = null;
-                    Texture2D? copy = null;
-                    try
+                    if (!work.Png.IsCompleted) return false;
+                    var png = work.Png.GetAwaiter().GetResult();
+                    if (png.Length == 0 || png.Length > MaxIndividualTextureBytes || png.Length > MaxTextureBytes - textureBytes)
                     {
-                        float ratio = Math.Min(1f, (float)edge / Math.Max(source.width, source.height));
-                        int width = Math.Max(1, Mathf.RoundToInt(source.width * ratio));
-                        int height = Math.Max(1, Mathf.RoundToInt(source.height * ratio));
-                        temporary = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32,
-                            linear ? RenderTextureReadWrite.Linear : RenderTextureReadWrite.sRGB);
-                        GL.sRGBWrite = !linear && QualitySettings.activeColorSpace == ColorSpace.Linear;
-                        Graphics.Blit(source, temporary);
-                        RenderTexture.active = temporary;
-                        copy = new Texture2D(width, height, TextureFormat.RGBA32, false, linear);
-                        copy.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
-                        copy.Apply(false, false);
-                        var png = ImageConversion.EncodeToPNG(copy);
-                        if (png == null || png.Length == 0 || png.Length > MaxIndividualTextureBytes ||
-                            textureBytes + png.Length > MaxTextureBytes) continue;
-                        var snapshot = new TextureSnapshot { Id = "t" + key, Width = width, Height = height, Linear = linear, Png = png };
-                        world.Textures.Add(snapshot); textureBytes += png.Length; textures[key] = snapshot.Id;
-                        return snapshot.Id;
+                        if (work.Edge > 256) { work.Edge /= 2; work.Requested = false; work.Png = null; return false; }
+                        DropTexture(work); return false;
                     }
-                    finally
+                    world.Textures.Add(new TextureSnapshot { Id = work.Id, Name = work.Name, Width = work.Width,
+                        Height = work.Height, Linear = work.Linear, FilterMode = work.FilterMode, Png = png });
+                    textureBytes += png.Length; activeTexture = null; return false;
+                }
+                if (work.Requested)
+                {
+                    if (!work.Request.done) return false;
+                    if (work.Failed || work.Request.hasError) DropTexture(work);
+                    return false;
+                }
+                if (!work.Source || textureBytes >= MaxTextureBytes) { DropTexture(work); return false; }
+                var ratio = Math.Min(1f, (float)work.Edge / Math.Max(work.Source.width, work.Source.height));
+                work.Width = Math.Max(1, Mathf.RoundToInt(work.Source.width * ratio));
+                work.Height = Math.Max(1, Mathf.RoundToInt(work.Source.height * ratio));
+                var oldSrgb = GL.sRGBWrite;
+                var target = RenderTexture.GetTemporary(work.Width, work.Height, 0, RenderTextureFormat.ARGB32,
+                    work.Linear ? RenderTextureReadWrite.Linear : RenderTextureReadWrite.sRGB);
+                var handedOff = false;
+                try
+                {
+                    GL.sRGBWrite = !work.Linear && QualitySettings.activeColorSpace == ColorSpace.Linear;
+                    Graphics.Blit(work.Source, target);
+                    if (SystemInfo.supportsAsyncGPUReadback)
                     {
-                        RenderTexture.active = old;
-                        if (temporary) RenderTexture.ReleaseTemporary(temporary);
-                        if (copy) Object.Destroy(copy);
+                        // The callback owns the surface until the GPU is finished,
+                        // including cancellation of this world capture job.
+                        work.Request = AsyncGPUReadback.Request(target, 0, TextureFormat.RGBA32, request =>
+                        {
+                            try
+                            {
+                                if (request.hasError) work.Failed = true;
+                                else EncodePixels(work, request.GetData<byte>());
+                            }
+                            catch { work.Failed = true; }
+                            finally { RenderTexture.ReleaseTemporary(target); }
+                        });
+                        handedOff = true; work.Requested = true;
+                    }
+                    else
+                    {
+                        // Older GPU fallback still moves PNG compression off the
+                        // game thread. Only its readback remains indivisible.
+                        var oldActive = RenderTexture.active;
+                        var copy = new Texture2D(work.Width, work.Height, TextureFormat.RGBA32, false, work.Linear);
+                        try
+                        {
+                            RenderTexture.active = target;
+                            copy.ReadPixels(new Rect(0, 0, work.Width, work.Height), 0, 0, false);
+                            EncodePixels(work, copy.GetRawTextureData<byte>());
+                        }
+                        finally { RenderTexture.active = oldActive; Object.Destroy(copy); }
                     }
                 }
+                finally { GL.sRGBWrite = oldSrgb; if (!handedOff) RenderTexture.ReleaseTemporary(target); }
             }
-            catch { /* Keep the remaining appearance even if one GPU texture cannot be read. */ }
-            finally { RenderTexture.active = old; GL.sRGBWrite = oldSrgbWrite; }
-            OmittedTextures++;
-            return "";
+            catch { DropTexture(work); }
+            return false;
+        }
+        private static void EncodePixels(TextureWork work, NativeArray<byte> raw)
+        {
+            // Readback memory lasts only one frame. Copy it in the completion
+            // callback even if world maintenance will resume several frames later.
+            var pixels = ArrayPool<byte>.Shared.Rent(raw.Length);
+            try { NativeArray<byte>.Copy(raw, 0, pixels, 0, raw.Length); }
+            catch { ArrayPool<byte>.Shared.Return(pixels); throw; }
+            work.Png = Task.Run(() => { try { return ReplayPng.EncodeRgba(pixels, work.Width, work.Height); }
+                finally { ArrayPool<byte>.Shared.Return(pixels); } });
+            work.Png.ContinueWith(task => { _ = task.Exception; }, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously);
+        }
+        private void DropTexture(TextureWork work)
+        {
+            foreach (var material in world.Materials)
+            {
+                if (material.TextureId == work.Id) material.TextureId = "";
+                foreach (var property in material.Properties)
+                    if (property.TextureId == work.Id) property.TextureId = "";
+            }
+            OmittedTextures++; activeTexture = null;
+        }
+        public void Dispose()
+        {
+            // No WaitAllRequests/Task.Wait on the game frame. Callbacks release
+            // submitted GPU surfaces; encoder finally blocks return pooled bytes.
+            textureWork.Clear(); activeTexture = null;
+        }
+        internal void FinishAvailable()
+        {
+            // Stop without waiting on GPU/CPU work. Completed geometry and
+            // textures remain usable; unfinished maps retain material colors.
+            if (activeTexture?.Png?.Status == TaskStatus.RanToCompletion)
+            {
+                var work = activeTexture; var png = work.Png.Result;
+                if (png.Length > 0 && png.Length <= MaxIndividualTextureBytes && png.Length <= MaxTextureBytes - textureBytes)
+                    world.Textures.Add(new TextureSnapshot { Id = work.Id, Name = work.Name, Width = work.Width,
+                        Height = work.Height, Linear = work.Linear, FilterMode = work.FilterMode, Png = png });
+            }
+            var complete = new HashSet<string>(world.Textures.Select(texture => texture.Id), StringComparer.Ordinal);
+            foreach (var material in world.Materials)
+            {
+                if (!complete.Contains(material.TextureId)) material.TextureId = "";
+                foreach (var property in material.Properties)
+                    if (!complete.Contains(property.TextureId)) property.TextureId = "";
+            }
+            Dispose();
         }
 
         private static string? TextureProperty(Material material)

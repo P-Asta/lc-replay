@@ -70,6 +70,7 @@ namespace LCReplay.Core.Archive
 
     public sealed class ArchiveDay : ArchiveFolder
     {
+        public List<string> Members { get; set; } = new List<string>();
         // New quota recordings live directly under the quota folder as
         // <remaining-deadline>.lcr. Empty means the legacy directory layout.
         public string RecordingStem { get; set; } = "";
@@ -85,6 +86,7 @@ namespace LCReplay.Core.Archive
         public int? DeadlineDaysTotal { get; set; }
         public int? QuotaCycle { get; set; }
         [JsonIgnore] public List<ArchiveSegment> Segments { get; set; } = new List<ArchiveSegment>();
+        [JsonIgnore] public long BookmarkCount => Segments.Sum(segment => (long)segment.BookmarkCount);
     }
 
     public sealed class ArchiveSegment
@@ -102,6 +104,7 @@ namespace LCReplay.Core.Archive
         public string Status { get; set; } = "recording";
         public string Error { get; set; } = "";
         public bool HeaderReadable { get; set; } = true;
+        public int BookmarkCount { get; set; }
         [JsonIgnore] public Dictionary<string, string> Metadata { get; set; } = new Dictionary<string, string>();
     }
 

@@ -46,6 +46,13 @@ namespace LCReplay.Core
                     if (r.Event!.Time != r.Time) Fail("Event and record timestamps disagree.");
                     String(r.Event.Category, l); String(r.Event.Name, l); String(r.Event.EntityId, l);
                     Dictionary(r.Event.Data, l);
+                    if (r.Event.AnimationTrack != null) AnimationTrack(r.Event, l);
+                    if (r.Event.ItemMotion != null) ItemMotion(r.Event, l);
+                    if (r.Event.PostProcess != null)
+                    {
+                        if (r.Event.Category != "postfx" || r.Event.Name != "component") Fail("Invalid post-processing event.");
+                        ValidateEnvironmentComponent(r.Event.PostProcess, l);
+                    }
                     break;
                 case "world":
                     if (r.World == null || r.Header != null || r.Frame != null || r.Event != null)
@@ -138,7 +145,19 @@ namespace LCReplay.Core
                 if (e == null) Fail("Null entity.");
                 String(e.Id, l); String(e.Kind, l); String(e.Name, l);
                 if (e.Id.Length == 0 || !ids.Add(e.Id)) Fail("Entity identifiers must be nonempty and unique per frame.");
-                Vector(e.Position); Vector(e.Scale); Rotation(e.Rotation); Dictionary(e.State, l);
+                if (e.PoseFromItemEvents && e.Kind != "item") Fail("Only item poses may be reconstructed from item events.");
+                Vector(e.Position); Vector(e.Scale); Rotation(e.Rotation);
+                if (e.ViewRotation.HasValue)
+                {
+                    if (e.Kind != "player") Fail("Only players can carry view rotation.");
+                    Rotation(e.ViewRotation.Value);
+                }
+                if (e.ViewPosition.HasValue)
+                {
+                    if (e.Kind != "player") Fail("Only players can carry view position.");
+                    Vector(e.ViewPosition.Value);
+                }
+                Dictionary(e.State, l);
                 if (e.Bones == null || e.Bones.Count > l.MaxBonesPerEntity) Fail("Bone count exceeds limit.");
                 var paths = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var b in e.Bones!)
@@ -164,6 +183,8 @@ namespace LCReplay.Core
         {
             String(w.Scene, l);
             String(w.CaptureSetId, l); String(w.Layer, l);
+            if (!Finite(w.CaptureCompletedAt) || w.CaptureCompletedAt < 0 ||
+                w.CaptureCompletedAt > l.MaxDurationSeconds) Fail("Invalid world capture completion time.");
             String(w.AssetScene, l); String(w.AssetGameVersion, l);
             if (w.AssetRendererPaths == null || w.AssetTerrainPaths == null ||
                 w.AssetRendererPaths.Count + w.AssetTerrainPaths.Count > 4096 ||
@@ -205,9 +226,33 @@ namespace LCReplay.Core
             if (w.Environment != null)
             {
                 Floats(w.Environment.AmbientSkyColor, 4, false);
-                if (w.Environment.Components == null || w.Environment.Components.Count > 16) Fail("Environment component count exceeds limit.");
+                if (w.Environment.Components == null || w.Environment.Components.Count > 32) Fail("Environment component count exceeds limit.");
+                if (w.Environment.CustomPasses == null || w.Environment.CustomPasses.Count > 4) Fail("Environment custom pass count exceeds limit.");
+                foreach (var pass in w.Environment.CustomPasses!)
+                {
+                    if (pass == null) Fail("Null environment custom pass.");
+                    String(pass.Name, l); String(pass.ShaderName, l); String(pass.MaterialName, l);
+                    String(pass.InjectionPoint, l); String(pass.MaterialPassName, l);
+                    if (pass.Name.Length > 96 || pass.ShaderName.Length == 0 || pass.ShaderName.Length > 128 ||
+                        pass.MaterialName.Length > 128 ||
+                        pass.InjectionPoint.Length > 64 || pass.MaterialPassName.Length > 64 ||
+                        pass.Properties == null || pass.Properties.Count > 32) Fail("Invalid environment custom pass.");
+                    foreach (var property in pass.Properties!)
+                    {
+                        if (property == null) Fail("Null environment custom pass property.");
+                        String(property.Name, l); String(property.Kind, l); String(property.Text, l);
+                        if (property.Name.Length == 0 || property.Name.Length > 96 ||
+                            property.Values == null || property.Values.Length > 4 ||
+                            property.CurveKeys == null || property.CurveKeys.Length != 0 ||
+                            !new[] { "float", "color", "vector4" }.Contains(property.Kind)) Fail("Invalid environment custom pass property.");
+                        foreach (var value in property.Values) if (!Finite(value)) Fail("Non-finite custom pass property.");
+                    }
+                }
                 if (w.Environment.SkyFaces == null || (w.Environment.SkyFaces.Count != 0 && w.Environment.SkyFaces.Count != 6))
                     Fail("Environment cubemap needs six faces.");
+                if (w.Environment.SkyFaceEncoding != "" && w.Environment.SkyFaceEncoding != "rgbe8" ||
+                    w.Environment.SkyFaceEncoding == "rgbe8" && w.Environment.SkyFaces.Count != 6)
+                    Fail("Invalid sky face encoding.");
                 long skyBytes = 0;
                 foreach (var face in w.Environment.SkyFaces!)
                 {
@@ -222,21 +267,8 @@ namespace LCReplay.Core
                 var types = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var component in w.Environment.Components!)
                 {
-                    if (component == null) Fail("Null environment component.");
-                    String(component.Type, l);
-                    if (component.Type.Length == 0 || component.Type.Length > 96 || !types.Add(component.Type) ||
-                        component.Parameters == null || component.Parameters.Count > 80) Fail("Invalid environment component.");
-                    var names = new HashSet<string>(StringComparer.Ordinal);
-                    foreach (var parameter in component.Parameters)
-                    {
-                        if (parameter == null) Fail("Null environment parameter.");
-                        String(parameter.Name, l); String(parameter.Kind, l); String(parameter.Text, l);
-                        if (parameter.Name.Length == 0 || parameter.Name.Length > 96 || !names.Add(parameter.Name) ||
-                            parameter.Values == null || parameter.Values.Length > 4 ||
-                            !new[] { "float", "int", "bool", "color", "vector2", "vector3", "vector4", "enum" }.Contains(parameter.Kind))
-                            Fail("Invalid environment parameter.");
-                        foreach (var value in parameter.Values) if (!Finite(value)) Fail("Non-finite environment parameter.");
-                    }
+                    ValidateEnvironmentComponent(component, l);
+                    if (!types.Add(component.Type)) Fail("Duplicate environment component.");
                 }
             }
             if (w.Lights == null || w.Lights.Count > 512) Fail("World light count exceeds limit.");
@@ -244,14 +276,21 @@ namespace LCReplay.Core
             foreach (var light in w.Lights!)
             {
                 if (light == null) Fail("Null light.");
-                String(light.Id, l); String(light.AnchorId, l); String(light.Type, l);
+                String(light.Id, l); String(light.AnchorId, l); String(light.EntityId, l); String(light.Type, l);
+                String(light.BakeType, l); String(light.Name, l);
                 if (light.Id.Length == 0 || !lightIds.Add(light.Id) ||
+                    (light.AnchorId.Length != 0 && light.EntityId.Length != 0) ||
                     (light.Type != "Directional" && light.Type != "Point" && light.Type != "Spot")) Fail("Invalid light identifier or type.");
                 Vector(light.Position); Rotation(light.Rotation); Floats(light.Color, 4, false);
                 if (!Finite(light.ColorTemperature) || light.ColorTemperature < 1000 || light.ColorTemperature > 20000 ||
                     !Finite(light.Intensity) || light.Intensity < 0 || light.Intensity > 1000000 ||
+                    !Finite(light.LightDimmer) || light.LightDimmer < 0 || light.LightDimmer > 16 ||
                     !Finite(light.Range) || light.Range < 0 || light.Range > 100000 ||
-                    !Finite(light.SpotAngle) || light.SpotAngle < 0 || light.SpotAngle > 180) Fail("Invalid light parameters.");
+                    !Finite(light.SpotAngle) || light.SpotAngle < 0 || light.SpotAngle > 180 ||
+                    !Finite(light.ShadowStrength) || light.ShadowStrength < 0 || light.ShadowStrength > 1 ||
+                    !Finite(light.ShadowDimmer) || light.ShadowDimmer < 0 || light.ShadowDimmer > 16 ||
+                    light.BakeType != "" && light.BakeType != "Realtime" && light.BakeType != "Baked" && light.BakeType != "Mixed")
+                    Fail("Invalid light parameters.");
             }
             if (w.Textures == null || w.Textures.Count > l.MaxTexturesPerWorld) Fail("World texture count exceeds limit.");
             var textureIds = new HashSet<string>(StringComparer.Ordinal);
@@ -259,10 +298,11 @@ namespace LCReplay.Core
             foreach (var t in w.Textures!)
             {
                 if (t == null) Fail("Null texture.");
-                String(t.Id, l);
+                String(t.Id, l); String(t.Name, l);
                 if (t.Id.Length == 0 || !textureIds.Add(t.Id)) Fail("Texture identifiers must be nonempty and unique per world.");
                 if (t.Width <= 0 || t.Height <= 0 || t.Width > l.MaxTextureDimension || t.Height > l.MaxTextureDimension)
                     Fail("Invalid or excessive texture dimensions.");
+                if (t.FilterMode < -1 || t.FilterMode > 2) Fail("Invalid texture filter mode.");
                 if (t.Png == null || t.Png.Length < 33) Fail("Invalid PNG texture.");
                 textureBytes += t.Png!.Length;
                 if (textureBytes > l.MaxTextureBytesPerWorld) Fail("World texture byte budget exceeded.");
@@ -361,8 +401,14 @@ namespace LCReplay.Core
                 if (g == null) Fail("Null geometry.");
                 String(g.Id, l); String(g.Name, l); String(g.EntityId, l); String(g.MeshName, l);
                 String(g.MeshSourceId, l); String(g.RoomId, l); String(g.AnchorId, l);
+                String(g.PrefabKey, l); String(g.PrefabRendererPath, l);
+                if (g.PrefabKey.Length != 0 && (g.EntityId.Length == 0 || g.PrefabRendererPath.Length == 0 ||
+                    g.PrefabRendererPath.Length > 4096 || g.MeshSourceId.Length != 0 || g.IsBoundsProxy))
+                    Fail("Invalid installed prefab renderer reference.");
+                if (g.PrefabKey.Length == 0 && g.PrefabRendererPath.Length != 0) Fail("Prefab renderer path without prefab key.");
                 String(g.LodGroupId, l);
                 if (g.Id.Length == 0 || !ids.Add(g.Id)) Fail("Geometry identifiers must be nonempty and unique per world.");
+                if (g.ShadowCastingMode < -1 || g.ShadowCastingMode > 3) Fail("Invalid geometry shadow mode.");
                 Vector(g.Position); Vector(g.Scale); Rotation(g.Rotation); Vector(g.BoundsCenter); Vector(g.BoundsSize);
                 Vector(g.LodCenter);
                 if (g.LodLevel < 0 || g.LodLevel > 1 || !Finite(g.LodSwitchDistance) ||
@@ -380,6 +426,8 @@ namespace LCReplay.Core
                 foreach (var t in g.Triangles!) if (t < 0 || t >= g.Vertices.Length / 3) Fail("Triangle index outside vertex array.");
                 var vertices = g.Vertices.Length / 3;
                 Floats(g.Uvs, vertices * 2, true); Floats(g.Normals, vertices * 3, true);
+                Floats(g.Uvs1, vertices * 2, true); Floats(g.Uvs2, vertices * 2, true); Floats(g.Uvs3, vertices * 2, true);
+                Floats(g.Tangents, vertices * 4, true);
                 if (g.Instances == null || g.Instances.Length % 16 != 0 || g.Instances.Length / 16 > l.MaxInstancesPerGeometry ||
                     (g.Instances.Length != 0 && (g.IsBoundsProxy || g.MeshSourceId.Length != 0 || g.EntityId.Length != 0 || vertices < 3)))
                     Fail("Invalid instanced geometry.");
@@ -405,7 +453,12 @@ namespace LCReplay.Core
                 }
                 if (g.BonePaths == null || g.BonePaths.Count > l.MaxBonesPerEntity) Fail("Mesh bone count exceeds limit.");
                 String(g.RootBonePath, l);
+                String(g.AttachedBonePath, l);
                 if (g.RootBonePath.Length > 4096) Fail("Mesh root bone path exceeds limit.");
+                if (g.AttachedBonePath.Length > 4096 ||
+                    g.AttachedBonePath.Count(c => c == '/') >= 128 ||
+                    g.AttachedBonePath.Length != 0 && g.EntityId.Length == 0)
+                    Fail("Invalid attached actor bone path.");
                 var rootDepth = 1;
                 foreach (var c in g.RootBonePath) if (c == '/' && ++rootDepth > 128) Fail("Mesh root bone hierarchy exceeds limit.");
                 foreach (var path in g.BonePaths!)
@@ -414,6 +467,20 @@ namespace LCReplay.Core
                     if (path.Length > 4096) Fail("Mesh bone path exceeds limit.");
                     var depth = 1;
                     foreach (var c in path) if (c == '/' && ++depth > 128) Fail("Mesh bone hierarchy exceeds limit.");
+                }
+                if (g.RigBones == null || g.RigBones.Count > l.MaxBonesPerEntity) Fail("Mesh rig pose count exceeds limit.");
+                String(g.AnimatorPath, l); String(g.AnimatorController, l); String(g.AnimatorAvatar, l);
+                if (g.AnimatorPath.Length > 4096) Fail("Animator path exceeds limit.");
+                var rigPaths = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var bone in g.RigBones!)
+                {
+                    if (bone == null) Fail("Null rig bone.");
+                    String(bone.Path, l);
+                    if (bone.Path.Length == 0 || bone.Path.Length > 4096 || !rigPaths.Add(bone.Path))
+                        Fail("Invalid rig bone path.");
+                    var rigDepth = 1;
+                    foreach (var c in bone.Path) if (c == '/' && ++rigDepth > 128) Fail("Rig bone hierarchy exceeds limit.");
+                    Vector(bone.Position); Vector(bone.Scale); Rotation(bone.Rotation);
                 }
                 Floats(g.BindPoses, g.BonePaths.Count * 16, false);
                 if (g.BoneIndices == null || g.BoneWeights == null) Fail("Null bone weights.");
@@ -436,6 +503,28 @@ namespace LCReplay.Core
                         Fail("Mesh instance must reference an earlier static mesh without duplicating arrays.");
                 }
                 else if (!g.IsBoundsProxy && g.Vertices.Length >= 9 && g.BonePaths.Count == 0) meshSources.Add(g.Id);
+            }
+        }
+
+        private static void ValidateEnvironmentComponent(EnvironmentComponentSnapshot component, ReplayReadLimits l)
+        {
+            if (component == null) Fail("Null environment component.");
+            String(component.Type, l);
+            if (component.Type.Length == 0 || component.Type.Length > 96 ||
+                component.Parameters == null || component.Parameters.Count > 80) Fail("Invalid environment component.");
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var parameter in component.Parameters)
+            {
+                if (parameter == null) Fail("Null environment parameter.");
+                String(parameter.Name, l); String(parameter.Kind, l); String(parameter.Text, l);
+                if (parameter.Name.Length == 0 || parameter.Name.Length > 96 || !names.Add(parameter.Name) ||
+                    parameter.Values == null || parameter.Values.Length > 4 || parameter.CurveKeys == null ||
+                    parameter.CurveKeys.Length > 224 || parameter.CurveKeys.Length % 7 != 0 ||
+                    !new[] { "float", "int", "bool", "color", "vector2", "vector3", "vector4", "enum", "curve" }.Contains(parameter.Kind) ||
+                    (parameter.Kind == "curve" ? parameter.Values.Length != 3 : parameter.CurveKeys.Length != 0))
+                    Fail("Invalid environment parameter.");
+                foreach (var value in parameter.Values) if (!Finite(value)) Fail("Non-finite environment parameter.");
+                foreach (var value in parameter.CurveKeys) if (!Finite(value)) Fail("Non-finite environment curve key.");
             }
         }
 
@@ -463,6 +552,59 @@ namespace LCReplay.Core
         {
             if (values == null || (values.Length != count && !(allowEmpty && values.Length == 0))) Fail("Invalid mesh or material array length.");
             foreach (var value in values!) if (!Finite(value)) Fail("Non-finite mesh or material component.");
+        }
+
+        private static void ItemMotion(ReplayEvent evt, ReplayReadLimits limits)
+        {
+            var motion = evt.ItemMotion!;
+            if (evt.Category != "item" || evt.Name != "pose" || evt.EntityId.Length == 0 ||
+                (motion.Mode != "rest" && motion.Mode != "fall")) Fail("Invalid item motion event.");
+            String(motion.AnchorId, limits);
+            if (motion.AnchorId.Length > 96) Fail("Item anchor identifier exceeds limit.");
+            Vector(motion.Position); Vector(motion.Scale); Rotation(motion.Rotation);
+            Vector(motion.Target); Rotation(motion.TargetRotation);
+            if (!Finite(motion.FallTime) || !Finite(motion.FallRate) ||
+                motion.FallTime < -2 || motion.FallTime > 2 || motion.FallRate < 0 || motion.FallRate > 10000)
+                Fail("Invalid item fall phase.");
+            if (motion.Curve == null || (motion.Mode == "fall" && motion.Curve.Length != 17) ||
+                (motion.Mode == "rest" && motion.Curve.Length != 0)) Fail("Invalid item fall curve.");
+            foreach (var value in motion.Curve!)
+                if (!Finite(value) || Math.Abs(value) > 10) Fail("Invalid item fall curve sample.");
+        }
+
+        private static void AnimationTrack(ReplayEvent evt, ReplayReadLimits limits)
+        {
+            var track = evt.AnimationTrack!;
+            if (evt.Category != "animation" || evt.Name != "track" || evt.EntityId.Length == 0)
+                Fail("Animation track must be an actor animation event.");
+            String(track.Clip, limits);
+            String(track.AnimatorPath, limits);
+            if (track.AnimatorPath.Length > 4096) Fail("Animation track Animator path exceeds limit.");
+            if (track.Clip.Length == 0 || track.Clip.Length > 256 || track.Layer < 0 || track.Layer > 31 ||
+                track.BonePaths == null || track.BonePaths.Count == 0 || track.BonePaths.Count > 128 ||
+                track.Phases == null || track.Phases.Length < 2 || track.Phases.Length > 64 ||
+                track.Positions == null || track.Rotations == null ||
+                track.Positions.Length != track.Phases.Length * track.BonePaths.Count * 3 ||
+                track.Rotations.Length != track.Phases.Length * track.BonePaths.Count * 4)
+                Fail("Invalid animation track dimensions.");
+            var paths = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var path in track.BonePaths!)
+            {
+                String(path, limits);
+                if (path.Length == 0 || path.Length > 4096 || !paths.Add(path)) Fail("Invalid animation track bone path.");
+            }
+            var prior = -1f;
+            foreach (var phase in track.Phases!)
+            {
+                if (!Finite(phase) || phase < 0 || phase > 1 || phase <= prior) Fail("Invalid animation track phase.");
+                prior = phase;
+            }
+            foreach (var value in track.Positions!) if (!Finite(value) || Math.Abs(value) > 10000) Fail("Invalid animation track position.");
+            for (var i = 0; i < track.Rotations!.Length; i += 4)
+            {
+                var q = new Quat(track.Rotations[i], track.Rotations[i + 1], track.Rotations[i + 2], track.Rotations[i + 3]);
+                Rotation(q);
+            }
         }
 
         private static void Dictionary(Dictionary<string, string> d, ReplayReadLimits l)

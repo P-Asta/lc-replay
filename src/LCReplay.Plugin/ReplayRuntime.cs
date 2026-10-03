@@ -9,12 +9,12 @@ namespace LCReplay.Plugin
     /// </summary>
     public sealed class ReplayRuntime : MonoBehaviour, IDisposable
     {
-        private Action? runFrame, drawUi, started;
+        private Action? runFrame, drawUi, lateFrame, started;
         private Action<string, Exception>? reportError;
         private bool disposed, firstFrame = true;
         private float nextFrameError, nextGuiError;
 
-        internal static ReplayRuntime Create(Action runFrame, Action drawUi, Action started, Action<string, Exception> reportError)
+        internal static ReplayRuntime Create(Action runFrame, Action drawUi, Action lateFrame, Action started, Action<string, Exception> reportError)
         {
             var owner = new GameObject("LCReplay.Runtime");
             owner.SetActive(false);
@@ -24,6 +24,7 @@ namespace LCReplay.Plugin
                 var runtime = owner.AddComponent<ReplayRuntime>();
                 runtime.runFrame = runFrame;
                 runtime.drawUi = drawUi;
+                runtime.lateFrame = lateFrame;
                 runtime.started = started;
                 runtime.reportError = reportError;
                 owner.SetActive(true);
@@ -59,6 +60,13 @@ namespace LCReplay.Plugin
             catch (Exception ex) { Report("UI", ex, ref nextGuiError); }
         }
 
+        private void LateUpdate()
+        {
+            if (disposed) return;
+            try { lateFrame?.Invoke(); }
+            catch (Exception ex) { Report("late frame", ex, ref nextFrameError); }
+        }
+
         private void Report(string stage, Exception exception, ref float nextAllowed)
         {
             var now = Time.realtimeSinceStartup;
@@ -73,6 +81,7 @@ namespace LCReplay.Plugin
             disposed = true;
             runFrame = null;
             drawUi = null;
+            lateFrame = null;
             started = null;
             reportError = null;
             // Scene/application teardown may destroy the native component before the

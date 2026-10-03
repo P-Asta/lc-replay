@@ -65,39 +65,70 @@ namespace LCReplay.Plugin.Capture
 
         // The room culler turns Renderer.enabled off solely for the live camera. Read its
         // membership instead of changing it, so recording never alters the running game.
-        internal static SceneVisibility Snapshot()
+        internal sealed class SnapshotJob : IDisposable
         {
-            var result = new SceneVisibility();
+            internal readonly SceneVisibility Result = new SceneVisibility();
+            private IEnumerator<bool>? steps;
+            internal SnapshotJob() { steps = SnapshotSteps(Result).GetEnumerator(); }
+            internal bool Step(double milliseconds)
+            {
+                if (steps == null) return true;
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                do
+                {
+                    if (steps.MoveNext()) continue;
+                    Dispose();
+                    return true;
+                } while (clock.Elapsed.TotalMilliseconds < milliseconds);
+                return false;
+            }
+            public void Dispose() { steps?.Dispose(); steps = null; }
+        }
+
+        internal static SnapshotJob BeginSnapshot() => new SnapshotJob();
+
+        private static IEnumerable<bool> SnapshotSteps(SceneVisibility result)
+        {
             var culler = GameAccess.Read(GameAccess.Singleton("StartOfRound"), "occlusionCuller");
             foreach (var field in new[] { "tileRenderers", "doorRenderers" })
             {
                 if (!(GameAccess.Read(culler, field) is IDictionary rooms)) continue;
-                foreach (DictionaryEntry room in rooms)
+                foreach (DictionaryEntry room in SnapshotEntries(rooms))
                 {
                     var key = room.Key as UnityEngine.Object;
                     var id = key ? "r" + key!.GetInstanceID() : "";
                     if (!(room.Value is IEnumerable renderers)) continue;
-                    foreach (var item in renderers)
+                    foreach (var item in renderers.Cast<object>().ToArray())
+                    {
+                        yield return true;
                         if (item is Renderer renderer && renderer)
                         {
                             if (field == "tileRenderers") result.Rooms[renderer] = id;
                             result.CullerManaged.Add(renderer);
                         }
+                    }
                 }
             }
             if (GameAccess.Read(culler, "OverrideRendererVisibilities") is IDictionary overrides)
-                foreach (DictionaryEntry item in overrides)
+                foreach (DictionaryEntry item in SnapshotEntries(overrides))
+                {
+                    yield return true;
                     if (item.Key is Renderer renderer && renderer && item.Value is bool visible)
                         result.Overrides[renderer] = visible;
+                }
             // Disabling the game's culler restores rooms and clears its membership maps.
             // Tile membership still supplies replay room tags; it must not override enabled.
             if (result.Rooms.Count == 0)
                 foreach (var tile in GameAccess.Find("DunGen.Tile"))
+                {
+                    yield return true;
                     foreach (var renderer in tile.GetComponentsInChildren<Renderer>(true))
                         if (renderer && renderer.enabled && renderer.gameObject.activeInHierarchy && result.Rooms.Count < 50000)
                             result.Rooms[renderer] = "r" + tile.GetInstanceID();
+                }
             foreach (var group in UnityEngine.Object.FindObjectsOfType<LODGroup>(true))
             {
+                yield return true;
                 if (!group || !group.gameObject.scene.IsValid() || !group.gameObject.scene.isLoaded) continue;
                 var lods = group.GetLODs();
                 if (lods.Length == 0) continue;
@@ -140,7 +171,14 @@ namespace LCReplay.Plugin.Capture
                         if (renderer && !selected.Contains(renderer)) result.OtherLods.Add(renderer);
                 }
             }
-            return result;
+        }
+
+        private static List<DictionaryEntry> SnapshotEntries(IDictionary source)
+        {
+            var entries = new List<DictionaryEntry>(source.Count);
+            var iterator = source.GetEnumerator();
+            while (iterator.MoveNext()) entries.Add(iterator.Entry);
+            return entries;
         }
 
         private static bool IsNatural(LODGroup group, LOD[] lods)
