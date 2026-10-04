@@ -112,7 +112,14 @@ namespace LCReplay.Plugin.Playback
                 if (!firingNow) Bullets!.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
                 else
                 {
-                    if (seeking) Bullets!.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+                    if (seeking)
+                    {
+                        Bullets!.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+                        // A paused seek into firing must still show a native
+                        // trail; waiting for realtime emission leaves it empty.
+                        foreach (var system in systems) { var main = system.main; main.simulationSpeed = 1f; }
+                        Bullets.Simulate(.12f, true, true, true);
+                    }
                     if (!Bullets!.isPlaying) Bullets.Play(true);
                     foreach (var system in systems)
                     { var main = system.main; main.simulationSpeed = playing ? speed : 0; }

@@ -1,5 +1,25 @@
 # LCReplay schema 1
 
+## Held attachments and vehicle cargo (0.25.28)
+
+Schema 1 and LCIX0007 remain unchanged. Held item scalar state can include `$heldBy` (entity ID), `$heldParent` (transform path relative to the owner's root), `$heldFirstPerson`, and the existing runtime `itemProperties.positionOffset` / `itemProperties.rotationOffset` fields. Playback uses these references after the owner's native Animator/IK and recorded procedural poses. Missing or unavailable references fall back to recorded world poses and existing legacy holder resolution.
+
+`ItemMotionSnapshot.AnchorId` can now be `entity:<entity-id>` for cargo resting or falling under a recorded vehicle root. Position and rotation are vehicle-relative; scale retains the recorded world scale. Playback samples the vehicle and cargo at the same clock time. Older unanchored rest poses may infer a vehicle-relative segment only from closely spaced, coherent carried motion with an unambiguous vehicle and no intervening pickup or despawn. The original file is not rewritten.
+
+Entity geometry now records its initial renderer visibility, including inactive alternate forms. Old Company Cruiser recordings can infer a missing opening pose only in part zero, when the opening world contains its geometry and several early parked samples prove translation with the ship. This is a bounded reconstruction of missing data; the first recorded vehicle pose remains authoritative. Legacy partial enemy skeletons receive a bounded 0.18-second transition blend because those files do not contain the game's original transition duration; complete visual bone recordings retain their actual captured output.
+
+## Generic enemy visual poses (0.25.27)
+
+The `enemy-visual-bone-poses` capability adds a complete bounded `EntitySnapshot.Bones` list for each enemy, regardless of the `CaptureBones` setting. It includes installed skin bones and ancestors of skinned/rigid renderers in inactive forms. Samples run after Animator evaluation and ordinary game LateUpdate scripts. Paths are cached and unchanged immutable poses are reused; frames retain complete lists, so existing interpolation and indexed seeking still apply. The limit remains 512 transforms per enemy, with `$omittedBones` when exceeded. Recorded outputs override native controller/IK evaluation; discrete renderer visibility selects the active form.
+
+`EntitySnapshot.State` keys beginning `$blendshape:` append the canonical renderer path to that prefix; their values contain invariant comma-separated weights, including zeros. Capture is bounded to 32 renderers and 128 total weights per enemy, with `$omittedBlendShapes` for omissions. Valid matching channels interpolate between observations of the same active entity kind/form; ordinary state fields remain discrete. Installed mesh copies retain blend-shape frames; custom runtime mesh replacement is not encoded by these weights. Matching game/mod assets are still needed. Older files remain readable but cannot recover procedural poses or state changes absent from their data.
+
+## Animation phase rate (0.25.26)
+
+Schema 1 remains unchanged. `animation/state` data optionally includes `normalizedRate`, the signed normalized cycles per second: `Animator.speed * sign(state.speed * state.speedMultiplier) / state.length`. Unity's state duration already includes state speed and its parameter, so `speed / duration` would apply that factor twice. A stopped state records rate zero. Old files interpolate phase between adjacent observations of the same state, clip and controller when their phases do not indicate a restart; otherwise they use the signed reciprocal of the effective duration. Older files do not separately store global Animator speed, so that fallback assumes a global magnitude of one.
+
+New enemy bone snapshots include Nutcracker's procedural torso and Jester's external head target. Legacy Nutcracker recordings can recover the torso's single-axis turn from a matching recorded shotgun renderer and the installed animated hierarchy.
+
 ## Capture work scheduling (0.25.24)
 
 Schema 1 and LCIX0007 remain unchanged. A live snapshot keeps entity, held-item and view poses at one observation time; its immutable frame and state-transition records are published on later work frames. State transitions retain the snapshot timestamp. Sparse animation and visual events use their own observation timestamps, and event/world arrival order may still differ from timestamp order.
@@ -152,6 +172,10 @@ The ordinary full-session reader retains a 1 GiB file/512 MiB aggregate limit, w
 `ReplayTimeline.Sample` binary-searches the surrounding frames, linearly interpolates position and scale, and spherically interpolates rotation along the shortest quaternion arc. It preserves the left frame's discrete state until the next timestamp. It does not interpolate across a missing entity, kind change, or activation change. Matching active renderer poses interpolate their local transforms, allowing a stationary door entity's panel to rotate or slide. Renderer visibility and presence change at frame boundaries. The returned snapshot is independent of the loaded data. Queries outside the frame range clamp to the first or final pose.
 
 ## Whole-recording time and duration indexing
+
+Player sample gaps of at most five seconds can interpolate between plausible living-player endpoints. Indoor/elevator changes, observed teleport calls, death changes and implausible displacement preserve a discontinuity. Interpolation estimates missing motion; it does not add observations to the recording. Legacy tree renderer hide events can be dated from a matching native positional break sound only when the same renderer has a later confirmed hide event and the recorded trunk base matches; no tree is deleted from sound alone.
+
+Playback uses an inherited world record's `SourceTime` to recover its availability across streaming windows; the clamped window-local timestamp must not become a new spawn time after a backward seek. `SourceTime` is reader metadata, not a schema change. Player state may include `ItemOnlySlot`, and item state may include `isPocketed`. These optional fields supplement explicit held-owner/attachment state for utility-slot inventory mods; older recordings can use a unique visible held item with an explicit owner.
 
 `ReplayRecordingTimeline` assigns each ordered part a global offset. With valid start timestamps, an offset is the later of its recorded start relative to the first part and the preceding part's end. Missing/earlier timestamps concatenate after the preceding part. This preserves capture gaps without overlapping the playback clock. `Locate` selects the part at a global timestamp; `LocalTime` clamps to that part's available duration, holding its final pose during a gap. Exact boundaries select the new part, and zero-duration parts do not trap seeking. The timeline accepts up to 10,000 distinct paths and seven days total.
 

@@ -186,9 +186,12 @@ namespace LCReplay.Plugin.Capture
                 .FirstOrDefault(animator => animator);
             var tileBounds = CaptureVisibility.TileVolumes();
             var orderedRenderers = new List<RendererOrder>();
+            // This iterator yields between renderers. Discovery may add an entry
+            // before its next MoveNext, so freeze the selected owners first.
+            var selectedEntries = onlyEntityIds == null ? Array.Empty<EntityTracker.Entry>() :
+                tracker.Entries.Where(entry => onlyEntityIds.Contains(entry.Id) && entry.Component).ToArray();
             var candidates = onlyEntityIds == null ? Object.FindObjectsOfType<Renderer>(true).AsEnumerable() :
-                tracker.Entries.Where(entry => onlyEntityIds.Contains(entry.Id) && entry.Component)
-                    .SelectMany(entry => entry.Component.GetComponentsInChildren<Renderer>(true)).Distinct();
+                selectedEntries.SelectMany(entry => entry.Component.GetComponentsInChildren<Renderer>(true)).Distinct();
             foreach (var candidate in candidates)
             {
                 yield return true;
@@ -296,6 +299,10 @@ namespace LCReplay.Plugin.Capture
                 }
                 if (owner != null)
                 {
+                    // A sparse renderer stream uses this as its initial state.
+                    // Disabled wrecks and alternate forms must not appear until
+                    // a later frame happens to publish their first tombstone.
+                    geometry.Active = renderer.gameObject.activeInHierarchy && visibility.Enabled(renderer);
                     var root = owner.Component.transform;
                     geometry.Position = GameAccess.Vec(root.InverseTransformPoint(transform.position));
                     geometry.Rotation = GameAccess.Rot(Quaternion.Inverse(root.rotation) * transform.rotation);

@@ -28,8 +28,11 @@ namespace LCReplay.Plugin.Capture
                     GameAccess.Bool(item, "isPocketed") || GameAccess.Read(item, "parentObject") is Transform parent && parent)
                 { latest.Remove(entry.Id); continue; }
                 var transform = item.transform;
-                var anchor = elevator && (transform == elevator || transform.IsChildOf(elevator)) ? elevator : null;
-                var anchorId = anchor ? "ship-elevator" : "";
+                var vehicleType = GameAccess.Type("VehicleController");
+                var vehicle = vehicleType == null ? null : transform.GetComponentInParent(vehicleType) as Component;
+                var anchor = vehicle ? vehicle!.transform :
+                    elevator && (transform == elevator || transform.IsChildOf(elevator)) ? elevator : null;
+                var anchorId = vehicle ? "entity:" + tracker.Identify(vehicle!) : anchor ? "ship-elevator" : "";
                 var worldRotation = transform.rotation;
                 var rotation = anchor ? Quaternion.Inverse(anchor!.rotation) * worldRotation : worldRotation;
                 var currentPosition = anchor ? anchor!.InverseTransformPoint(transform.position) : transform.position;
@@ -102,12 +105,17 @@ namespace LCReplay.Plugin.Capture
         private static bool SameMotion(ItemMotionSnapshot a, ItemMotionSnapshot b)
         {
             if (a.Mode != b.Mode || a.AnchorId != b.AnchorId) return false;
-            static bool Near(Vec3 x, Vec3 y) =>
-                Math.Abs(x.X - y.X) < .02f && Math.Abs(x.Y - y.Y) < .02f && Math.Abs(x.Z - y.Z) < .02f;
+            static bool NearAxis(float x, float y) => Math.Abs(x - y) < .02f;
+            // Even a small height change affects where a resting item or a
+            // falling item's floor target appears. Do not deduplicate it away.
+            static bool SamePosition(Vec3 x, Vec3 y) =>
+                NearAxis(x.X, y.X) && x.Y == y.Y && NearAxis(x.Z, y.Z);
+            static bool NearScale(Vec3 x, Vec3 y) =>
+                NearAxis(x.X, y.X) && NearAxis(x.Y, y.Y) && NearAxis(x.Z, y.Z);
             static bool NearRotation(Quat x, Quat y) => Math.Abs(x.X * y.X + x.Y * y.Y + x.Z * y.Z + x.W * y.W) > .999f;
-            if (!Near(a.Position, b.Position) || !Near(a.Scale, b.Scale)) return false;
+            if (!SamePosition(a.Position, b.Position) || !NearScale(a.Scale, b.Scale)) return false;
             return a.Mode == "fall"
-                ? Near(a.Target, b.Target) && NearRotation(a.TargetRotation, b.TargetRotation)
+                ? SamePosition(a.Target, b.Target) && NearRotation(a.TargetRotation, b.TargetRotation)
                 : NearRotation(a.Rotation, b.Rotation);
         }
     }

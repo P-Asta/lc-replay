@@ -121,6 +121,16 @@ namespace LCReplay.Plugin.Playback
             source.minDistance = Mathf.Clamp(Number(evt, "min", 1f), .01f, 1000f);
             source.maxDistance = Mathf.Clamp(Number(evt, "max", 20f), source.minDistance, 10000f);
             source.rolloffMode = (AudioRolloffMode)Mathf.Clamp(Mathf.RoundToInt(Number(evt, "rolloff", 0f)), 0, 2);
+            // Helmet and held-item effects (including TZP inhalation) are 2D
+            // only for their owner in the live game. Their AudioSource often
+            // has a very large, unused 3D range. A replay spectator must hear
+            // them near the actor rather than across the entire moon.
+            if (evt.Data.GetValueOrDefault("player") == "true" && Number(evt, "spatial", 1f) < .5f)
+            {
+                source.maxDistance = Mathf.Min(source.maxDistance, 20f);
+                source.minDistance = Mathf.Min(source.minDistance, source.maxDistance, 2f);
+                source.rolloffMode = AudioRolloffMode.Logarithmic;
+            }
             if (ambient && source.rolloffMode == AudioRolloffMode.Custom && evt.Data.TryGetValue("attenuation", out var attenuation))
             {
                 var values = attenuation.Split(',');
@@ -139,9 +149,10 @@ namespace LCReplay.Plugin.Playback
                 Mathf.RoundToInt(Number(evt, "component", 0f))) : null;
             if (prototype)
             {
-                source.minDistance = prototype!.minDistance; source.maxDistance = prototype.maxDistance;
-                source.rolloffMode = prototype.rolloffMode; source.spread = prototype.spread;
-                if (prototype.rolloffMode == AudioRolloffMode.Custom)
+                // The recording contains the runtime source range. A prefab
+                // may have different defaults, especially for local-only SFX.
+                source.spread = prototype!.spread;
+                if (source.rolloffMode == AudioRolloffMode.Custom && prototype.rolloffMode == AudioRolloffMode.Custom)
                     source.SetCustomCurve(AudioSourceCurveType.CustomRolloff, prototype.GetCustomCurve(AudioSourceCurveType.CustomRolloff));
             }
             source.dopplerLevel = 0f;

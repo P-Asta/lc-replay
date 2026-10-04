@@ -49,6 +49,8 @@ namespace LCReplay.Plugin
         internal static bool IsDebugObject(string name) =>
             name.StartsWith("ImpVis_", StringComparison.Ordinal) ||
             name.StartsWith("ImpGizmo_", StringComparison.Ordinal) ||
+            name == "VehicleBounds" || name == "InsideTruckNavBounds" ||
+            name == "OntopOfTruckBounds" || name == "WindshieldInteractBlocker" ||
             string.Equals(name, "ScanSphere", StringComparison.OrdinalIgnoreCase) ||
             name == "MapDot" || name.StartsWith("MapDot (", StringComparison.Ordinal);
 

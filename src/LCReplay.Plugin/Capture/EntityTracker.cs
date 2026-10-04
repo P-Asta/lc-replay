@@ -11,11 +11,11 @@ namespace LCReplay.Plugin.Capture
     {
         internal static readonly KeyValuePair<string, string>[] BuiltinTypes =
         {
-            Pair("GameNetcodeStuff.PlayerControllerB", "player"), Pair("EnemyAI", "enemy"),
+            Pair("VehicleController", "vehicle"), Pair("GameNetcodeStuff.PlayerControllerB", "player"), Pair("EnemyAI", "enemy"),
             Pair("GrabbableObject", "item"), Pair("DoorLock", "door"),
             Pair("TerminalAccessibleObject", "facility"), Pair("Landmine", "hazard"),
             Pair("SandSpiderWebTrap", "web"),
-            Pair("Turret", "hazard"), Pair("ShipTeleporter", "ship"), Pair("VehicleController", "vehicle"),
+            Pair("Turret", "hazard"), Pair("ShipTeleporter", "ship"),
             Pair("DeadBodyInfo", "body"), Pair("AnimatedObjectTrigger", "mechanism"),
             Pair("ItemDropship", "ship"), Pair("MineshaftElevatorController", "mechanism"),
             Pair("StartOfRound", "round"), Pair("RoundManager", "round"),
@@ -55,6 +55,7 @@ namespace LCReplay.Plugin.Capture
         private readonly Dictionary<string, Dictionary<string, string>> animationParameterValues =
             new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
         private readonly AnimationTrackCapture animationTracks = new AnimationTrackCapture();
+        private readonly EnemyVisualPoseCapture enemyVisualPoses = new EnemyVisualPoseCapture();
         private string[] animationOrder = Array.Empty<string>();
         private int animationCursor;
         private bool animationOrderDirty = true;
@@ -65,6 +66,7 @@ namespace LCReplay.Plugin.Capture
             internal float Normalized;
             internal float Duration;
             internal float Speed;
+            internal float NormalizedRate;
             internal float Weight;
             internal double Time;
         }
@@ -108,6 +110,7 @@ namespace LCReplay.Plugin.Capture
         {
             var key = component.GetInstanceID();
             if (identities.TryGetValue(key, out var existing) && existing.Component == component) return existing.Id;
+            if (existing != null) enemyVisualPoses.Forget(existing.Id);
             var entry = new Entry { Component = component, Id = "e" + (++nextId), Kind = "other" };
             identities[key] = entry;
             return entry.Id;
@@ -135,6 +138,8 @@ namespace LCReplay.Plugin.Capture
                 ?? component.name) ?? "enemy";
             if (trackedIds.Add(id)) tracked.Add(entry);
             justSpawned.Add(id);
+            RegisterEnemyLods(component);
+            enemyVisualPoses.Refresh(entry, Visibility);
             var preferred = GameAccess.Read(component, "creatureAnimator") as Animator;
             foreach (var animator in component.GetComponentsInChildren<Animator>(true)
                 .Where(value => value && value.runtimeAnimatorController && !RadarAnimator(value)).Take(8))
@@ -191,6 +196,7 @@ namespace LCReplay.Plugin.Capture
             { bones.Remove(identities[id].Id); renderers.Remove(identities[id].Id);
               entityRendererBaselines.Remove(identities[id].Id); capturedBones.Remove(identities[id].Id);
               animationTracks.Forget(identities[id].Id);
+              enemyVisualPoses.Forget(identities[id].Id);
               RemoveAnimationBindings(identities[id].Id); identities.Remove(id); }
             foreach (var id in movingSceneRenderers.Where(pair => !pair.Value.Renderer).Select(pair => pair.Key).ToArray()) movingSceneRenderers.Remove(id);
             discoveryPhase = 0;
@@ -226,6 +232,8 @@ namespace LCReplay.Plugin.Capture
                     !GameAccess.Bool(component, "isPlayerDead")) continue;
                 if (entry.Kind == "player" || entry.Kind == "enemy")
                 {
+                    if (entry.Kind == "enemy")
+                    { RegisterEnemyLods(component); enemyVisualPoses.Refresh(entry, Visibility); }
                     // Several vanilla enemies have independent body, baby,
                     // mask or effect Animators. Keep their paths distinct.
                     var preferred = entry.Kind == "player"
@@ -303,18 +311,33 @@ namespace LCReplay.Plugin.Capture
                     AnimatorStateInfo state;
                     try { state = animator.GetCurrentAnimatorStateInfo(layer); }
                     catch { continue; }
-                    if (state.fullPathHash == 0 || !GameAccess.Finite(state.normalizedTime) ||
-                        !GameAccess.Finite(state.length) || state.length <= 0) continue;
-                    var speed = animator.speed * state.speed * state.speedMultiplier;
+                    if (state.fullPathHash == 0 || !GameAccess.Finite(state.normalizedTime)) continue;
+                    var stateSpeed = state.speed * state.speedMultiplier;
+                    var speed = animator.speed * stateSpeed;
+                    var duration = state.length;
+                    if (!GameAccess.Finite(duration) || duration <= 0)
+                    {
+                        // A zero speed parameter can make the effective state
+                        // length infinite. Still record the frozen phase.
+                        if (speed != 0) continue;
+                        duration = 1f;
+                    }
                     if (!GameAccess.Finite(speed)) speed = 1;
+                    // AnimatorStateInfo.length already includes the state's
+                    // speed and speed parameter. Applying those again makes
+                    // walking/cranking clips advance too fast between events.
+                    var normalizedRate = GameAccess.Finite(stateSpeed) ? animator.speed * Math.Sign(stateSpeed) / duration : 0;
+                    if (!GameAccess.Finite(normalizedRate)) normalizedRate = 0;
                     var weight = animator.GetLayerWeight(layer);
                     if (!GameAccess.Finite(weight)) weight = 0;
                     var previous = samples[layer];
-                    var expected = previous.Normalized + (float)((time - previous.Time) * previous.Speed / Math.Max(.001f, previous.Duration));
+                    var expected = previous.Normalized + (float)((time - previous.Time) * previous.NormalizedRate);
                     var unchanged = weight < .001f && previous.Weight < .001f ||
                         previous.Hash == state.fullPathHash && time - previous.Time < 10 &&
                         Math.Abs(expected - state.normalizedTime) < .25f &&
-                        Math.Abs(previous.Speed - speed) < .05f && Math.Abs(previous.Weight - weight) < .1f &&
+                        Math.Abs(previous.Speed - speed) < .05f && Math.Abs(previous.NormalizedRate - normalizedRate) < .05f &&
+                        Math.Sign(previous.NormalizedRate) == Math.Sign(normalizedRate) &&
+                        Math.Abs(previous.Weight - weight) < .1f &&
                         (previous.Weight >= .05f) == (weight >= .05f);
                     // Native actor controllers need clip names only when a state
                     // is emitted. Avoid allocating clip arrays for unchanged legs.
@@ -345,14 +368,15 @@ namespace LCReplay.Plugin.Capture
                     }
                     if (unchanged) continue;
                     samples[layer] = new AnimationSample { Hash = state.fullPathHash, Normalized = state.normalizedTime,
-                        Duration = state.length, Speed = speed, Weight = weight, Time = time };
+                        Duration = duration, Speed = speed, NormalizedRate = normalizedRate, Weight = weight, Time = time };
                     var data = new Dictionary<string, string>
                     {
                         ["layer"] = layer.ToString(System.Globalization.CultureInfo.InvariantCulture),
                         ["hash"] = state.fullPathHash.ToString(System.Globalization.CultureInfo.InvariantCulture),
                         ["normalizedTime"] = state.normalizedTime.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
-                        ["duration"] = state.length.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                        ["duration"] = duration.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
                         ["speed"] = speed.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                        ["normalizedRate"] = normalizedRate.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
                         ["weight"] = weight.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
                     };
                     if (clip.Length != 0) data["clip"] = clip;
@@ -447,6 +471,10 @@ namespace LCReplay.Plugin.Capture
             if (visibilityJob == null) return true;
             if (!visibilityJob.Step(milliseconds)) return false;
             Visibility = visibilityJob.Result;
+            // Enemies can spawn while the incremental world scan is running,
+            // after its LODGroup array was already enumerated.
+            foreach (var entry in tracked)
+                if (entry.Kind == "enemy" && entry.Component) RegisterEnemyLods(entry.Component);
             visibilityJob.Dispose(); visibilityJob = null;
             interiorBounds = GameAccess.Find("DunGen.Tile").Take(4096)
                 .Select(tile => GameAccess.Read(tile, "Bounds"))
@@ -526,17 +554,12 @@ namespace LCReplay.Plugin.Capture
                             entity.ViewPosition = GameAccess.Vec(gameplayCamera.transform.position);
                     }
                 }
-                else if (entry.Kind == "item" && GameAccess.Bool(component, "isHeld") &&
-                    GameAccess.Read(component, "playerHeldBy") is Component holder && holder)
-                    entity.State["$heldBy"] = Identify(holder);
-                if (captureBones && (entry.Kind == "player" || entry.Kind == "enemy" ||
+                else if (entry.Kind == "item") CaptureHeldAttachment(component, entity);
+                if (entry.Kind == "enemy")
+                    enemyVisualPoses.Capture(entry, entity, Visibility);
+                else if (captureBones && (entry.Kind == "player" ||
                     renderers.TryGetValue(entry.Id, out var skins) && skins.Any(renderer => renderer is SkinnedMeshRenderer)))
                     CaptureBones(entry, entity);
-                else if (!captureBones && entry.Kind == "enemy" &&
-                    component.GetType().Name == "SandSpiderAI")
-                    CaptureSpiderProceduralBones(entry, entity);
-                else if (!captureBones && entry.Kind == "enemy")
-                    CaptureEnemyFacing(entry, entity);
                 CaptureRenderers(entry, entity);
                 var entityBytes = 1024L + entity.State.Sum(p => 128L + 6L * (p.Key.Length + p.Value.Length))
                     + entity.Bones.Sum(b => 640L + 6L * b.Path.Length)
@@ -586,6 +609,30 @@ namespace LCReplay.Plugin.Capture
             if (list.Any(item => item.Id == geometry.Id)) return;
             list.Add(new EntityRendererBaseline { Renderer = renderer, Id = geometry.Id,
                 Position = geometry.Position, Rotation = geometry.Rotation, Scale = geometry.Scale, Active = geometry.Active });
+        }
+
+        private void CaptureHeldAttachment(Component item, EntitySnapshot entity)
+        {
+            var parent = GameAccess.Read(item, "parentObject") as Transform;
+            var holder = GameAccess.Bool(item, "isHeld") ? GameAccess.Read(item, "playerHeldBy") as Component : null;
+            if (!holder && parent && GameAccess.Type("EnemyAI") is Type enemyType)
+                holder = parent!.GetComponentInParent(enemyType) as Component;
+            if (!holder) return;
+            entity.State["$heldBy"] = Identify(holder!);
+            if (!parent || parent != holder!.transform && !parent!.IsChildOf(holder.transform)) return;
+            var path = RelativePath(holder.transform, parent!);
+            if (path.Length > 4096 || path.Count(character => character == '/') > 127) return;
+            entity.State["$heldParent"] = path;
+            if (GameAccess.Read(holder, "localItemHolder") is Transform local && local == parent)
+                entity.State["$heldFirstPerson"] = "True";
+            // GrabbableObject applies these in rotation space, without parent
+            // scale. Keep the actual installed values, including mod changes,
+            // rather than resolving a same-named asset on another machine.
+            var properties = GameAccess.Read(item, "itemProperties");
+            if (GameAccess.Read(properties, "positionOffset") is Vector3 position && GameAccess.Finite(position))
+                entity.State["itemProperties.positionOffset"] = GameAccess.Scalar(position)!;
+            if (GameAccess.Read(properties, "rotationOffset") is Vector3 rotation && GameAccess.Finite(rotation))
+                entity.State["itemProperties.rotationOffset"] = GameAccess.Scalar(rotation)!;
         }
 
         private void CaptureMovingSceneRenderers(ReplayFrame frame)
@@ -801,6 +848,29 @@ namespace LCReplay.Plugin.Capture
 
         private static bool CaptureRendererPoses(string kind) => kind != "round" && kind != "time" && kind != "terminal";
 
+        private void RegisterEnemyLods(Component component)
+        {
+            // Late enemy geometry reuses the world's visibility snapshot.
+            // Register newly spawned LOD groups locally so their low-detail
+            // body copies do not all enter that late capture together.
+            foreach (var group in component.GetComponentsInChildren<LODGroup>(true))
+            {
+                var selected = new HashSet<Renderer>();
+                foreach (var lod in group.GetLODs())
+                {
+                    if (selected.Count == 0)
+                        foreach (var renderer in lod.renderers)
+                            if (renderer) selected.Add(renderer);
+                    foreach (var renderer in lod.renderers)
+                        if (renderer)
+                        {
+                            if (selected.Contains(renderer)) Visibility.OtherLods.Remove(renderer);
+                            else Visibility.OtherLods.Add(renderer);
+                        }
+                }
+            }
+        }
+
         internal static bool IsCapturedRenderer(Entry entry, Renderer renderer)
         {
             if (entry.Kind != "player") return true;
@@ -823,6 +893,27 @@ namespace LCReplay.Plugin.Capture
 
         private void CaptureRenderers(Entry entry, EntitySnapshot entity)
         {
+            // Moving platforms can be used before their mesh export completes.
+            // Their first ride must not depend on a late, already-lowered baseline.
+            if (entry.Kind == "mechanism")
+            {
+                var mechanismRoot = entry.Component.transform;
+                foreach (var renderer in entry.Component.GetComponentsInChildren<Renderer>(true)
+                    .Where(value => value is MeshRenderer || value is SkinnedMeshRenderer).Take(512))
+                {
+                    if (!renderer || CaptureVisibility.IsDebugRenderer(renderer)) continue;
+                    var node = renderer.transform;
+                    var position = mechanismRoot.InverseTransformPoint(node.position);
+                    var rotation = Quaternion.Inverse(mechanismRoot.rotation) * node.rotation;
+                    var rootScale = mechanismRoot.lossyScale;
+                    var scale = new Vector3(Div(node.lossyScale.x, rootScale.x), Div(node.lossyScale.y, rootScale.y), Div(node.lossyScale.z, rootScale.z));
+                    if (!GameAccess.Finite(position) || !GameAccess.Finite(rotation) || !GameAccess.Finite(scale)) continue;
+                    entity.Renderers.Add(new RenderPose { Id = "g" + renderer.GetInstanceID(),
+                        Position = GameAccess.Vec(position), Rotation = GameAccess.Rot(rotation),
+                        Scale = GameAccess.Vec(scale), Active = RendererActive(entry, renderer) });
+                }
+                return;
+            }
             if (!entityRendererBaselines.TryGetValue(entry.Id, out var list)) return;
             var root = entry.Component.transform;
             var omitted = Math.Max(0, list.Count - 512);
@@ -853,50 +944,6 @@ namespace LCReplay.Plugin.Capture
             if (omitted > 0) entity.State["$omittedRenderers"] = "at least " + omitted;
         }
         private static float Div(float a, float b) => Math.Abs(b) < 0.00001f ? 1 : a / b;
-
-        private static void CaptureSpiderProceduralBones(Entry entry, EntitySnapshot entity)
-        {
-            // SandSpiderAI drives its mesh root and leg IK outside the Animator.
-            // Preserve only those non-reproducible transforms; its other bones
-            // still come from the reusable native animation track.
-            var root = entry.Component.transform;
-            var meshRoot = GameAccess.Read(entry.Component, "meshContainer") as Transform;
-            var body = GameAccess.Read(entry.Component, "spiderNormalMesh") as SkinnedMeshRenderer;
-            if (!meshRoot || !body) return;
-            var selected = new HashSet<Transform> { meshRoot! };
-            foreach (var bone in body!.bones)
-                if (bone && (bone.name.EndsWith("Thigh", StringComparison.Ordinal) ||
-                    bone.name.EndsWith("Leg", StringComparison.Ordinal))) selected.Add(bone);
-            foreach (var bone in selected)
-            {
-                if (!bone || !bone.IsChildOf(root) || !GameAccess.Finite(bone.localPosition) ||
-                    !GameAccess.Finite(bone.localRotation) || !GameAccess.Finite(bone.localScale)) continue;
-                entity.Bones.Add(new BonePose { Path = RelativePath(root, bone),
-                    Position = GameAccess.Vec(bone.localPosition), Rotation = GameAccess.Rot(bone.localRotation),
-                    Scale = GameAccess.Vec(bone.localScale) });
-            }
-        }
-
-        private static void CaptureEnemyFacing(Entry entry, EntitySnapshot entity)
-        {
-            // AI rotation is often applied to the visual container rather than
-            // EnemyAI.transform. Keep only its small transform chain.
-            var root = entry.Component.transform;
-            var selected = new HashSet<Transform>();
-            var meshRoot = GameAccess.Read(entry.Component, "meshContainer") as Transform;
-            var animator = GameAccess.Read(entry.Component, "creatureAnimator") as Animator;
-            foreach (var candidate in new[] { meshRoot, animator != null && animator ? animator.transform : null })
-                for (var bone = candidate; bone != null && bone && bone != root && bone.IsChildOf(root); bone = bone.parent)
-                    selected.Add(bone);
-            foreach (var bone in selected.Take(12))
-            {
-                if (!GameAccess.Finite(bone.localPosition) || !GameAccess.Finite(bone.localRotation) ||
-                    !GameAccess.Finite(bone.localScale)) continue;
-                entity.Bones.Add(new BonePose { Path = RelativePath(root, bone),
-                    Position = GameAccess.Vec(bone.localPosition), Rotation = GameAccess.Rot(bone.localRotation),
-                    Scale = GameAccess.Vec(bone.localScale) });
-            }
-        }
 
         private void CaptureBones(Entry entry, EntitySnapshot entity)
         {

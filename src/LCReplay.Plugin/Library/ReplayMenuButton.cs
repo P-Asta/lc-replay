@@ -19,6 +19,8 @@ namespace LCReplay.Plugin.Library
         {
             "UnityEngine.RectTransform", "UnityEngine.Transform", "UnityEngine.CanvasRenderer",
             "UnityEngine.Animator", "UnityEngine.UI.Button", "UnityEngine.UI.Image",
+            // Menu mods may add this passive size hint to the vanilla Settings row.
+            "UnityEngine.UI.LayoutElement",
             "TMPro.TextMeshProUGUI", "TMPro.TMP_SubMeshUI"
         };
         private readonly Action open;

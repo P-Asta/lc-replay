@@ -491,7 +491,12 @@ namespace LCReplay.Plugin.Library
             }
         }
 
-        private void RequestClose() { if (DismissDialog()) return; Close(); CloseRequested?.Invoke(); }
+        private void RequestClose()
+        {
+            if (DismissDialog()) return;
+            if (CloseRequested != null) CloseRequested();
+            else Close();
+        }
         private bool IsRecording(ArchiveSegment segment) => SamePath(segment.FilePath, _recordingPath);
         private static bool SamePath(string a, string b) => a.Length != 0 && b.Length != 0 && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         private static void SetText(TMP_Text? text, string value) { if (text != null && text.text != value) text.text = value; }

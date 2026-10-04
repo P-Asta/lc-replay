@@ -22,8 +22,6 @@ namespace LCReplay.Plugin.UI
         public static readonly Color White = new Color(1f, 0.86f, 0.64f, 1f);
         public static readonly Color ButtonColor = new Color(0.42f, 0.025f, 0.015f, 1f);
         public static readonly Color HeaderColor = new Color(0.34f, 0.01f, 0.008f, 1f);
-        private readonly Dictionary<Behaviour, bool> _suspended = new Dictionary<Behaviour, bool>();
-        private readonly Dictionary<Selectable, bool> _selectableStates = new Dictionary<Selectable, bool>();
         private readonly List<Object> _ownedAssets = new List<Object>();
         private readonly bool _modal;
         private CursorLockMode _cursorLock;
@@ -41,7 +39,6 @@ namespace LCReplay.Plugin.UI
         private string _fontFile = "";
         private MethodInfo? _addGlyph;
         private Texture2D? _fontAtlas;
-        private float _nextScan;
         private bool _disposed, _inputReleased;
         public GameObject Root { get; private set; } = null!;
         public RectTransform Rect => (RectTransform)Root.transform;
@@ -67,10 +64,12 @@ namespace LCReplay.Plugin.UI
                 scaler.referenceResolution = new Vector2(1920, 1080);
                 scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
                 FindFont();
-                if (modal) SuspendOtherInput();
-                SuspendOtherSelectables();
                 var dispatcher = NewRect(Root.transform, "Replay EventSystem").gameObject;
                 _eventSystem = dispatcher.AddComponent<EventSystem>();
+                // The replay canvas owns pointer input while it is visible. Do not
+                // mutate the game's buttons or input modules: a menu can change
+                // while playback is open, making a saved enabled state stale.
+                _eventSystem.sendNavigationEvents = false;
                 var inputType = AppDomain.CurrentDomain.GetAssemblies()
                     .Select(assembly => assembly.GetType("UnityEngine.InputSystem.UI.InputSystemUIInputModule", false)).FirstOrDefault(type => type != null);
                 if (inputType == null) throw new InvalidOperationException("The game's Input System UI module is unavailable.");
@@ -79,13 +78,11 @@ namespace LCReplay.Plugin.UI
                 // those actions again needlessly allocates another default asset.
                 if (inputType.GetProperty("actionsAsset", BindingFlags.Public | BindingFlags.Instance)?.GetValue(input, null) == null)
                     inputType.GetMethod("AssignDefaultActions", BindingFlags.Public | BindingFlags.Instance)?.Invoke(input, null);
-                if (!modal)
-                {
-                    // Playback has its own Space/arrow shortcuts. UI navigation and
-                    // submit must not run a second action for the same key press.
-                    inputType.GetProperty("move", BindingFlags.Public | BindingFlags.Instance)?.SetValue(input, null, null);
-                    inputType.GetProperty("submit", BindingFlags.Public | BindingFlags.Instance)?.SetValue(input, null, null);
-                }
+                // The archive and playback have their own keyboard shortcuts.
+                // Navigation/submit would be able to select a live-game button
+                // outside this canvas even when the replay has pointer focus.
+                inputType.GetProperty("move", BindingFlags.Public | BindingFlags.Instance)?.SetValue(input, null, null);
+                inputType.GetProperty("submit", BindingFlags.Public | BindingFlags.Instance)?.SetValue(input, null, null);
                 EventSystem.current = _eventSystem;
                 if (modal)
                 {
@@ -113,10 +110,8 @@ namespace LCReplay.Plugin.UI
                 foreach (var text in _textValues.Keys)
                     if (text != null) text.ForceMeshUpdate(false, true);
             if (_modal) { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; }
-            if (Time.realtimeSinceStartup < _nextScan) return;
-            _nextScan = Time.realtimeSinceStartup + 0.5f;
-            if (_modal) SuspendOtherInput();
-            SuspendOtherSelectables();
+            // New game menus can appear during replay. Keep pointer dispatch on
+            // this canvas without disabling their EventSystems or Selectables.
             if (_eventSystem != null) EventSystem.current = _eventSystem;
         }
 
@@ -388,42 +383,18 @@ namespace LCReplay.Plugin.UI
             return changed;
         }
 
-        private void SuspendOtherInput()
-        {
-            foreach (var behaviour in Resources.FindObjectsOfTypeAll<Behaviour>())
-            {
-                if (behaviour == null || Owns(behaviour) || !behaviour.gameObject.scene.IsValid() || !behaviour.gameObject.scene.isLoaded) continue;
-                if (!(behaviour is EventSystem) && !(behaviour is BaseInputModule) && !(behaviour is GraphicRaycaster)) continue;
-                if (!_suspended.ContainsKey(behaviour)) _suspended.Add(behaviour, behaviour.enabled);
-                behaviour.enabled = false;
-            }
-        }
-
-        private void SuspendOtherSelectables()
-        {
-            // Navigation.Automatic searches all scene Selectables, even on a disabled
-            // Canvas or GraphicRaycaster. Prevent keyboard submit from reaching them.
-            foreach (var selectable in Resources.FindObjectsOfTypeAll<Selectable>())
-            {
-                if (selectable == null || Owns(selectable) || !selectable.gameObject.scene.IsValid() || !selectable.gameObject.scene.isLoaded) continue;
-                if (!_selectableStates.ContainsKey(selectable)) _selectableStates.Add(selectable, selectable.interactable);
-                selectable.interactable = false;
-            }
-        }
-
         internal void ReleaseInput()
         {
             if (_inputReleased) return;
             _inputReleased = true;
-            foreach (var pair in _suspended) if (pair.Key != null) pair.Key.enabled = pair.Value;
-            _suspended.Clear();
-            foreach (var pair in _selectableStates) if (pair.Key != null) pair.Key.interactable = pair.Value;
-            _selectableStates.Clear();
-            if (_previousEventSystem != null)
+            if (EventSystem.current == _eventSystem || !Usable(EventSystem.current))
             {
-                EventSystem.current = _previousEventSystem;
-                if (_previousSelection != null && _previousSelection.activeInHierarchy)
-                    _previousEventSystem.SetSelectedGameObject(_previousSelection);
+                var restore = Usable(_previousEventSystem) ? _previousEventSystem :
+                    Resources.FindObjectsOfTypeAll<EventSystem>().FirstOrDefault(system =>
+                        system != _eventSystem && Usable(system));
+                EventSystem.current = restore;
+                if (restore == _previousEventSystem && _previousSelection != null && _previousSelection.activeInHierarchy)
+                    restore!.SetSelectedGameObject(_previousSelection);
             }
             _previousEventSystem = null;
             _previousSelection = null;
@@ -438,11 +409,11 @@ namespace LCReplay.Plugin.UI
             _previousSelection = _previousEventSystem != null ? _previousEventSystem.currentSelectedGameObject : null;
             _cursorLock = Cursor.lockState;
             _cursorVisible = Cursor.visible;
-            if (_modal) SuspendOtherInput();
-            SuspendOtherSelectables();
             if (_eventSystem != null) EventSystem.current = _eventSystem;
-            _nextScan = 0;
         }
+
+        private static bool Usable(EventSystem? system) => system && system!.enabled &&
+            system.gameObject.activeInHierarchy && system.gameObject.scene.IsValid() && system.gameObject.scene.isLoaded;
 
         public void Dispose()
         {

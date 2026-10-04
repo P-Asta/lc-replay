@@ -13,6 +13,35 @@ namespace LCReplay.Plugin.Playback
     {
         private static readonly Dictionary<string, Dictionary<string, Quaternion>> Poses =
             new Dictionary<string, Dictionary<string, Quaternion>>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, (Component Prefab, string Path, string ItemName)> EnemyHolders =
+            new Dictionary<string, (Component, string, string)>(StringComparer.Ordinal);
+
+        internal static bool TryEnemyHolderPath(string enemyName, string itemName, out string path)
+        {
+            path = "";
+            if (!EnemyHolders.TryGetValue(enemyName, out var binding) || !binding.Prefab)
+            {
+                var prefab = PrefabAssetRegistry.ResolvePrefab("enemy:" + enemyName);
+                if (!prefab) return false;
+                // These are the installed game's serialized attachment points.
+                // New captures store the exact parent path, so arbitrary modded
+                // holders do not need field-name guesses during playback.
+                var point = GameAccess.Read(prefab, "gunPoint") as Transform;
+                var requiredItem = "";
+                if (point && GameAccess.Read(prefab, "gunPrefab") is GameObject gun && gun &&
+                    GameAccess.Type("GrabbableObject") is Type itemType)
+                    requiredItem = GameAccess.Read(GameAccess.Read(gun.GetComponent(itemType), "itemProperties"), "itemName") as string ?? "";
+                if (!point) point = GameAccess.Read(prefab, "grabTarget") as Transform;
+                var parentPath = point && (point == prefab!.transform || point!.IsChildOf(prefab.transform))
+                    ? EntityTracker.RelativePath(prefab.transform, point!) : "";
+                if (EnemyHolders.Count >= 256) EnemyHolders.Clear();
+                EnemyHolders[enemyName] = binding = (prefab!, parentPath, requiredItem);
+            }
+            if (binding.Path.Length == 0 || binding.ItemName.Length != 0 &&
+                !string.Equals(binding.ItemName, itemName, StringComparison.OrdinalIgnoreCase)) return false;
+            path = binding.Path;
+            return true;
+        }
 
         internal static bool Apply(Dictionary<string, Transform> bones, bool bothHands, string clip, int hash, float weight)
         {

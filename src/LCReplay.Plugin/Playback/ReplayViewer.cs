@@ -27,6 +27,8 @@ namespace LCReplay.Plugin.Playback
     /// </summary>
     public sealed class ReplayViewer : IDisposable
     {
+        private static int pendingSceneCleanup;
+        internal static bool HasPendingSceneCleanup => pendingSceneCleanup != 0 || NativePlayerAssetLoader.HasPendingLoads;
         private const int ReplayLayer = 31;
         private static readonly MethodInfo ShallowClone = typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!;
         private ReplaySession _session;
@@ -47,8 +49,6 @@ namespace LCReplay.Plugin.Playback
         private readonly bool _preserveLiveAudio;
         private AudioListener? _liveListener;
         private readonly Dictionary<Renderer, bool> _rendererStates = new Dictionary<Renderer, bool>();
-        private readonly Dictionary<Behaviour, bool> _uiInputStates = new Dictionary<Behaviour, bool>();
-        private readonly Dictionary<Type, bool> _uiInputTypes = new Dictionary<Type, bool>();
         private readonly Dictionary<string, EntityVisual> _entities = new Dictionary<string, EntityVisual>();
         private readonly Dictionary<string, Dictionary<int, List<ReplayEvent>>> _animationEvents =
             new Dictionary<string, Dictionary<int, List<ReplayEvent>>>(StringComparer.Ordinal);
@@ -76,6 +76,7 @@ namespace LCReplay.Plugin.Playback
         private readonly Dictionary<Color32, Material> _materials = new Dictionary<Color32, Material>();
         private readonly List<GameObject> _worldObjects = new List<GameObject>();
         private readonly List<Mesh> _worldMeshes = new List<Mesh>();
+        private readonly HashSet<Mesh> _sharedNativeMeshes = new HashSet<Mesh>();
         private readonly List<InstancedGeometry> _instancedGeometry = new List<InstancedGeometry>();
         private readonly List<Renderer> _proceduralGrassRenderers = new List<Renderer>();
         private readonly List<ParticleSystem> _worldParticles = new List<ParticleSystem>();
@@ -139,6 +140,7 @@ namespace LCReplay.Plugin.Playback
         private readonly HashSet<string> _hazardsWithModel = new HashSet<string>(StringComparer.Ordinal);
         private readonly Dictionary<string, BakedPlayerBody> _bakedPlayers = new Dictionary<string, BakedPlayerBody>(StringComparer.Ordinal);
         private readonly HashSet<string> _nativeSkinIds = new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, Transform> _nativeRigidParts = new Dictionary<string, Transform>(StringComparer.Ordinal);
         private Material? _playerOutlineMaterial;
         private Material? _turretBeamMaterial;
         private Texture2D? _turretBeamTexture;
@@ -200,11 +202,15 @@ namespace LCReplay.Plugin.Playback
         private Shader? _unlitShader;
         private bool _worldHasLighting;
         private bool _indoor;
-        private PropertyInfo? _eventSystemCurrentProperty;
-        private Component? _savedEventSystem;
-        private bool _eventSystemRemembered;
         private ReplayFrame _frame = new ReplayFrame();
         private readonly ReplayTimelineSampler _sampler = new ReplayTimelineSampler();
+        private readonly ReplayTimelineSampler _transitionSampler = new ReplayTimelineSampler();
+        private readonly ReplaySession _transitionSession = new ReplaySession();
+        private readonly ReplayFrame _transitionLeft = new ReplayFrame();
+        private readonly ReplayFrame _transitionRight = new ReplayFrame();
+        private int _animationSeekGeneration;
+        private ReplayVehicleCargo? _vehicleCargo;
+        private ReplayVehicleLeadIn? _vehicleLeadIn;
         private WorldSnapshot? _displayWorld;
         private int _worldIndex = -2;
         private bool _allowEquivalentWorldReuse;
@@ -245,7 +251,7 @@ namespace LCReplay.Plugin.Playback
         public double Duration => _recording.Duration;
         public double LocalTime => _recording.LocalTime(_partIndex, Time);
         public bool IsBuffering => _requestedPart >= 0 || _worldBuild != null || _assetScene?.IsLoading == true;
-        internal bool CanPark => !_disposed && !_parked && !IsBuffering && !_pendingHudSeek.HasValue &&
+        internal bool CanPark => !_preserveLiveAudio && !_disposed && !_parked && !IsBuffering && !_pendingHudSeek.HasValue &&
             _root && _scene.IsValid() && _scene.isLoaded && _playbackError == null;
         internal string[] SourceFiles => _recording.Parts.Select(part => part.FilePath)
             .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -365,7 +371,14 @@ namespace LCReplay.Plugin.Playback
                 _exteriorFill.cullingMask = 1 << ReplayLayer;
                 AddRenderPipelineLightData(fillObject, 2.5f);
                 _exteriorFill.intensity = 2.5f;
-                _assetScene = new SceneAssetReplay(ReplayLayer, UpdateInteriorVisibility);
+                // This viewer-only fill compensates surface lighting; it is not
+                // a second sun. HDRP otherwise also scatters it through recorded
+                // fog, brightening the whole atmosphere as the camera turns.
+                var fillDataType = GameAccess.Type("UnityEngine.Rendering.HighDefinition.HDAdditionalLightData");
+                var fillData = fillDataType == null ? null : fillObject.GetComponent(fillDataType);
+                if (fillData) SetOptionalMember(fillData!, "volumetricDimmer", 0f);
+                _assetScene = new SceneAssetReplay(ReplayLayer, UpdateInteriorVisibility,
+                    _preserveLiveAudio ? _root.transform : null);
                 CreateBurstRenderer();
                 IndexAnimationEvents();
                 SuspendOtherViews();
@@ -434,11 +447,12 @@ namespace LCReplay.Plugin.Playback
                 while (watch.Elapsed.TotalMilliseconds < 12)
                 {
                     if (!_worldBuild.MoveNext())
-                    { _worldBuild.Dispose(); _worldBuild = null; _worldBuildProgress = 1f; ApplyFrame(); break; }
+                    { _worldBuild.Dispose(); _worldBuild = null; _worldBuildProgress = 1f; _showWorldLoading = false; ApplyFrame(); break; }
                     _worldBuildProgress = Mathf.Clamp01(_worldBuild.Current);
-                    if (_assetScene?.IsLoading == true) break;
+                    if (_assetScene?.IsLoading == true || NativePlayerAssetLoader.HasPendingLoads) break;
                 }
-                _hud?.SetLoading(_showWorldLoading, _assetScene?.IsLoading == true ? "Loading moon scenery" : "Building replay scene",
+                _hud?.SetLoading(_showWorldLoading, NativePlayerAssetLoader.HasPendingLoads ? "Loading player model" :
+                    _assetScene?.IsLoading == true ? "Loading moon scenery" : "Building replay scene",
                     .85f + .13f * _worldBuildProgress);
                 if (_worldBuild != null) return;
             }
@@ -457,7 +471,7 @@ namespace LCReplay.Plugin.Playback
             }
             if (IsPlaying && !IsBuffering && !hudSeekApplied && !_pendingHudSeek.HasValue)
             {
-                Seek(Time + delta * Speed);
+                SeekInternal(Time + delta * Speed, false);
                 if (Time >= Duration) IsPlaying = false;
             }
             if (ReplayInput.WasPressed("Space")) TogglePause();
@@ -651,11 +665,18 @@ namespace LCReplay.Plugin.Playback
             _hud.Root.SetActive(!_hud.Root.activeSelf);
         }
 
-        public void Seek(double time)
+        public void Seek(double time) => SeekInternal(time, true);
+
+        private void SeekInternal(double time, bool explicitSeek)
         {
             if (_disposed) return;
             if (double.IsNaN(time) || double.IsInfinity(time)) return;
             var target = Math.Max(0, Math.Min(Duration, time));
+            // Direct navigation can skip the state boundary which clears a
+            // controller's retained, unkeyed pose. Reset lazily once at the new
+            // sample, while continuous playback and paused repeats stay warm.
+            if (explicitSeek && Math.Abs(target - Time) > .000001)
+                unchecked { _animationSeekGeneration++; }
             var targetPart = _recording.Locate(target);
             if (targetPart != _partIndex)
             {
@@ -668,14 +689,15 @@ namespace LCReplay.Plugin.Playback
             }
             _requestedPart = -1;
             Time = target;
-            _frame = _sampler.Sample(_session, LocalTime);
+            _frame = _sampler.SampleReusable(_session, LocalTime);
+            _vehicleLeadIn?.Apply(_frame);
             var index = FindWorld(LocalTime);
             if (index != _worldIndex)
             {
                 var world = index < 0 ? null : AssembleWorld(index);
                 // Late actors in this capture set were prepared during the
                 // initial build. Their appearance only changes active roots.
-                if (world != null && CanReuseWorld(world, _allowEquivalentWorldReuse))
+                if (world != null && CanReuseWorld(world, true))
                 {
                     _allowEquivalentWorldReuse = false;
                     RefreshWorldEnvironment(world);
@@ -685,8 +707,9 @@ namespace LCReplay.Plugin.Playback
                     return;
                 }
                 _allowEquivalentWorldReuse = false;
-                _showWorldLoading = _displayWorld == null || world == null || world.CaptureSetId.Length == 0 ||
-                    world.CaptureSetId != _displayWorld.CaptureSetId;
+                // A rebuild removes the old geometry before replacing it. Keep
+                // the loading overlay visible even when seeking within one map.
+                _showWorldLoading = world == null || !CanExtendWorld(world);
                 _worldBuild?.Dispose();
                 if (_useFutureMeshes && (world == null || _futureWorld?.CaptureSetId != world.CaptureSetId))
                     ReleaseFutureResources();
@@ -722,7 +745,7 @@ namespace LCReplay.Plugin.Playback
                         _assetScene?.SetWorld(world);
                     }
                 }
-                _worldBuild = RebuildWorldSteps(world).GetEnumerator();
+                _worldBuild = RebuildWorldSteps(world, !_showWorldLoading).GetEnumerator();
                 _worldBuildProgress = 0;
                 _worldIndex = index;
             }
@@ -756,6 +779,21 @@ namespace LCReplay.Plugin.Playback
         {
             var known = new HashSet<string>(available.Select(id), StringComparer.Ordinal);
             return required.All(item => known.Contains(id(item)));
+        }
+
+        private bool CanExtendWorld(WorldSnapshot world)
+        {
+            var old = _displayWorld;
+            if (old == null || _worldBuild != null || world.CaptureSetId.Length == 0 ||
+                old.CaptureSetId != world.CaptureSetId || old.AssetScene != world.AssetScene ||
+                old.AssetBuildIndex != world.AssetBuildIndex) return false;
+            // Capture IDs identify immutable geometry within one map. Assets
+            // with an existing ID must also remain equivalent before appending.
+            return ContainsEquivalent(old.Materials, world.Materials.Where(m => old.Materials.Any(o => o.Id == m.Id)), m => m.Id, SameSnapshot) &&
+                ContainsEquivalent(old.Textures, world.Textures.Where(t => old.Textures.Any(o => o.Id == t.Id)), t => t.Id, SameTexture) &&
+                ContainsEquivalent(old.Lights, world.Lights.Where(t => old.Lights.Any(o => o.Id == t.Id)), t => t.Id, SameSnapshot) &&
+                ContainsEquivalent(old.LocalFogs, world.LocalFogs.Where(t => old.LocalFogs.Any(o => o.Id == t.Id)), t => t.Id, SameSnapshot) &&
+                ContainsEquivalent(old.ParticleEmitters, world.ParticleEmitters.Where(t => old.ParticleEmitters.Any(o => o.Id == t.Id)), t => t.Id, SameSnapshot);
         }
 
         private static bool ContainsSame<T>(IEnumerable<T> available, IEnumerable<T> required, Func<T, string> id)
@@ -794,6 +832,24 @@ namespace LCReplay.Plugin.Playback
             UpdateInteriorVisibility();
         }
 
+        private double WorldAvailableTime(ReplayRecord record)
+        {
+            var part = _recording.Parts[_partIndex];
+            var time = record.Time + part.Offset;
+            // Carried worlds have their window-local time clamped to zero.
+            // Their original file timestamp still describes availability when
+            // this scene is retained across a later backward seek.
+            if (part.Window != null && record.SourceTime.HasValue)
+                time = Math.Min(time, record.SourceTime.Value + part.Offset - part.Window.Start);
+            if (_landingMapSet.Length != 0 && record.World?.CaptureSetId == _landingMapSet)
+                foreach (var initial in _session.Worlds.Where(value => value.World?.CaptureSetId == _landingMapSet))
+                {
+                    if (ReferenceEquals(initial, record)) return Math.Min(time, _landingMapStart);
+                    if (initial.World!.Layer == "interior") break;
+                }
+            return time;
+        }
+
         private void PreloadNextMap()
         {
             if (_assetScene == null || _worldIndex < 0 || _futureWorld != null) return;
@@ -807,7 +863,8 @@ namespace LCReplay.Plugin.Playback
                     !_session.Worlds.Skip(i + 1).Any(record => record.World?.CaptureSetId == candidate.CaptureSetId &&
                         record.World.Layer == "interior")) continue;
                 var world = AssembleWorld(i);
-                if (world.AssetScene.Length != 0 && world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count != 0)
+                if (!_preserveLiveAudio && world.AssetScene.Length != 0 &&
+                    world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count != 0)
                 {
                     var preload = new SceneAssetReplay(ReplayLayer, UpdateInteriorVisibility);
                     try
@@ -826,15 +883,15 @@ namespace LCReplay.Plugin.Playback
                 {
                     foreach (var geometry in record.World!.Geometry)
                         if (geometry.EntityId.Length == 0 && !_futureWorldFirstSeen.ContainsKey(geometry.Id))
-                            _futureWorldFirstSeen[geometry.Id] = record.Time + _recording.Parts[_partIndex].Offset;
+                            _futureWorldFirstSeen[geometry.Id] = WorldAvailableTime(record);
                     foreach (var light in record.World.Lights)
                         if (light.EntityId.Length == 0) _futureWorldFirstSeen.TryAdd("light:" + light.Id,
-                            record.Time + _recording.Parts[_partIndex].Offset);
+                            WorldAvailableTime(record));
                     foreach (var fog in record.World.LocalFogs)
-                        _futureWorldFirstSeen.TryAdd("fog:" + fog.Id, record.Time + _recording.Parts[_partIndex].Offset);
+                        _futureWorldFirstSeen.TryAdd("fog:" + fog.Id, WorldAvailableTime(record));
                     foreach (var emitter in record.World.ParticleEmitters)
                         if (emitter.EntityId.Length == 0) _futureWorldFirstSeen.TryAdd("particle:" + emitter.Id,
-                            record.Time + _recording.Parts[_partIndex].Offset);
+                            WorldAvailableTime(record));
                 }
                 break;
             }
@@ -843,7 +900,7 @@ namespace LCReplay.Plugin.Playback
         private void WarmFutureMap()
         {
             if (_futureWarmFailed || _futureWorld == null) return;
-            if (_futureAssetScene == null && _futureWorld.AssetScene.Length != 0 &&
+            if (!_preserveLiveAudio && _futureAssetScene == null && _futureWorld.AssetScene.Length != 0 &&
                 _futureWorld.AssetRendererPaths.Count + _futureWorld.AssetTerrainPaths.Count != 0) return;
             if (_futureAssetScene != null && (_futureAssetScene.IsLoading ||
                 !_futureAssetScene.Scene.IsValid() || !_futureAssetScene.Scene.isLoaded)) return;
@@ -893,7 +950,7 @@ namespace LCReplay.Plugin.Playback
             _futureAppearanceBuild = null;
             _futureAppearance?.Dispose();
             _futureAppearance = null;
-            foreach (var mesh in _futureMeshes.Values) if (mesh) Object.Destroy(mesh);
+            foreach (var mesh in _futureMeshes.Values) DestroyOwnedMesh(mesh);
             _futureMeshes.Clear();
             _futureMeshBytes = 0;
             _futureMeshIndex = 0;
@@ -913,8 +970,6 @@ namespace LCReplay.Plugin.Playback
             var current = session.Worlds.LastOrDefault(record => record.Time <= localTime)?.World;
             if (current == null || current.CaptureSetId.Length == 0 ||
                 current.CaptureSetId != _displayWorld.CaptureSetId) return false;
-            if (session.Frames.SelectMany(frame => frame.Anchors)
-                .Any(anchor => !_anchorRoots.ContainsKey(anchor.Id))) return false;
             var actors = new HashSet<string>(session.Frames.SelectMany(frame => frame.Entities)
                 .Select(entity => entity.Id), StringComparer.Ordinal);
             var parts = session.Worlds.Where(record => record.Time <= localTime)
@@ -948,7 +1003,7 @@ namespace LCReplay.Plugin.Playback
                 Rooms = parts.LastOrDefault(part => part.Layer == "interior")?.Rooms ?? new List<RoomSnapshot>()
             };
             var displayed = _displayWorld;
-            return displayed != null && candidate.Geometry.All(geometry => _renderGeometrySources.ContainsKey(geometry.Id)) &&
+            return CanExtendWorld(candidate) || displayed != null && candidate.Geometry.All(geometry => _renderGeometrySources.ContainsKey(geometry.Id)) &&
                 candidate.Rooms.All(room => _interiorRooms.ContainsKey(room.Id)) &&
                 ContainsAll(displayed.AssetRendererPaths, candidate.AssetRendererPaths, path => path) &&
                 ContainsAll(displayed.AssetTerrainPaths, candidate.AssetTerrainPaths, path => path) &&
@@ -1023,19 +1078,16 @@ namespace LCReplay.Plugin.Playback
             _requestedPart = -1;
             AlignLandingMap(ready, part);
             var previousWindow = _recording.Parts[_partIndex].Window;
-            var targetWindow = _recording.Parts[part].Window;
-            var sameRevision = _displayWorld != null && previousWindow != null && targetWindow != null &&
-                ReferenceEquals(previousWindow.Index, targetWindow.Index) &&
-                previousWindow.Index.WorldRevisionAt(previousWindow.Start + LocalTime) ==
-                targetWindow.Index.WorldRevisionAt(targetWindow.Start + _recording.LocalTime(part, target));
-            // An initial map can already contain later exterior/interior world
-            // records, even though the file revision changes at this boundary.
-            var retainWorld = sameRevision || CanReuseWindowWorld(ready, _recording.LocalTime(part, target));
-            _allowEquivalentWorldReuse = retainWorld && !sameRevision;
+            // A matching file revision does not prove the current scene is
+            // complete: its build may still be running, and bounded windows
+            // can need actor geometry or anchors absent from the prior one.
+            var retainWorld = CanReuseWindowWorld(ready, _recording.LocalTime(part, target));
+            _allowEquivalentWorldReuse = retainWorld;
             if (!retainWorld) { _visualState?.Dispose(); _visualState = null; }
             if (!retainWorld) foreach (var entity in _entities.Values)
             {
                 if (entity.SkeletonMesh != null) Object.Destroy(entity.SkeletonMesh);
+                entity.NativeRig?.Dispose();
                 if (entity.Root != null) { entity.Root.SetActive(false); Object.Destroy(entity.Root); }
             }
             if (!retainWorld) _entities.Clear();
@@ -1047,8 +1099,8 @@ namespace LCReplay.Plugin.Playback
             _session = ready;
             if (_recording.Parts[part].Window == null)
                 _playerDeaths.AddRange(DeathsInSession(ready, _recording.Parts[part].Offset));
-            IndexAnimationEvents();
             _partIndex = part;
+            IndexAnimationEvents();
             if (retainWorld && _displayWorld != null)
             {
                 _visualState?.Dispose();
@@ -1057,7 +1109,9 @@ namespace LCReplay.Plugin.Playback
             }
             _hasRendererPoseCapability = _session.Header.Capabilities.Contains("child-renderer-poses");
             _sparseRendererPoses = _session.Header.Capabilities.Contains("sparse-entity-renderer-poses");
-            _worldIndex = sameRevision ? FindWorld(_recording.LocalTime(part, target)) : -2;
+            // Always resolve the target world's contents. Seek can then reuse a
+            // verified complete scene or rebuild it if the new window needs more.
+            _worldIndex = -2;
             Seek(target);
             RebuildAudio();
             var selected = _players.FirstOrDefault(player => player.Name == selectedName);
@@ -1130,10 +1184,15 @@ namespace LCReplay.Plugin.Playback
                 var visual = GetEntity(entity.Id);
                 _inactiveEntities.Remove(entity.Id);
                 SetActiveIfChanged(visual.Root, entity.Active && IsVisualKind(entity.Kind));
-                if (entity.PoseFromItemEvents) ApplyItemMotion(visual, entity.Id, LocalTime);
-                else SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
+                if (!entity.PoseFromItemEvents || !ApplyItemMotion(visual, entity.Id, LocalTime))
+                    SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
                 ConfigureProxy(visual, entity);
                 ConfigureSwarm(visual, entity);
+                if (!double.IsNaN(visual.LastAnimationTime) &&
+                    (visual.AnimationSeekGeneration != _animationSeekGeneration || Time + .000001 < visual.LastAnimationTime))
+                    visual.NativeRig?.ResetAnimationHistory();
+                visual.AnimationSeekGeneration = _animationSeekGeneration;
+                visual.LastAnimationTime = Time;
                 visual.NativeRig?.ResetPose();
                 visual.NativeRig?.ApplyView(entity.ViewRotation);
                 if (!_session.Header.Capabilities.Contains("actor-bone-poses"))
@@ -1141,8 +1200,10 @@ namespace LCReplay.Plugin.Playback
                 UpdateBones(visual, entity.Bones);
                 visual.NativeRig?.ApplyPlayerState(entity);
                 visual.NativeRig?.Evaluate();
-                if (visual.NativeRig != null && entity.Bones.Count == 0)
+                if (visual.NativeRig != null)
                     BlendNativeAnimationTransition(visual, entity, LocalTime);
+                visual.NativeRig?.ApplyEnemyProceduralPose(entity);
+                visual.NativeRig?.ApplyBlendShapes(entity);
                 // The game keeps unused player slots in the scene. Their hidden spawn
                 // positions must not become the initial camera target or a selectable player.
                 if (entity.Active && entity.Kind.Equals("player", StringComparison.OrdinalIgnoreCase)) _players.Add(entity);
@@ -1195,6 +1256,46 @@ namespace LCReplay.Plugin.Playback
 
         private void ApplyHeldItemPlacement()
         {
+            foreach (var item in _frame.Entities)
+            {
+                if (item.Kind != "item" || !item.Active || !_entities.TryGetValue(item.Id, out var itemVisual)) continue;
+                item.State.TryGetValue("$heldBy", out var ownerId);
+                var enemyHeld = item.State.TryGetValue("isHeldByEnemy", out var heldByEnemy) && heldByEnemy == "True";
+                if (!enemyHeld && string.IsNullOrEmpty(ownerId) ||
+                    !string.IsNullOrEmpty(ownerId) && _entities.TryGetValue(ownerId, out var explicitOwner) && explicitOwner.Kind != "enemy" ||
+                    !TryHeldItemPose(item, out var positionOffset, out var rotationOffset)) continue;
+                Transform? selected = null;
+                var closest = 2.25f; var second = float.PositiveInfinity;
+                foreach (var holder in _frame.Entities)
+                {
+                    if (holder.Kind != "enemy" || !holder.Active ||
+                        holder.State.TryGetValue("isEnemyDead", out var dead) && dead == "True" ||
+                        !string.IsNullOrEmpty(ownerId) && ownerId != holder.Id ||
+                        !_entities.TryGetValue(holder.Id, out var enemyVisual) || enemyVisual.NativeRig == null) continue;
+                    Transform? parent = null;
+                    if (!string.IsNullOrEmpty(ownerId) && item.State.TryGetValue("$heldParent", out var recordedPath))
+                    {
+                        if (recordedPath.Length == 0) parent = enemyVisual.Root.transform;
+                        else enemyVisual.NativeRig.Bones.TryGetValue(recordedPath, out parent);
+                    }
+                    else if (NativeHeldItemPose.TryEnemyHolderPath(holder.Name, item.Name, out var path))
+                        enemyVisual.NativeRig.Bones.TryGetValue(path, out parent);
+                    if (!parent) continue;
+                    if (!string.IsNullOrEmpty(ownerId)) { selected = parent; break; }
+                    // Legacy files omitted enemy ownership. Recover only a
+                    // nearby, unambiguous installed attachment point; never
+                    // move an unrelated loose item onto the nearest enemy.
+                    var target = parent!.position + parent.rotation * positionOffset;
+                    var distance = (target - ToVector(item.Position)).sqrMagnitude;
+                    if (distance < closest) { second = selected ? closest : float.PositiveInfinity; closest = distance; selected = parent; }
+                    else if (distance < second) second = distance;
+                }
+                if (!selected || string.IsNullOrEmpty(ownerId) && second - closest < .04f) continue;
+                var position = selected!.position + selected.rotation * positionOffset;
+                var rotation = selected.rotation * rotationOffset;
+                if (GameAccess.Finite(position) && GameAccess.Finite(rotation))
+                    itemVisual.Root.transform.SetPositionAndRotation(position, rotation);
+            }
             // The local game's held object follows LocalItemHolder on the
             // first-person rig. Remote objects follow ServerItemHolder on the
             // animated third-person hand. Old files contain only the former
@@ -1202,8 +1303,31 @@ namespace LCReplay.Plugin.Playback
             // and the installed Item offsets without storing another stream.
             foreach (var holder in _players)
             {
-                if (!holder.State.TryGetValue("currentlyHeldObjectServer", out var itemId) ||
-                    itemId.Length == 0 || IsDead(holder)) continue;
+                if (IsDead(holder)) continue;
+                holder.State.TryGetValue("currentlyHeldObjectServer", out var itemId);
+                if (string.IsNullOrEmpty(itemId) && holder.State.TryGetValue("currentItemSlot", out var slot) && slot == "50")
+                    holder.State.TryGetValue("ItemOnlySlot", out itemId);
+                if (string.IsNullOrEmpty(itemId))
+                {
+                    // Legacy utility-slot captures can omit the player's item
+                    // reference while retaining the item's explicit owner. Use
+                    // only one visible held candidate; hidden pocket items and
+                    // ambiguous ownership must not be moved into the hand.
+                    EntitySnapshot? candidate = null;
+                    foreach (var heldItem in _frame.Entities)
+                    {
+                        if (heldItem.Kind != "item" || !heldItem.Active ||
+                            !heldItem.State.TryGetValue("$heldBy", out var heldOwner) || heldOwner != holder.Id ||
+                            !heldItem.State.TryGetValue("isHeld", out var isHeld) || isHeld != "True" ||
+                            heldItem.State.TryGetValue("isPocketed", out var pocketed) && pocketed == "True" ||
+                            !_dynamicGeometry.Any(pair => pair.Value.EntityId == heldItem.Id &&
+                                _geometryObjects.TryGetValue(pair.Key, out var geometryObject) && geometryObject && geometryObject.activeInHierarchy)) continue;
+                        if (candidate != null) { candidate = null; break; }
+                        candidate = heldItem;
+                    }
+                    itemId = candidate?.Id;
+                }
+                if (string.IsNullOrEmpty(itemId)) continue;
                 var firstPerson = _follow && _followTargetDistance < .45f && _selectedId == holder.Id;
                 var item = _frame.Entities.FirstOrDefault(entity => entity.Id == itemId && entity.Kind == "item" && entity.Active);
                 if (item == null || !item.State.TryGetValue("isHeld", out var held) ||
@@ -1220,6 +1344,15 @@ namespace LCReplay.Plugin.Playback
                 if (!TryHeldItemPose(item, out var positionOffset, out var rotationOffset) ||
                     !_entities.TryGetValue(holder.Id, out var playerVisual)) continue;
                 var nativeHolder = playerVisual.NativeRig?.ServerItemHolder;
+                if (item.State.TryGetValue("$heldParent", out var heldPath) &&
+                    !item.State.ContainsKey("$heldFirstPerson") && playerVisual.NativeRig != null)
+                {
+                    // Body-mounted items (for example a belt bag) have their
+                    // own parent; ordinary local hand items still map to the
+                    // third-person ServerItemHolder outside first-person view.
+                    if (heldPath.Length == 0) nativeHolder = playerVisual.Root.transform;
+                    else if (playerVisual.NativeRig.Bones.TryGetValue(heldPath, out var recordedHolder)) nativeHolder = recordedHolder;
+                }
                 var hand = playerVisual.Bones.FirstOrDefault(pair =>
                     pair.Key.EndsWith("/hand.R[0]", StringComparison.Ordinal) && pair.Value).Value;
                 if (!nativeHolder && !hand) continue;
@@ -1316,25 +1449,66 @@ namespace LCReplay.Plugin.Playback
             {
                 if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || obj == null) continue;
                 var baseline = pair.Value;
+                _entities.TryGetValue(baseline.EntityId, out var actor);
+                var preferredLod = actor?.NativeRig?.IsPreferredLod(pair.Key) ?? true;
                 if (_currentRendererPoses.TryGetValue(pair.Key, out var pose))
                 {
-                    if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
-                    SetActiveIfChanged(obj, pose.Active);
+                    if (_nativeRigidParts.TryGetValue(pair.Key, out var nativePart) && nativePart && actor?.Kind == "enemy")
+                    {
+                        // Flattened renderer snapshots in old files can describe
+                        // a different animation phase from the reconstructed skin.
+                        // Keep attached eyes/jaws on the same evaluated hierarchy.
+                        // New captures already apply procedural local bone poses
+                        // to this hierarchy after the Animator has evaluated.
+                        if (obj.transform.parent != nativePart) obj.transform.SetParent(nativePart, false);
+                        obj.transform.localPosition = Vector3.zero;
+                        obj.transform.localRotation = Quaternion.identity;
+                        obj.transform.localScale = Vector3.one;
+                    }
+                    else if (_nativeRigidParts.ContainsKey(pair.Key) && actor != null)
+                    {
+                        // Runtime-driven head/face movement is authoritative
+                        // when the recorder sampled it outside the Animator.
+                        if (obj.transform.parent != actor.Root.transform) obj.transform.SetParent(actor.Root.transform, false);
+                        SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
+                    }
+                    else if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
+                    SetActiveIfChanged(obj, pose.Active && preferredLod);
                 }
                 else
                 {
-                    if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
+                    if (_nativeRigidParts.TryGetValue(pair.Key, out var animatedPart) && animatedPart)
+                    {
+                        if (obj.transform.parent != animatedPart) obj.transform.SetParent(animatedPart, false);
+                        obj.transform.localPosition = Vector3.zero;
+                        obj.transform.localRotation = Quaternion.identity;
+                        obj.transform.localScale = Vector3.one;
+                    }
+                    else if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
                     // Older files use complete lists: a missing ID marks a
                     // destroyed child. Sparse files store explicit tombstones.
-                    SetActiveIfChanged(obj, baseline.AttachedBonePath.Length != 0 || _sparseRendererPoses ? baseline.Active :
-                        !_completeRendererLists.Contains(baseline.EntityId));
+                    var active = baseline.AttachedBonePath.Length != 0 || _sparseRendererPoses ? baseline.Active :
+                        !_completeRendererLists.Contains(baseline.EntityId);
+                    // Old world captures defaulted every entity mesh to active,
+                    // including the Cruiser's disabled wreck. Use its recorded
+                    // damage state until an explicit renderer pose is available.
+                    if (actor?.Kind == "vehicle" && (baseline.Name == "MainBody" || baseline.Name == "MainBodyDestroyed"))
+                    {
+                        var vehicle = _frame.Entities.FirstOrDefault(value => value.Id == baseline.EntityId);
+                        if (vehicle?.Name.StartsWith("CompanyCruiser", StringComparison.Ordinal) == true &&
+                            vehicle.State.TryGetValue("carDestroyed", out var destroyed) && bool.TryParse(destroyed, out var wrecked))
+                            active = baseline.Name == "MainBodyDestroyed" ? wrecked : !wrecked;
+                    }
+                    SetActiveIfChanged(obj, preferredLod && active);
                 }
+                if (obj.activeSelf) actor?.NativeRig?.EnsureVisibleBranch(obj.transform);
             }
             foreach (var player in _players)
             {
                 if (IsDead(player)) continue;
                 foreach (var pair in _dynamicGeometry)
                     if (pair.Value.EntityId == player.Id && pair.Value.Name.StartsWith("LOD", StringComparison.Ordinal) &&
+                        (_entities[player.Id].NativeRig?.IsPreferredLod(pair.Key) ?? true) &&
                         _geometryObjects.TryGetValue(pair.Key, out var body) && body)
                     {
                         SetActiveIfChanged(body, true);
@@ -1511,6 +1685,14 @@ namespace LCReplay.Plugin.Playback
 
         private void IndexAnimationEvents()
         {
+            _vehicleCargo = new ReplayVehicleCargo(_session);
+            _vehicleLeadIn = ReplayVehicleLeadIn.Create(_session, _partIndex);
+            foreach (var visual in _entities.Values)
+            { visual.NativeTransitions.Clear(); visual.ActiveNativeTransitions.Clear(); }
+            _transitionSession.Events = _session.Events;
+            _transitionSession.Frames.Clear();
+            _transitionLeft.Entities.Clear();
+            _transitionRight.Entities.Clear();
             _windowActorIds.Clear();
             foreach (var frame in _session.Frames)
                 foreach (var actor in frame.Entities) _windowActorIds.Add(actor.Id);
@@ -1638,6 +1820,12 @@ namespace LCReplay.Plugin.Playback
             if (low == 0) return false;
             var evt = events[low - 1];
             var motion = evt.ItemMotion!;
+            if (_vehicleCargo?.TrySample(evt, low < events.Count ? events[low] : null, time, _frame,
+                out var cargoPosition, out var cargoRotation) == true)
+            {
+                SetTransform(visual.Root.transform, cargoPosition, cargoRotation, motion.Scale);
+                return true;
+            }
             var position = ToVector(motion.Position);
             var rotation = ToQuaternion(motion.Rotation);
             if (motion.Mode == "fall")
@@ -1655,8 +1843,19 @@ namespace LCReplay.Plugin.Playback
             }
             if (motion.AnchorId.Length != 0)
             {
-                var anchor = _frame.Anchors.FirstOrDefault(value => value.Id == motion.AnchorId);
-                if (anchor != null)
+                if (motion.AnchorId.StartsWith("entity:", StringComparison.Ordinal))
+                {
+                    EntitySnapshot? owner = null;
+                    foreach (var candidate in _frame.Entities)
+                        if (candidate.Active && motion.AnchorId.Length == candidate.Id.Length + 7 &&
+                            string.CompareOrdinal(motion.AnchorId, 7, candidate.Id, 0, candidate.Id.Length) == 0)
+                        { owner = candidate; break; }
+                    if (owner == null) return false;
+                    var ownerRotation = ToQuaternion(owner.Rotation);
+                    position = ToVector(owner.Position) + ownerRotation * Vector3.Scale(position, ToVector(owner.Scale));
+                    rotation = ownerRotation * rotation;
+                }
+                else if (_frame.Anchors.FirstOrDefault(value => value.Id == motion.AnchorId) is AnchorPose anchor)
                 {
                     var anchorRotation = ToQuaternion(anchor.Rotation);
                     position = ToVector(anchor.Position) + anchorRotation * Vector3.Scale(position, ToVector(anchor.Scale));
@@ -1761,14 +1960,15 @@ namespace LCReplay.Plugin.Playback
                     continue;
                 }
                 if (!animator.enabled) { animator.enabled = true; animator.Rebind(); }
-                if (visual.NativeRig != null && visual.Kind != "player") animator.WriteDefaultValues();
+                var playerController = visual.NativeRig?.PlayerController(animator);
+                if (visual.NativeRig != null && visual.Kind != "player" && !playerController.HasValue)
+                    animator.WriteDefaultValues();
                 var acceptedKeys = visual.AnimatorParameterKeysByPath.TryGetValue(path, out var keys)
                     ? keys : visual.AnimatorParameterKeys;
                 ApplyAnimationParameters(visual, bindingKey, animator, acceptedKeys, time);
-                var playerController = visual.NativeRig?.PlayerController(animator);
                 foreach (var pair in layers)
                 {
-                    if (pair.Key >= animator.layerCount) continue;
+                    if (pair.Key >= (playerController.HasValue ? playerController.Value.GetLayerCount() : animator.layerCount)) continue;
                     var events = pair.Value;
                     var low = 0; var high = events.Count;
                     while (low < high)
@@ -1780,15 +1980,8 @@ namespace LCReplay.Plugin.Playback
                     var evt = events[low - 1];
                     if (!evt.Data.TryGetValue("hash", out var hashText) ||
                         !int.TryParse(hashText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var hash) ||
-                        !evt.Data.TryGetValue("normalizedTime", out var normalizedText) ||
-                        !float.TryParse(normalizedText, NumberStyles.Float, CultureInfo.InvariantCulture, out var normalized) ||
+                        !ReplayAnimationClock.TrySample(evt, time, out var normalized, low < events.Count ? events[low] : null) ||
                         !(playerController.HasValue ? playerController.Value.HasState(pair.Key, hash) : animator.HasState(pair.Key, hash))) continue;
-                    if (evt.Data.TryGetValue("duration", out var durationText) &&
-                        float.TryParse(durationText, NumberStyles.Float, CultureInfo.InvariantCulture, out var duration) &&
-                        duration > .001f && evt.Data.TryGetValue("speed", out var speedText) &&
-                        float.TryParse(speedText, NumberStyles.Float, CultureInfo.InvariantCulture, out var speed))
-                        normalized += (float)((time - evt.Time) * speed / duration);
-                    if (!GameAccess.Finite(normalized)) continue;
                     if (evt.Data.TryGetValue("weight", out var weightText) &&
                         float.TryParse(weightText, NumberStyles.Float, CultureInfo.InvariantCulture, out var weight) &&
                         GameAccess.Finite(weight))
@@ -1874,8 +2067,13 @@ namespace LCReplay.Plugin.Playback
                 {
                     var now = states[index].Data;
                     var prior = states[index - 1].Data;
-                    if (now.GetValueOrDefault("hash") == prior.GetValueOrDefault("hash") &&
-                        now.GetValueOrDefault("clip") == prior.GetValueOrDefault("clip")) continue;
+                    var hash = now.GetValueOrDefault("hash");
+                    var priorHash = prior.GetValueOrDefault("hash");
+                    // A blend tree can change its dominant clip without
+                    // leaving its state. Its native weights already blend;
+                    // starting a second transition would interrupt that motion.
+                    if (hash == priorHash && (!string.IsNullOrEmpty(hash) ||
+                        now.GetValueOrDefault("clip") == prior.GetValueOrDefault("clip"))) continue;
                     if (pair.Key != 0 && !Active(now) && !Active(prior)) break;
                     boundary = Math.Max(boundary, states[index].Time);
                     break;
@@ -1888,33 +2086,139 @@ namespace LCReplay.Plugin.Playback
         {
             const float blendSeconds = .18f;
             var entityId = entity.Id;
-            if (visual.NativeRig == null || !_animationPaths.TryGetValue(entityId, out var paths)) return;
-            var boundary = double.NegativeInfinity;
+            // Complete visual samples already contain the game's real transition
+            // output. Legacy files often contain only a few procedural roots;
+            // those roots must not disable smoothing of the remaining skeleton.
+            if (!entity.Active || visual.NativeRig == null || _session.Header.Capabilities.Contains("actor-bone-poses") ||
+                entity.Kind == "enemy" && _session.Header.Capabilities.Contains("enemy-visual-bone-poses") &&
+                    !entity.State.ContainsKey("$omittedBones") ||
+                !_animationPaths.TryGetValue(entityId, out var paths)) return;
+            var rebuilt = false;
+            var active = visual.ActiveNativeTransitions;
+            active.Clear();
             foreach (var path in paths)
                 if (_animationEvents.TryGetValue(AnimationBindingKey(entityId, path), out var layers))
-                    boundary = Math.Max(boundary, AnimationTransitionBoundary(layers, time, blendSeconds));
-            if (!double.IsFinite(boundary) || time - boundary >= blendSeconds) return;
-            var incoming = visual.NativeRig.Bones.Values.Where(bone => bone)
-                .Select(bone => (Bone: bone, Position: bone.localPosition, Rotation: bone.localRotation)).ToArray();
-            // Evaluate both sides through the same native controller and IK rig.
-            // Restore current controller state before displaying the mixed pose.
-            visual.NativeRig.ResetPose();
-            visual.NativeRig.ApplyView(entity.ViewRotation);
-            ApplyAnimation(visual, entityId, Math.Max(0, boundary - .001));
-            visual.NativeRig.ApplyPlayerState(entity);
-            visual.NativeRig.Evaluate();
-            var previous = incoming.Select(pose => (Position: pose.Bone.localPosition, Rotation: pose.Bone.localRotation)).ToArray();
-            visual.NativeRig.ResetPose();
-            visual.NativeRig.ApplyView(entity.ViewRotation);
-            ApplyAnimation(visual, entityId, time);
-            visual.NativeRig.ApplyPlayerState(entity);
-            visual.NativeRig.Evaluate();
-            var amount = Mathf.SmoothStep(0f, 1f, (float)((time - boundary) / blendSeconds));
-            for (var i = 0; i < incoming.Length; i++)
+                {
+                    var boundary = AnimationTransitionBoundary(layers, time, blendSeconds);
+                    if (!double.IsFinite(boundary) || time - boundary >= blendSeconds) continue;
+                    var outgoing = NativeTransitionSource(visual, entity, path, layers, boundary, 0, ref rebuilt);
+                    if (outgoing != null) active.Add(outgoing);
+                }
+            if (active.Count == 0) return;
+            if (rebuilt)
             {
-                incoming[i].Bone.localPosition = Vector3.LerpUnclamped(previous[i].Position, incoming[i].Position, amount);
-                incoming[i].Bone.localRotation = Quaternion.SlerpUnclamped(previous[i].Rotation, incoming[i].Rotation, amount);
+                // A cached source was evaluated through a fresh stream. Return
+                // to a fresh current stream too, so unkeyed head/limb defaults
+                // do not depend on whether playback arrived forwards or by seek.
+                visual.NativeRig.ResetAnimationHistory();
+                SampleNativeTransitionPose(visual, entity, time);
             }
+            foreach (var transition in active)
+            {
+                var amount = Mathf.SmoothStep(0f, 1f, (float)((time - transition.Boundary) / blendSeconds));
+                foreach (var pose in transition.Poses)
+                    if (pose.Bone)
+                    {
+                        pose.Bone.localPosition = Vector3.LerpUnclamped(pose.Position, pose.Bone.localPosition, amount);
+                        pose.Bone.localRotation = Quaternion.SlerpUnclamped(pose.Rotation, pose.Bone.localRotation, amount);
+                        pose.Bone.localScale = Vector3.LerpUnclamped(pose.Scale, pose.Bone.localScale, amount);
+                    }
+            }
+        }
+
+        private NativeTransitionPose? NativeTransitionSource(EntityVisual visual, EntitySnapshot entity, string path,
+            Dictionary<int, List<ReplayEvent>> layers, double boundary, int depth, ref bool rebuilt)
+        {
+            foreach (var cached in visual.NativeTransitions)
+                if (cached.Path == path && cached.Boundary == boundary) return cached;
+            var rig = visual.NativeRig!;
+            if (!visual.Animators.TryGetValue(path, out var animator)) animator = path.Length == 0 ? visual.Animator : null;
+            if (!animator) return null;
+            // Manual Play() retains unkeyed values in its controller stream.
+            // Build a boundary reference once, never on each blended frame.
+            var before = Math.Max(0, boundary - .001);
+            var source = TransitionEntityAt(entity, before);
+            if (source == null || !source.Active || source.Kind != entity.Kind) return null;
+            rig.ResetAnimationHistory();
+            SampleNativeTransitionPose(visual, source, before);
+            rebuilt = true;
+            var branch = animator!.transform;
+            var nested = rig.Animators.Values.Where(value => value && value != animator && value.transform.IsChildOf(branch))
+                .Select(value => value.transform).ToArray();
+            var poses = rig.Bones.Values.Where(bone => bone && (bone == branch || bone.IsChildOf(branch)) &&
+                !nested.Any(child => bone == child || bone.IsChildOf(child)))
+                .Select(bone => (Bone: bone, Position: bone.localPosition, Rotation: bone.localRotation, Scale: bone.localScale)).ToArray();
+            // A short intermediate clip can be interrupted before its blend
+            // finishes. Carry its already blended boundary pose into the next
+            // transition instead of popping to its unblended destination.
+            var priorBoundary = AnimationTransitionBoundary(layers, before, .18f);
+            if (depth < 7 && double.IsFinite(priorBoundary) && before - priorBoundary < .18)
+            {
+                var prior = NativeTransitionSource(visual, entity, path, layers, priorBoundary, depth + 1, ref rebuilt);
+                if (prior != null)
+                {
+                    var amount = Mathf.SmoothStep(0f, 1f, (float)((before - priorBoundary) / .18));
+                    for (var index = 0; index < poses.Length; index++)
+                    {
+                        if (index >= prior.Poses.Length || prior.Poses[index].Bone != poses[index].Bone) continue;
+                        poses[index].Position = Vector3.LerpUnclamped(prior.Poses[index].Position, poses[index].Position, amount);
+                        poses[index].Rotation = Quaternion.SlerpUnclamped(prior.Poses[index].Rotation, poses[index].Rotation, amount);
+                        poses[index].Scale = Vector3.LerpUnclamped(prior.Poses[index].Scale, poses[index].Scale, amount);
+                    }
+                }
+            }
+            var result = new NativeTransitionPose { Path = path, Boundary = boundary, Poses = poses };
+            // Capture supports eight Animator branches; retain each branch's
+            // bounded interruption chain without evicting another active fade.
+            if (visual.NativeTransitions.Count == 64) visual.NativeTransitions.RemoveAt(0);
+            visual.NativeTransitions.Add(result);
+            return result;
+        }
+
+        private void SampleNativeTransitionPose(EntityVisual visual, EntitySnapshot entity, double time)
+        {
+            SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
+            visual.NativeRig!.ResetPose();
+            visual.NativeRig.ApplyView(entity.ViewRotation);
+            ApplyAnimation(visual, entity.Id, time);
+            UpdateBones(visual, entity.Bones);
+            visual.NativeRig.ApplyPlayerState(entity);
+            visual.NativeRig.Evaluate();
+        }
+
+        private EntitySnapshot? TransitionEntityAt(EntitySnapshot fallback, double time)
+        {
+            // Cache inputs at the boundary itself. Using the current frame's
+            // look/IK targets would make a direct seek cache a different source
+            // from ordinary playback. Sample only this actor, avoiding a second
+            // copy of every particle, line and actor when a transition begins.
+            var frames = _session.Frames;
+            if (frames.Count == 0) return null;
+            var low = 0; var high = frames.Count;
+            while (low < high)
+            {
+                var middle = low + (high - low) / 2;
+                if (frames[middle].Time <= time) low = middle + 1; else high = middle;
+            }
+            var index = Math.Max(0, low - 1);
+            _transitionLeft.Entities.Clear();
+            _transitionLeft.Time = frames[index].Time;
+            foreach (var entity in frames[index].Entities)
+                if (entity.Id == fallback.Id) { _transitionLeft.Entities.Add(entity); break; }
+            if (_transitionLeft.Entities.Count == 0) return null;
+            _transitionSession.Frames.Clear();
+            _transitionSession.Frames.Add(_transitionLeft);
+            _transitionSession.Events = _session.Events;
+            _transitionSession.Duration = _session.Duration;
+            if (index + 1 < frames.Count)
+            {
+                _transitionRight.Entities.Clear();
+                _transitionRight.Time = frames[index + 1].Time;
+                foreach (var entity in frames[index + 1].Entities)
+                    if (entity.Id == fallback.Id) { _transitionRight.Entities.Add(entity); break; }
+                _transitionSession.Frames.Add(_transitionRight);
+            }
+            return _transitionSampler.SampleReusable(_transitionSession, time).Entities[0];
         }
 
         private static bool Active(Dictionary<string, string> state) =>
@@ -2005,22 +2309,24 @@ namespace LCReplay.Plugin.Playback
 
         private void EnsureNativeActorRig(EntityVisual visual, string key, string entityId)
         {
-            if ((visual.Kind != "enemy" && visual.Kind != "player") || visual.NativeRig != null) return;
+            if ((visual.Kind != "enemy" && visual.Kind != "player") || visual.NativeRig != null || visual.NativeRigFailed) return;
             Component? prefab = null;
             RuntimeAnimatorController? remote = null;
             if (visual.Kind == "enemy") prefab = key.Length == 0 ? null : PrefabAssetRegistry.ResolvePrefab(key);
             else
             {
+                prefab = PrefabAssetRegistry.ResolvePrefab("player");
                 var round = GameAccess.Singleton("StartOfRound") ?? GameAccess.Find("StartOfRound").FirstOrDefault();
                 if (GameAccess.Read(round, "otherClientsAnimatorController") == null && GameAccess.Type("StartOfRound") is Type roundType)
                     round = Resources.FindObjectsOfTypeAll(roundType).FirstOrDefault(candidate =>
                         GameAccess.Read(candidate, "otherClientsAnimatorController") is RuntimeAnimatorController) ?? round;
-                var player = GameAccess.Read(round, "playerPrefab") as GameObject;
+                var player = prefab ? prefab!.gameObject : GameAccess.Read(round, "playerPrefab") as GameObject;
                 if (!player && GameAccess.Type("GameNetcodeStuff.PlayerControllerB") is Type type)
                     player = Resources.FindObjectsOfTypeAll(type).OfType<Component>()
                         .Where(component => component && !component.gameObject.scene.IsValid()).Select(component => component.gameObject).FirstOrDefault();
                 if (player && GameAccess.Type("GameNetcodeStuff.PlayerControllerB") is Type playerType) prefab = player!.GetComponent(playerType);
-                remote = GameAccess.Read(round, "otherClientsAnimatorController") as RuntimeAnimatorController;
+                remote = GameAccess.Read(round, "otherClientsAnimatorController") as RuntimeAnimatorController ??
+                    PrefabAssetRegistry.RemotePlayerController;
                 // Preserve the recorded local/remote body controller using the
                 // verified player assets, even when they share state hashes.
                 if (prefab && GameAccess.Read(prefab, "playerBodyAnimator") is Animator body &&
@@ -2029,12 +2335,20 @@ namespace LCReplay.Plugin.Playback
                 {
                     var state = states.LastOrDefault(evt => evt.Time <= LocalTime && evt.Data.ContainsKey("controller")) ??
                         states.FirstOrDefault(evt => evt.Data.ContainsKey("controller"));
-                    var local = GameAccess.Read(round, "localClientAnimatorController") as RuntimeAnimatorController;
+                    var local = GameAccess.Read(round, "localClientAnimatorController") as RuntimeAnimatorController ??
+                        PrefabAssetRegistry.LocalPlayerController;
                     if (state != null && local && state.Data["controller"] == local!.name) remote = local;
                 }
             }
             if (!prefab) return;
-            visual.NativeRig = new NativeActorRig(prefab!, visual.Root.transform, ReplayLayer, remote);
+            try { visual.NativeRig = new NativeActorRig(prefab!, visual.Root.transform, ReplayLayer, remote); }
+            catch (Exception error)
+            {
+                visual.NativeRigFailed = true;
+                UnityEngine.Debug.LogWarning("LC Replay: using recorded geometry for " + entityId +
+                    " because its installed animation rig could not be isolated: " + error.Message);
+                return;
+            }
             foreach (var bone in visual.NativeRig.Bones) visual.Bones[bone.Key] = bone.Value;
             foreach (var animator in visual.Animators.Values) if (animator) Object.Destroy(animator);
             visual.Animator = null; visual.Animators.Clear(); visual.AnimatorParameterKeys.Clear();
@@ -2047,8 +2361,12 @@ namespace LCReplay.Plugin.Playback
             visual.Animators[path] = animator;
             if (visual.Animator == null) visual.Animator = animator;
             var keys = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var parameter in animator.parameters)
+            var controller = visual.NativeRig?.PlayerController(animator);
+            var parameters = controller.HasValue ? null : animator.parameters;
+            var count = controller.HasValue ? controller.Value.GetParameterCount() : parameters!.Length;
+            for (var index = 0; index < count; index++)
             {
+                var parameter = controller.HasValue ? controller.Value.GetParameter(index) : parameters![index];
                 var prefix = parameter.type == AnimatorControllerParameterType.Float ? "f" :
                     parameter.type == AnimatorControllerParameterType.Int ? "i" :
                     parameter.type == AnimatorControllerParameterType.Bool ? "b" : "";
@@ -2066,6 +2384,7 @@ namespace LCReplay.Plugin.Playback
             var oneHanded = visual.Kind == "player" && HeldTwoHandedAnimation(bindingKey) == false;
             var selectedLayer = -1;
             ReplayEvent? selectedEvent = null;
+            ReplayEvent? nextEvent = null;
             foreach (var pair in layers)
             {
                 if (onlyLayer.HasValue && pair.Key != onlyLayer.Value) continue;
@@ -2084,7 +2403,11 @@ namespace LCReplay.Plugin.Playback
                     overlayClip.Length == 0 || !candidate.Data.TryGetValue("weight", out var weightText) ||
                     !float.TryParse(weightText, NumberStyles.Float, CultureInfo.InvariantCulture, out var weight) ||
                     weight < .05f)) continue;
-                if (pair.Key > selectedLayer) { selectedLayer = pair.Key; selectedEvent = candidate; }
+                if (pair.Key > selectedLayer)
+                {
+                    selectedLayer = pair.Key; selectedEvent = candidate;
+                    nextEvent = low < events.Count ? events[low] : null;
+                }
             }
             if (selectedEvent == null) return false;
             // An active upper layer takes precedence even in older recordings
@@ -2110,14 +2433,7 @@ namespace LCReplay.Plugin.Playback
                 int.TryParse(hashText, NumberStyles.Integer, CultureInfo.InvariantCulture, out hash);
             if (!tracks.TryGetValue(AnimationTrackKey(layer, hash, clip), out var track) &&
                 !tracks.TryGetValue(AnimationTrackKey(layer, 0, clip), out track)) return false;
-            if (!evt.Data.TryGetValue("normalizedTime", out var normalizedText) ||
-                !float.TryParse(normalizedText, NumberStyles.Float, CultureInfo.InvariantCulture, out var normalized)) return false;
-            if (evt.Data.TryGetValue("duration", out var durationText) &&
-                float.TryParse(durationText, NumberStyles.Float, CultureInfo.InvariantCulture, out var duration) && duration > .001f &&
-                evt.Data.TryGetValue("speed", out var speedText) &&
-                float.TryParse(speedText, NumberStyles.Float, CultureInfo.InvariantCulture, out var speed))
-                normalized += (float)((time - evt.Time) * speed / duration);
-            if (!GameAccess.Finite(normalized)) return false;
+            if (!ReplayAnimationClock.TrySample(evt, time, out var normalized, nextEvent)) return false;
             var phase = track.Looping ? Mathf.Repeat(normalized, 1f) : Mathf.Clamp01(normalized);
             var phases = track.Phases;
             var upper = Array.BinarySearch(phases, phase);
@@ -2235,6 +2551,19 @@ namespace LCReplay.Plugin.Playback
                 else if (part.Layer == "interior") interior = part;
             }
             if (exteriors.Count == 0) return selected;
+            // The opening map can already contain actor meshes for the next
+            // bounded frame window. Keep those meshes built, with their roots
+            // hidden until observed, so a cruiser does not wait for a full map
+            // rebuild when its first frame arrives. Later spawn updates remain
+            // subject to the current window's actor filter.
+            var openingActorGeometry = new HashSet<string>(StringComparer.Ordinal);
+            for (var i = first; i <= mapEnd; i++)
+            {
+                var part = _session.Worlds[i].World;
+                if (part?.CaptureSetId != selected.CaptureSetId) continue;
+                foreach (var geometry in part.Geometry)
+                    if (geometry.EntityId.Length != 0) openingActorGeometry.Add(geometry.Id);
+            }
             var parts = interior == null ? exteriors : exteriors.Concat(new[] { interior! }).ToList();
             var source = exteriors.LastOrDefault(part => part.AssetScene.Length != 0) ?? exteriors.First();
             var generation = exteriors.LastOrDefault(part => part.LevelId >= 0) ?? source;
@@ -2307,10 +2636,11 @@ namespace LCReplay.Plugin.Playback
                     if (textureIds.Contains(texture.Id) && ownedTextures.Add(texture.Id)) combined.Textures.Add(texture);
             }
             // A capture set can contain meshes from every past spawn. Keep
-            // actors needed by this bounded window (including future spawns),
-            // with any shared-mesh dependency, instead of rebuilding old ones.
+            // actors needed by this bounded window plus the opening map's
+            // actor meshes, with any shared-mesh dependency.
             var requiredMeshes = new HashSet<string>(combined.Geometry.Where(geometry =>
-                geometry.EntityId.Length == 0 || _windowActorIds.Contains(geometry.EntityId))
+                geometry.EntityId.Length == 0 || openingActorGeometry.Contains(geometry.Id) ||
+                _windowActorIds.Contains(geometry.EntityId))
                 .Select(geometry => geometry.Id), StringComparer.Ordinal);
             var changed = true;
             while (changed)
@@ -2470,8 +2800,14 @@ namespace LCReplay.Plugin.Playback
             SetCameraSpeed(_cameraSpeed * Mathf.Pow(1.15f, steps));
         }
 
-        private IEnumerable<float> RebuildWorldSteps(WorldSnapshot? world)
+        private IEnumerable<float> RebuildWorldSteps(WorldSnapshot? world, bool append)
         {
+            // Keep a complete map visible while a new frame window introduces
+            // actors. Meshes, materials and anchors already built remain owned
+            // by this viewer and are released only when the map actually changes.
+            var previous = append ? _displayWorld : null;
+            if (!append)
+            {
             foreach (var id in _entities.Keys.Where(id => !_windowActorIds.Contains(id)).ToArray())
             {
                 var obsolete = _entities[id];
@@ -2494,13 +2830,14 @@ namespace LCReplay.Plugin.Playback
             for (var i = 0; i < _worldMeshes.Count; i++)
             {
                 var mesh = _worldMeshes[i];
-                if (mesh != null) Object.Destroy(mesh);
+                DestroyOwnedMesh(mesh);
                 _worldMeshes[i] = null!;
                 if (i % 48 == 47) yield return .035f;
             }
             foreach (var mask in _worldFogMasks) if (mask) Object.Destroy(mask);
             _bakedPlayers.Clear();
             _nativeSkinIds.Clear();
+            _nativeRigidParts.Clear();
             _worldObjects.Clear();
             _worldMeshes.Clear();
             _worldFogMasks.Clear();
@@ -2534,10 +2871,22 @@ namespace LCReplay.Plugin.Playback
             _appearance?.Dispose(); _appearance = null;
             foreach (var material in _particleMaterials.Values) if (material) Object.Destroy(material);
             _particleMaterials.Clear();
+            }
+            else
+            {
+                _visualState?.Dispose(); _visualState = null;
+                _environment?.Dispose(); _environment = null;
+                _structureAudio?.Dispose(); _structureAudio = null;
+            }
             var legacyItemLights = world != null ? LegacyItemEmissionLights(world).ToArray() : Array.Empty<LightSnapshot>();
             _worldHasLighting = world != null && (world.Lights.Count != 0 || legacyItemLights.Length != 0);
             foreach (var visual in _entities.Values)
-            { visual.GeometryCount = 0; visual.RestBones.Clear(); visual.Proxy.SetActive(_showSkeletons && IsVisualKind(visual.Kind)); }
+            {
+                if (append) continue;
+                visual.GeometryCount = 0; visual.RestBones.Clear();
+                visual.NativeRig?.ClearRendererBindings();
+                visual.Proxy.SetActive(_showSkeletons && IsVisualKind(visual.Kind));
+            }
             foreach (var actor in _session.Frames.SelectMany(frame => frame.Entities).Where(entity => IsVisualKind(entity.Kind))
                 .GroupBy(entity => entity.Id).Select(group => group.First()))
             {
@@ -2552,6 +2901,9 @@ namespace LCReplay.Plugin.Playback
                 if (_exteriorFill) _exteriorFill!.enabled = false;
                 yield break;
             }
+            if (world.Geometry.Any(geometry => geometry.PrefabKey == "player" ||
+                _entities.TryGetValue(geometry.EntityId, out var actor) && actor.Kind == "player"))
+                foreach (var step in NativePlayerAssetLoader.Prepare()) yield return .04f + .03f * step;
             _environment = new ReplayEnvironment(world, _root!.transform, ReplayLayer,
                 _session.Header.Capabilities.Contains("world-postfx-without-player-filters"));
             _environment.SetFogEnabled(_fogEnabled);
@@ -2567,6 +2919,16 @@ namespace LCReplay.Plugin.Playback
             world = (WorldSnapshot)ShallowClone.Invoke(world, null);
             world.Geometry = world.Geometry.Select(geometry => (GeometrySnapshot)ShallowClone.Invoke(geometry, null)).ToList();
             world.Materials = new List<MaterialSnapshot>(world.Materials);
+            if (previous != null)
+            {
+                AddMissing(world.Geometry, previous.Geometry, g => g.Id);
+                AddMissing(world.Materials, previous.Materials, m => m.Id);
+                world.Textures = world.Textures.ToList(); AddMissing(world.Textures, previous.Textures, t => t.Id);
+                world.Lights = world.Lights.ToList(); AddMissing(world.Lights, previous.Lights, l => l.Id);
+                world.ParticleEmitters = world.ParticleEmitters.ToList(); AddMissing(world.ParticleEmitters, previous.ParticleEmitters, p => p.Id);
+                world.LocalFogs = world.LocalFogs.ToList(); AddMissing(world.LocalFogs, previous.LocalFogs, f => f.Id);
+                world.Rooms = world.Rooms.ToList(); AddMissing(world.Rooms, previous.Rooms, r => r.Id);
+            }
             _displayWorld = world;
             NativeSpiderFallback.Restore(world, _frame);
             PrefabAssetRegistry.Restore(world, _session);
@@ -2593,7 +2955,7 @@ namespace LCReplay.Plugin.Playback
                     _futureAppearance?.Dispose();
                     _futureAppearance = null;
                 }
-                _appearance = new ReplayAppearance();
+                _appearance ??= new ReplayAppearance();
             }
             var sameAppearance = appearanceComplete && _futureWorld != null &&
                 world.Materials.Count == _futureWorld.Materials.Count &&
@@ -2620,6 +2982,7 @@ namespace LCReplay.Plugin.Playback
                 .Where(id => id.Length != 0).Distinct(StringComparer.Ordinal);
             foreach (var id in anchorIds)
             {
+                if (_anchorRoots.ContainsKey(id)) continue;
                 var root = NewObject("Moving environment " + id, _root!.transform);
                 _worldObjects.Add(root);
                 _anchorRoots[id] = root.transform;
@@ -2635,15 +2998,15 @@ namespace LCReplay.Plugin.Playback
                 {
                     foreach (var recorded in record.World!.Geometry)
                         if (recorded.EntityId.Length == 0 && !firstSeen.ContainsKey(recorded.Id))
-                            firstSeen[recorded.Id] = record.Time + _recording.Parts[_partIndex].Offset;
+                            firstSeen[recorded.Id] = WorldAvailableTime(record);
                     foreach (var light in record.World.Lights)
                         if (light.EntityId.Length == 0) firstSeen.TryAdd("light:" + light.Id,
-                            record.Time + _recording.Parts[_partIndex].Offset);
+                            WorldAvailableTime(record));
                     foreach (var fog in record.World.LocalFogs)
-                        firstSeen.TryAdd("fog:" + fog.Id, record.Time + _recording.Parts[_partIndex].Offset);
+                        firstSeen.TryAdd("fog:" + fog.Id, WorldAvailableTime(record));
                     foreach (var emitter in record.World.ParticleEmitters)
                         if (emitter.EntityId.Length == 0) firstSeen.TryAdd("particle:" + emitter.Id,
-                            record.Time + _recording.Parts[_partIndex].Offset);
+                            WorldAvailableTime(record));
                 }
             if (_futureWorld?.CaptureSetId == world.CaptureSetId)
                 foreach (var entry in _futureWorldFirstSeen) firstSeen[entry.Key] = entry.Value;
@@ -2658,10 +3021,14 @@ namespace LCReplay.Plugin.Playback
                     meshSources.TryGetValue(source.MeshSourceId, out var next); depth++) source = next;
                 _renderGeometrySources[geometry.Id] = source;
             }
+            var visibleActorIds = new HashSet<string>(_frame.Entities.Where(entity => entity.Active &&
+                IsVisualKind(entity.Kind)).Select(entity => entity.Id), StringComparer.Ordinal);
             var completedGeometry = 0;
             foreach (var geometry in world.Geometry)
             {
                 completedGeometry++;
+                if (append && previous!.Geometry.Any(g => g.Id == geometry.Id)) continue;
+                if (_assetScene?.HasNativeTerrain(geometry.Id) == true) continue;
                 if (geometry.AnchorId == "ship-elevator" && geometry.Name == "ShipInside" &&
                     _anchorRoots.TryGetValue(geometry.AnchorId, out var cabinAnchor))
                 { _shipCabinAnchor = cabinAnchor; _shipCabinCenter = ToVector(geometry.Position); }
@@ -2687,9 +3054,17 @@ namespace LCReplay.Plugin.Playback
                 if (!string.IsNullOrEmpty(geometry.EntityId))
                 {
                     owner = GetEntity(geometry.EntityId);
+                    if (!visibleActorIds.Contains(geometry.EntityId)) SetActiveIfChanged(owner.Root, false);
                     EnsureNativeActorRig(owner, geometry.PrefabKey, geometry.EntityId);
                     parent = geometry.AttachedBonePath.Length == 0 ? owner.Root.transform :
                         GetBone(owner, geometry.AttachedBonePath);
+                    // Rigid parts such as eyes, teeth and a separate head mesh
+                    // still inherit animation from their native prefab node.
+                    // Their recorded root-relative pose is only a fallback when
+                    // the installed actor asset cannot be matched.
+                    if (geometry.BonePaths.Count == 0 && geometry.PrefabRendererPath.Length != 0 &&
+                        owner.NativeRig?.Bones.TryGetValue(geometry.PrefabRendererPath, out var nativePart) == true && nativePart)
+                        parent = nativePart;
                 }
                 else if (geometry.AnchorId.Length != 0 && _anchorRoots.TryGetValue(geometry.AnchorId, out var anchor)) parent = anchor;
                 var obj = NewObject("World " + geometry.Name, parent);
@@ -2702,7 +3077,16 @@ namespace LCReplay.Plugin.Playback
                 }
                 if (owner != null) _dynamicGeometry[geometry.Id] = geometry;
                 else if (geometry.IsMovingSceneRenderer) _movingSceneGeometry[geometry.Id] = geometry;
-                SetTransform(obj.transform, geometry.Position, geometry.Rotation, geometry.Scale);
+                if (owner?.NativeRig != null && parent != owner.Root.transform &&
+                    geometry.BonePaths.Count == 0 && geometry.PrefabRendererPath.Length != 0 &&
+                    owner.NativeRig.Bones.TryGetValue(geometry.PrefabRendererPath, out var attachedPart) && parent == attachedPart)
+                {
+                    obj.transform.localPosition = Vector3.zero;
+                    obj.transform.localRotation = Quaternion.identity;
+                    obj.transform.localScale = Vector3.one;
+                    _nativeRigidParts[geometry.Id] = attachedPart;
+                }
+                else SetTransform(obj.transform, geometry.Position, geometry.Rotation, geometry.Scale);
                 if (!geometry.Active) obj.SetActive(false);
                 var data = _renderGeometrySources[geometry.Id];
                 if (!meshes.TryGetValue(data.Id, out var mesh))
@@ -2732,6 +3116,7 @@ namespace LCReplay.Plugin.Playback
                 }
                 if (obj.GetComponent<Renderer>() is Renderer recordedRenderer)
                 {
+                    owner?.NativeRig?.BindRenderer(geometry);
                     if (owner == null && firstSeen.TryGetValue(geometry.Id, out var availableAt))
                     {
                         _deferredWorldRenderers.Add(new KeyValuePair<Renderer, double>(recordedRenderer, availableAt));
@@ -2789,6 +3174,7 @@ namespace LCReplay.Plugin.Playback
             var interiorShadows = 0;
             foreach (var snapshot in world.Lights.Concat(legacyItemLights))
             {
+                if (append && _worldLights.Any(pair => pair.Value.Id == snapshot.Id)) continue;
                 if (snapshot.Name == "NightVision" || snapshot.Name == "NightVisionRadar") continue;
                 var parent = snapshot.EntityId.Length != 0 ? GetEntity(snapshot.EntityId).Root.transform :
                     snapshot.AnchorId.Length != 0 && _anchorRoots.TryGetValue(snapshot.AnchorId, out var anchor) ? anchor : _root!.transform;
@@ -2834,6 +3220,7 @@ namespace LCReplay.Plugin.Playback
             if (localFogType != null && typeof(Behaviour).IsAssignableFrom(localFogType))
                 foreach (var snapshot in world.LocalFogs)
                 {
+                    if (append && _localFogs.Any(pair => pair.Value.Id == snapshot.Id)) continue;
                     try
                     {
                         var shipExclusion = snapshot.Name.IndexOf("FogExclusionZone", StringComparison.OrdinalIgnoreCase) >= 0 &&
@@ -2862,6 +3249,7 @@ namespace LCReplay.Plugin.Playback
                 }
             foreach (var snapshot in world.ParticleEmitters)
             {
+                if (append && previous!.ParticleEmitters.Any(p => p.Id == snapshot.Id)) continue;
                 var parent = snapshot.EntityId.Length != 0 ? GetEntity(snapshot.EntityId).Root.transform : _root!.transform;
                 _particleAssets ??= new ReplayParticleAssets(_root!.transform, ReplayLayer);
                 var effect = _particleAssets.Create(parent, snapshot.Style, snapshot.Name, snapshot.MaterialId,
@@ -3131,12 +3519,41 @@ namespace LCReplay.Plugin.Playback
                 }
         }
 
+        private void DestroyOwnedMesh(Mesh? mesh)
+        {
+            if (mesh && !_sharedNativeMeshes.Contains(mesh!)) Object.Destroy(mesh);
+        }
+
         private Mesh? MakeGeometryMesh(GeometrySnapshot geometry)
         {
             if (_useFutureMeshes && _futureMeshes.TryGetValue(geometry.Id, out var prepared))
             {
                 _futureMeshes.Remove(geometry.Id);
                 return prepared;
+            }
+            // Native references carry blend-shape frames and vertex channels
+            // used by modded forms that a positions/triangles-only rebuild
+            // cannot reproduce. Clone so replay skin setup never edits assets.
+            var nativeMesh = PrefabAssetRegistry.ResolveMesh(geometry);
+            if (nativeMesh && geometry.BonePaths.Count == 0)
+            {
+                // Unity can clone a GPU-only rigid mesh's metadata without
+                // usable draw buffers. Teeth, jaws and barrels then have valid
+                // bounds but draw nothing. Rigid renderers never modify mesh
+                // data, so retain the exact installed asset and its channels.
+                _sharedNativeMeshes.Add(nativeMesh!);
+                return nativeMesh;
+            }
+            // Player skins are baked on the CPU. Cloning a GPU-only native
+            // mesh preserves its unreadable flag, so neither the baker's
+            // inputs nor its output copies can be accessed. Rebuild those
+            // meshes from Restore's readable snapshot channels instead.
+            // Other native skins keep their blend-shape/extra vertex data.
+            if (nativeMesh && (nativeMesh!.isReadable || geometry.PrefabKey != "player"))
+            {
+                var nativeCopy = Object.Instantiate(nativeMesh!);
+                nativeCopy.name = "Replay geometry " + geometry.Id;
+                return nativeCopy;
             }
             var coordinates = geometry.Vertices;
             var triangles = geometry.Triangles;
@@ -3198,6 +3615,13 @@ namespace LCReplay.Plugin.Playback
 
         private void AddSkin(GameObject obj, Mesh mesh, Material[] materials, GeometrySnapshot geometry, EntityVisual owner)
         {
+            // A shared mesh reference must never acquire another actor's skin
+            // weights or bind poses, even in an unusual mixed legacy reference.
+            if (_sharedNativeMeshes.Contains(mesh))
+            {
+                mesh = Object.Instantiate(mesh);
+                _worldMeshes.Add(mesh);
+            }
             var nativeTransform = owner.NativeRig?.SkinTransform(geometry);
             if (nativeTransform)
             {
@@ -3235,6 +3659,7 @@ namespace LCReplay.Plugin.Playback
             var renderer = obj.AddComponent<SkinnedMeshRenderer>();
             renderer.sharedMesh = mesh; renderer.sharedMaterials = materials; renderer.bones = bones;
             renderer.rootBone = geometry.RootBonePath.Length == 0 ? owner.Root.transform : GetBone(owner, geometry.RootBonePath);
+            owner.NativeRig?.BindSkin(geometry, renderer);
             renderer.updateWhenOffscreen = true;
             renderer.shadowCastingMode = ShadowCastingMode.On; renderer.receiveShadows = true;
             renderer.lightProbeUsage = LightProbeUsage.BlendProbes; renderer.reflectionProbeUsage = ReflectionProbeUsage.BlendProbes;
@@ -3496,8 +3921,6 @@ namespace LCReplay.Plugin.Playback
             {
                 var system = pair.Key.Length == 0 ? _burstParticles : _emitterBursts[pair.Key];
                 var count = 0;
-                var turretTracer = _frame.ParticleStyles.Any(style => style.Id == pair.Key &&
-                    style.Name == "BulletParticle" && style.RenderMode == (int)ParticleSystemRenderMode.None);
                 foreach (var pose in pair.Value)
                 {
                     if (count == _burstBuffer.Length) break;
@@ -3505,8 +3928,7 @@ namespace LCReplay.Plugin.Playback
                     _burstBuffer[count++] = new ParticleSystem.Particle
                     {
                         position = ToVector(pose.Position), velocity = ToVector(pose.Velocity),
-                        startSize3D = turretTracer ? ToVector(pose.Size3D) * .16f :
-                            native ? ToVector(pose.Size3D) : Vector3.one * pose.Size,
+                        startSize3D = native ? ToVector(pose.Size3D) : Vector3.one * pose.Size,
                         rotation3D = native ? ToVector(pose.Rotation3D) : new Vector3(0, 0, pose.Rotation),
                         startLifetime = pose.Lifetime, remainingLifetime = pose.RemainingLifetime,
                         randomSeed = pose.RandomSeed,
@@ -3536,6 +3958,12 @@ namespace LCReplay.Plugin.Playback
             foreach (var id in _frameLines.Keys) _inactiveLines.Add(id);
             foreach (var pose in FrameLines())
             {
+                // turret-laser is a recorded aim ray used to orient native bullet
+                // particles, not a beam rendered by the game's turret. Drawing
+                // both adds an opaque straight stripe over the native glowing trail.
+                if (pose.Id.StartsWith("turret-laser-", StringComparison.Ordinal) &&
+                    _entities.TryGetValue(pose.Id.Substring("turret-laser-".Length), out var turret) &&
+                    turret.NativeTurret?.Bullets) continue;
                 if ((pose.IsInterior ? !_indoor && !_disableInteriorCulling : _indoor) || pose.Positions.Length < 6) continue;
                 if (!_frameLines.TryGetValue(pose.Id, out var line) || !line)
                 {
@@ -3746,6 +4174,15 @@ namespace LCReplay.Plugin.Playback
                 sourceAudio.maxDistance = Mathf.Clamp(max, sourceAudio.minDistance, 10000f);
                 if (data.TryGetValue("rolloff", out var mode) && int.TryParse(mode, out var rolloff) && rolloff >= 0 && rolloff <= 2)
                     sourceAudio.rolloffMode = (AudioRolloffMode)rolloff;
+                // Older recordings store decoded source blocks instead of
+                // native sound actions. Keep held-item and helmet effects
+                // local for spectators in that playback path as well.
+                if (player && sourceAudio.spatialBlend > .5f)
+                {
+                    sourceAudio.maxDistance = Mathf.Min(sourceAudio.maxDistance, 20f);
+                    sourceAudio.minDistance = Mathf.Min(sourceAudio.minDistance, sourceAudio.maxDistance, 2f);
+                    sourceAudio.rolloffMode = AudioRolloffMode.Logarithmic;
+                }
                 sourceAudio.dopplerLevel = 0f;
                 sourceAudio.mute = _mutePlayerAudio && player || SoundOutOfRange(sourceAudio);
                 sourceAudio.pitch = Speed;
@@ -3800,7 +4237,7 @@ namespace LCReplay.Plugin.Playback
         {
             PruneDestroyed(_audioSourceStates); PruneDestroyed(_listenerStates);
             PruneDestroyed(_cameraStates); PruneDestroyed(_canvasStates);
-            PruneDestroyed(_rendererStates); PruneDestroyed(_uiInputStates);
+            PruneDestroyed(_rendererStates);
             foreach (var source in Resources.FindObjectsOfTypeAll<AudioSource>())
             {
                 if (!source || source == _replayAudio || !source.gameObject.scene.IsValid() ||
@@ -3809,26 +4246,26 @@ namespace LCReplay.Plugin.Playback
                 // voice at its original listener. Do not override live mute
                 // changes; inert moon asset sources are disabled separately.
                 if (_preserveLiveAudio) continue;
-                if (!_audioSourceStates.ContainsKey(source)) _audioSourceStates.Add(source, source.mute);
+                if (!_audioSourceStates.ContainsKey(source) && !source.mute) _audioSourceStates.Add(source, false);
                 source.mute = true;
             }
             foreach (var listener in Resources.FindObjectsOfTypeAll<AudioListener>())
             {
                 if (!listener || listener.gameObject.scene == _scene || !listener.gameObject.scene.IsValid() ||
                     !listener.gameObject.scene.isLoaded) continue;
-                if (!_listenerStates.ContainsKey(listener)) _listenerStates.Add(listener, listener.enabled);
-                listener.enabled = _preserveLiveAudio && listener == _liveListener && _listenerStates[listener];
+                if (!_listenerStates.ContainsKey(listener) && listener.enabled) _listenerStates.Add(listener, true);
+                listener.enabled = _preserveLiveAudio && listener == _liveListener && listener.enabled;
             }
             foreach (var camera in Resources.FindObjectsOfTypeAll<Camera>())
             {
                 if (camera == null || camera == _camera || !camera.gameObject.scene.IsValid() || !camera.gameObject.scene.isLoaded) continue;
-                if (!_cameraStates.ContainsKey(camera)) _cameraStates.Add(camera, camera.enabled);
+                if (!_cameraStates.ContainsKey(camera) && camera.enabled) _cameraStates.Add(camera, true);
                 camera.enabled = false;
             }
             foreach (var canvas in Resources.FindObjectsOfTypeAll<Canvas>())
             {
                 if (canvas == null || !canvas.gameObject.scene.IsValid() || !canvas.gameObject.scene.isLoaded || canvas.gameObject.scene == _scene) continue;
-                if (!_canvasStates.ContainsKey(canvas)) _canvasStates.Add(canvas, canvas.enabled);
+                if (!_canvasStates.ContainsKey(canvas) && canvas.enabled) _canvasStates.Add(canvas, true);
                 canvas.enabled = false;
             }
             // Mods may already use layer 31. Hide those renderers so this camera
@@ -3837,53 +4274,18 @@ namespace LCReplay.Plugin.Playback
             {
                 if (renderer == null || renderer.gameObject.layer != ReplayLayer || !renderer.gameObject.scene.IsValid() || !renderer.gameObject.scene.isLoaded || renderer.gameObject.scene == _scene ||
                     _assetScene != null && renderer.gameObject.scene == _assetScene.Scene) continue;
-                if (!_rendererStates.ContainsKey(renderer)) _rendererStates.Add(renderer, renderer.enabled);
+                if (!_rendererStates.ContainsKey(renderer) && renderer.enabled) _rendererStates.Add(renderer, true);
                 renderer.enabled = false;
             }
-            // A hidden Canvas can still receive EventSystem submit/navigation.
-            // Suspend both dispatchers and input modules, including systems added later.
-            foreach (var behaviour in Resources.FindObjectsOfTypeAll<Behaviour>())
-            {
-                if (behaviour == null || !behaviour.gameObject.scene.IsValid() || !behaviour.gameObject.scene.isLoaded || behaviour.gameObject.scene == _scene || !IsUiInput(behaviour.GetType())) continue;
-                RememberCurrentEventSystem(behaviour.GetType());
-                if (!_uiInputStates.ContainsKey(behaviour)) _uiInputStates.Add(behaviour, behaviour.enabled);
-                behaviour.enabled = false;
-            }
+            // The replay HUD owns EventSystem.current while its canvas is open.
+            // Keep the live menu's EventSystem and input module enabled: Unity
+            // can replace either component during a scene transition, and
+            // restoring a stale disabled instance leaves every menu button dead.
         }
 
         private static void PruneDestroyed<T>(Dictionary<T, bool> states) where T : Object
         {
             foreach (var key in states.Keys.Where(key => !key).ToArray()) states.Remove(key);
-        }
-
-        private bool IsUiInput(Type type)
-        {
-            if (_uiInputTypes.TryGetValue(type, out var result)) return result;
-            for (var current = type; current != null; current = current.BaseType)
-            {
-                if (current.FullName != "UnityEngine.EventSystems.EventSystem" && current.FullName != "UnityEngine.EventSystems.BaseInputModule") continue;
-                _uiInputTypes[type] = true;
-                return true;
-            }
-            _uiInputTypes[type] = false;
-            return false;
-        }
-
-        private void RememberCurrentEventSystem(Type type)
-        {
-            if (_eventSystemRemembered) return;
-            for (var current = type; current != null; current = current.BaseType)
-            {
-                if (current.FullName != "UnityEngine.EventSystems.EventSystem") continue;
-                try
-                {
-                    _eventSystemCurrentProperty = current.GetProperty("current", BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly);
-                    _savedEventSystem = _eventSystemCurrentProperty?.GetValue(null, null) as Component;
-                    _eventSystemRemembered = true;
-                }
-                catch (Exception) { /* The enabled states still restore on older UI versions. */ }
-                break;
-            }
         }
 
         private void SetLooking(bool looking)
@@ -4381,9 +4783,11 @@ namespace LCReplay.Plugin.Playback
                 target.spotAngle = source.spotAngle;
             }
             if (data)
-                foreach (var name in new[] { "lightUnit", "shapeRadius", "applyRangeAttenuation", "affectDiffuse", "affectSpecular", "intensity" })
+                foreach (var name in new[] { "lightUnit", "shapeRadius", "applyRangeAttenuation", "affectDiffuse", "affectSpecular", "intensity",
+                    "volumetricDimmer", "volumetricShadowDimmer" })
                 {
                     var value = native ? GameAccess.Read(native, name) : name == "shapeRadius" ? (object)2.2f :
+                        name == "volumetricDimmer" ? (object)0f :
                         name == "affectSpecular" || name == "applyRangeAttenuation" ? false : null;
                     if (value != null) SetOptionalMember(data!, name, value);
                 }
@@ -4588,19 +4992,10 @@ namespace LCReplay.Plugin.Playback
             foreach (var pair in _listenerStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
             foreach (var pair in _audioSourceStates) if (pair.Key != null) pair.Key.mute = pair.Value;
             foreach (var pair in _rendererStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
-            foreach (var pair in _uiInputStates) if (pair.Key != null) pair.Key.enabled = pair.Value;
-            if (_savedEventSystem != null && _eventSystemCurrentProperty?.CanWrite == true)
-            {
-                try { _eventSystemCurrentProperty.SetValue(null, _savedEventSystem, null); }
-                catch (Exception) { /* Enabled systems are restored even if the active system changed. */ }
-            }
             Cursor.lockState = _savedCursorLock;
             Cursor.visible = _savedCursorVisible;
             _cameraStates.Clear(); _canvasStates.Clear(); _listenerStates.Clear();
-            _audioSourceStates.Clear(); _rendererStates.Clear(); _uiInputStates.Clear();
-            _savedEventSystem = null;
-            _eventSystemCurrentProperty = null;
-            _eventSystemRemembered = false;
+            _audioSourceStates.Clear(); _rendererStates.Clear();
         }
 
         public void Dispose()
@@ -4650,7 +5045,7 @@ namespace LCReplay.Plugin.Playback
                 if (_displayImage) _displayImage!.texture = null;
                 if (_displayTexture != null) { _displayTexture.Release(); Object.Destroy(_displayTexture); _displayTexture = null; }
                 if (_root != null) { _root.SetActive(false); Object.Destroy(_root); }
-                foreach (var mesh in _worldMeshes) if (mesh != null) Object.Destroy(mesh);
+                foreach (var mesh in _worldMeshes) DestroyOwnedMesh(mesh);
                 foreach (var mask in _worldFogMasks) if (mask) Object.Destroy(mask);
                 foreach (var visual in _entities.Values) if (visual.SkeletonMesh != null) Object.Destroy(visual.SkeletonMesh);
                 if (_cube != null) Object.Destroy(_cube);
@@ -4660,17 +5055,25 @@ namespace LCReplay.Plugin.Playback
                 if (_turretBeamTexture) Object.Destroy(_turretBeamTexture);
                 _structureAudio?.Dispose(); _structureAudio = null;
                 ReplayIsolation.Unregister(_scene);
-                if (_scene.IsValid() && _scene.isLoaded) SceneManager.UnloadSceneAsync(_scene);
+                if (_scene.IsValid() && _scene.isLoaded)
+                {
+                    var unload = SceneManager.UnloadSceneAsync(_scene);
+                    if (unload != null)
+                    {
+                        pendingSceneCleanup++;
+                        unload.completed += _ => pendingSceneCleanup--;
+                    }
+                }
             }
             finally
             {
                 if (!_parked) RestoreOtherViews();
-                _uiInputTypes.Clear();
                 foreach (var entity in _entities.Values) entity.NativeRig?.Dispose();
                 _entities.Clear();
                 _frameLines.Clear();
                 _materials.Clear();
                 _worldMeshes.Clear();
+                _sharedNativeMeshes.Clear();
                 _worldFogMasks.Clear();
                 _playerDeathCancellation.Dispose();
                 _instancedGeometry.Clear();
@@ -4694,12 +5097,25 @@ namespace LCReplay.Plugin.Playback
             }
         }
 
+        private sealed class NativeTransitionPose
+        {
+            internal string Path = "";
+            internal double Boundary;
+            internal (Transform Bone, Vector3 Position, Quaternion Rotation, Vector3 Scale)[] Poses =
+                Array.Empty<(Transform, Vector3, Quaternion, Vector3)>();
+        }
+
         private sealed class EntityVisual
         {
             internal readonly GameObject Root;
             internal readonly GameObject Proxy;
             internal GameObject? NativeHazard;
             internal NativeActorRig? NativeRig;
+            internal bool NativeRigFailed;
+            internal double LastAnimationTime = double.NaN;
+            internal int AnimationSeekGeneration;
+            internal readonly List<NativeTransitionPose> NativeTransitions = new List<NativeTransitionPose>();
+            internal readonly List<NativeTransitionPose> ActiveNativeTransitions = new List<NativeTransitionPose>();
             internal readonly Dictionary<string, Transform> Bones = new Dictionary<string, Transform>();
             internal readonly Dictionary<string, BonePose> RestBones = new Dictionary<string, BonePose>(StringComparer.Ordinal);
             internal string Kind = "";

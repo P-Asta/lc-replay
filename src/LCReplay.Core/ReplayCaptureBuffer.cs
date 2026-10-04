@@ -14,6 +14,7 @@ namespace LCReplay.Core
         private readonly long maxBytes;
         private readonly Queue<(ReplayRecord Record, long Bytes)> pending = new Queue<(ReplayRecord, long)>();
         private long pendingBytes;
+        private bool pendingLargeWorld;
         private bool completing;
         private bool throttled;
         public Exception? Error { get; private set; }
@@ -52,12 +53,19 @@ namespace LCReplay.Core
             if (completing || Error != null || writer.Error != null) return false;
             var bytes = ReplayRecordMemory.Estimate(record);
             if (pending.Count == 0 && writer.TryWrite(record, bytes)) return true;
-            if (pending.Count >= capacity || (pendingBytes != 0 && bytes > maxBytes - pendingBytes))
+            // A completed map snapshot is already resident in memory. If the
+            // writer is busy, retain one such oversized record in order and
+            // pause further sampling while it drains. Rejecting it here loses
+            // the rest of the day even though disk output is still healthy.
+            var largeWorld = record.Kind == "world" && bytes > maxBytes;
+            if (pending.Count >= capacity || pendingLargeWorld ||
+                !largeWorld && pendingBytes != 0 && bytes > maxBytes - pendingBytes)
             {
                 Error = new IOException("Capture backlog exceeded its bounded memory budget; previously accepted recording data is preserved.");
                 return false;
             }
             pending.Enqueue((record, bytes)); pendingBytes += bytes;
+            if (largeWorld) pendingLargeWorld = true;
             return true;
         }
         public void Drain(int maxRecords = 16, double maxMilliseconds = .75)
@@ -69,6 +77,7 @@ namespace LCReplay.Core
                 var next = pending.Peek();
                 if (!writer.TryWrite(next.Record, next.Bytes)) break;
                 var item = pending.Dequeue(); pendingBytes -= item.Bytes;
+                if (item.Bytes > maxBytes && item.Record.Kind == "world") pendingLargeWorld = false;
                 if ((Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency >= maxMilliseconds) break;
             }
         }
@@ -83,6 +92,7 @@ namespace LCReplay.Core
                     var next = pending.Peek();
                     if (!await writer.WriteAsync(next.Record, next.Bytes).ConfigureAwait(false)) break;
                     var item = pending.Dequeue(); pendingBytes -= item.Bytes;
+                    if (item.Bytes > maxBytes && item.Record.Kind == "world") pendingLargeWorld = false;
                 }
                 // One final producer may stream its already captured records
                 // without filling another memory queue or blocking Unity.
@@ -92,7 +102,7 @@ namespace LCReplay.Core
             }
             finally
             {
-                pending.Clear(); pendingBytes = 0;
+                pending.Clear(); pendingBytes = 0; pendingLargeWorld = false;
                 await writer.CompleteAsync().ConfigureAwait(false);
             }
         }

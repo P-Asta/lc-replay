@@ -3,24 +3,36 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using LCReplay.Core;
+using LCReplay.Plugin.Capture;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.Playables;
 
 namespace LCReplay.Plugin.Playback
 {
-    // Uses the installed game's baked moon scene as render-only scenery. Game
-    // behaviours and colliders are disabled before their first Update/Start.
+    // In a live session, copies inert render components from an already loaded
+    // matching moon. Menu playback loads the installed scene additively and
+    // disables its behaviours after scene activation, before Update/Start.
     internal sealed class SceneAssetReplay : IDisposable
     {
+        private static int pendingSceneOperations;
+        internal static bool HasPendingLoads => pendingSceneOperations != 0;
         private readonly int replayLayer;
         private readonly Action changed;
         private readonly HashSet<string> rendererPaths = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> hiddenRendererPaths = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> terrainPaths = new HashSet<string>(StringComparer.Ordinal);
+        private readonly List<GeometrySnapshot> legacyTerrains = new List<GeometrySnapshot>();
+        private readonly HashSet<string> restoredTerrains = new HashSet<string>(StringComparer.Ordinal);
+        internal bool HasNativeTerrain(string geometryId) => restoredTerrains.Contains(geometryId);
         private readonly Dictionary<Renderer, string> renderers = new Dictionary<Renderer, string>();
         private readonly Dictionary<Terrain, string> terrains = new Dictionary<Terrain, string>();
         private readonly HashSet<string> pendingScenes = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> clonedRendererPaths = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> clonedTerrainPaths = new HashSet<string>(StringComparer.Ordinal);
+        private readonly List<GameObject> liveCopies = new List<GameObject>();
+        private readonly Transform? liveCloneRoot;
+        private int liveSourceHandle;
         private readonly List<Animator> suns = new List<Animator>();
         private readonly List<Light> sunLights = new List<Light>();
         private readonly Dictionary<Light, Light> sunTargets = new Dictionary<Light, Light>();
@@ -36,43 +48,76 @@ namespace LCReplay.Plugin.Playback
             terrains.Count(entry => entry.Key && entry.Key.enabled);
         internal bool IsLoading => sceneName.Length != 0 && pendingScenes.Contains(sceneName);
 
-        internal SceneAssetReplay(int replayLayer, Action changed)
-        { this.replayLayer = replayLayer; this.changed = changed; }
+        internal SceneAssetReplay(int replayLayer, Action changed, Transform? liveCloneRoot = null)
+        { this.replayLayer = replayLayer; this.changed = changed; this.liveCloneRoot = liveCloneRoot; }
 
         internal void SetWorld(WorldSnapshot world)
         {
+            legacyTerrains.Clear(); restoredTerrains.Clear();
+            var assetScene = world.AssetScene;
+            var assetBuildIndex = world.AssetBuildIndex;
+            if (assetScene.Length == 0 && world.LevelId >= 0)
+            {
+                var candidates = world.Geometry.Where(g => g.EntityId.Length == 0 &&
+                    g.Id.StartsWith("terrain", StringComparison.Ordinal) && g.Vertices.Length >= 12).ToArray();
+                var levelType = GameAccess.Type("SelectableLevel");
+                if (candidates.Length != 0 && levelType != null)
+                {
+                    var levels = Resources.FindObjectsOfTypeAll(levelType).Where(level =>
+                        GameAccess.Read(level, "levelID") is int id && id == world.LevelId).ToArray();
+                    var names = levels.Select(level => GameAccess.Read(level, "sceneName") as string)
+                        .Where(name => !string.IsNullOrEmpty(name)).Distinct().ToArray();
+                    if (names.Length == 1)
+                        for (var i = 0; i < SceneManager.sceneCountInBuildSettings; i++)
+                            if (Path.GetFileNameWithoutExtension(SceneUtility.GetScenePathByBuildIndex(i)) == names[0])
+                            { assetScene = names[0]!; assetBuildIndex = i; legacyTerrains.AddRange(candidates); break; }
+                }
+            }
             rendererPaths.Clear(); terrainPaths.Clear();
             hiddenRendererPaths.Clear();
-            if (world.AssetScene.Length == 0 || world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count == 0)
+            if (assetScene.Length == 0 || world.AssetRendererPaths.Count + world.AssetTerrainPaths.Count + legacyTerrains.Count == 0)
             {
                 sceneName = "";
                 loading = null;
+                ClearLiveCopies();
                 foreach (var renderer in renderers.Keys) if (renderer) renderer.enabled = false;
                 foreach (var terrain in terrains.Keys) if (terrain) terrain.enabled = false;
                 ReplayIsolation.Unregister(scene);
-                if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
+                Unload(scene);
                 renderers.Clear(); terrains.Clear(); ClearSun(); scene = default;
                 return;
             }
-            if (world.AssetGameVersion != Application.version || world.AssetBuildIndex < 0)
+            if (legacyTerrains.Count == 0 && world.AssetGameVersion != Application.version || assetBuildIndex < 0)
                 throw new InvalidDataException("This replay's moon scenery requires Lethal Company version " + world.AssetGameVersion + ".");
-            var scenePath = SceneUtility.GetScenePathByBuildIndex(world.AssetBuildIndex);
-            if (!string.Equals(Path.GetFileNameWithoutExtension(scenePath), world.AssetScene, StringComparison.Ordinal))
+            var scenePath = SceneUtility.GetScenePathByBuildIndex(assetBuildIndex);
+            if (!string.Equals(Path.GetFileNameWithoutExtension(scenePath), assetScene, StringComparison.Ordinal))
                 throw new InvalidDataException("The recorded moon scene " + world.AssetScene + " is unavailable in this game build.");
             foreach (var path in world.AssetRendererPaths) rendererPaths.Add(path);
             foreach (var path in world.AssetTerrainPaths) terrainPaths.Add(path);
-            if (sceneName == world.AssetScene)
-            { ApplyVisibility(); return; }
+            if (liveCloneRoot)
+            {
+                // Loading a build-index scene while Netcode is listening makes it
+                // part of the scenes synchronized to joining clients. Use only
+                // inert render components copied from the already loaded moon.
+                if (sceneName != assetScene) ClearLiveCopies();
+                sceneName = assetScene;
+                var sourceWorld = new WorldSnapshot { AssetScene = assetScene, AssetBuildIndex = assetBuildIndex };
+                CopyLiveScene(sourceWorld);
+                ApplyVisibility();
+                return;
+            }
+            if (sceneName == assetScene)
+            { foreach (var entry in terrains) MatchLegacyTerrain(entry.Key, entry.Value); ApplyVisibility(); return; }
             foreach (var renderer in renderers.Keys) if (renderer) renderer.enabled = false;
             foreach (var terrain in terrains.Keys) if (terrain) terrain.enabled = false;
             ReplayIsolation.Unregister(scene);
-            if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
+            Unload(scene);
             renderers.Clear(); terrains.Clear(); ClearSun(); scene = default;
-            sceneName = world.AssetScene;
+            sceneName = assetScene;
             if (pendingScenes.Contains(sceneName)) return;
             if (pendingScenes.Count == 0) SceneManager.sceneLoaded += OnSceneLoaded;
             pendingScenes.Add(sceneName);
-            loading = SceneManager.LoadSceneAsync(world.AssetBuildIndex, LoadSceneMode.Additive);
+            loading = SceneManager.LoadSceneAsync(assetBuildIndex, LoadSceneMode.Additive);
             if (loading == null)
             {
                 pendingScenes.Remove(sceneName);
@@ -80,11 +125,115 @@ namespace LCReplay.Plugin.Playback
                 sceneName = "";
                 throw new InvalidOperationException("Recorded moon scene could not be loaded from the installed game.");
             }
+            Track(loading);
+        }
+
+        private static void Track(AsyncOperation operation)
+        {
+            pendingSceneOperations++;
+            operation.completed += _ => pendingSceneOperations--;
+        }
+
+        private static void Unload(Scene target)
+        {
+            if (!target.IsValid() || !target.isLoaded) return;
+            var operation = SceneManager.UnloadSceneAsync(target);
+            if (operation != null) Track(operation);
+        }
+
+        private void CopyLiveScene(WorldSnapshot world)
+        {
+            if (!liveCloneRoot) return;
+            var parent = liveCloneRoot!;
+            Scene source = default;
+            for (var index = 0; index < SceneManager.sceneCount; index++)
+            {
+                var candidate = SceneManager.GetSceneAt(index);
+                if (candidate.IsValid() && candidate.isLoaded && candidate.buildIndex == world.AssetBuildIndex &&
+                    candidate.name == world.AssetScene && !ReplayIsolation.IsReplayScene(candidate))
+                { source = candidate; break; }
+            }
+            if (!source.IsValid()) return;
+            if (liveSourceHandle != source.handle)
+            {
+                ClearLiveCopies();
+                liveSourceHandle = source.handle;
+            }
+            foreach (var root in source.GetRootGameObjects())
+                foreach (var terrain in root.GetComponentsInChildren<Terrain>(true))
+                    MatchLegacyTerrain(terrain, SceneAssetPaths.For(terrain));
+            if (rendererPaths.IsSubsetOf(clonedRendererPaths) && terrainPaths.IsSubsetOf(clonedTerrainPaths)) return;
+            var missingRenderers = rendererPaths.Count(path => !clonedRendererPaths.Contains(path));
+            var missingTerrains = terrainPaths.Count(path => !clonedTerrainPaths.Contains(path));
+            foreach (var root in source.GetRootGameObjects())
+            {
+                if (missingRenderers != 0) foreach (var renderer in root.GetComponentsInChildren<MeshRenderer>(true))
+                {
+                    if (!renderer || !renderer.TryGetComponent<MeshFilter>(out var filter) || !filter.sharedMesh) continue;
+                    var path = SceneAssetPaths.For(renderer);
+                    if (!rendererPaths.Contains(path) || !clonedRendererPaths.Add(path)) continue;
+                    var copy = new GameObject("LCReplay scenery " + renderer.name, typeof(MeshFilter), typeof(MeshRenderer));
+                    liveCopies.Add(copy);
+                    copy.hideFlags = HideFlags.DontSave;
+                    copy.layer = replayLayer;
+                    SceneManager.MoveGameObjectToScene(copy, parent.gameObject.scene);
+                    copy.transform.SetParent(parent, false);
+                    copy.transform.position = renderer.transform.position;
+                    copy.transform.rotation = renderer.transform.rotation;
+                    copy.transform.localScale = renderer.transform.lossyScale;
+                    copy.GetComponent<MeshFilter>().sharedMesh = filter.sharedMesh;
+                    var target = copy.GetComponent<MeshRenderer>();
+                    target.sharedMaterials = renderer.sharedMaterials;
+                    target.shadowCastingMode = renderer.shadowCastingMode;
+                    target.receiveShadows = renderer.receiveShadows;
+                    target.lightmapIndex = renderer.lightmapIndex;
+                    target.lightmapScaleOffset = renderer.lightmapScaleOffset;
+                    renderers.Add(target, path);
+                    if (--missingRenderers == 0) break;
+                }
+                if (missingTerrains != 0) foreach (var terrain in root.GetComponentsInChildren<Terrain>(true))
+                {
+                    if (!terrain || !terrain.terrainData) continue;
+                    var path = SceneAssetPaths.For(terrain);
+                    if (!terrainPaths.Contains(path) || !clonedTerrainPaths.Add(path)) continue;
+                    var copy = new GameObject("LCReplay terrain " + terrain.name, typeof(Terrain));
+                    liveCopies.Add(copy);
+                    copy.hideFlags = HideFlags.DontSave;
+                    copy.layer = replayLayer;
+                    SceneManager.MoveGameObjectToScene(copy, parent.gameObject.scene);
+                    copy.transform.SetParent(parent, false);
+                    copy.transform.position = terrain.transform.position;
+                    copy.transform.rotation = terrain.transform.rotation;
+                    copy.transform.localScale = terrain.transform.lossyScale;
+                    var target = copy.GetComponent<Terrain>();
+                    target.terrainData = terrain.terrainData;
+                    target.materialTemplate = terrain.materialTemplate;
+                    target.drawInstanced = terrain.drawInstanced;
+                    target.heightmapPixelError = terrain.heightmapPixelError;
+                    target.basemapDistance = terrain.basemapDistance;
+                    terrains.Add(target, path);
+                    if (--missingTerrains == 0) break;
+                }
+                if (missingRenderers == 0 && missingTerrains == 0) break;
+            }
+        }
+
+        private void ClearLiveCopies()
+        {
+            foreach (var copy in liveCopies) if (copy) UnityEngine.Object.Destroy(copy);
+            liveCopies.Clear();
+            clonedRendererPaths.Clear();
+            clonedTerrainPaths.Clear();
+            liveSourceHandle = 0;
+            if (liveCloneRoot) { renderers.Clear(); terrains.Clear(); }
         }
 
         private void OnSceneLoaded(Scene loaded, LoadSceneMode mode)
         {
             if (mode != LoadSceneMode.Additive || !pendingScenes.Remove(loaded.name)) return;
+            // Keep this build-index scene out of a host's scene synchronization
+            // from the first callback through Unity's asynchronous unload.
+            ReplayIsolation.Register(loaded);
             if (pendingScenes.Count == 0) SceneManager.sceneLoaded -= OnSceneLoaded;
             var current = !disposed && loaded.name == sceneName;
             foreach (var root in loaded.GetRootGameObjects())
@@ -125,15 +274,15 @@ namespace LCReplay.Plugin.Playback
                             {
                                 terrain.gameObject.layer = replayLayer;
                                 terrains.Add(terrain, SceneAssetPaths.For(terrain));
+                                MatchLegacyTerrain(terrain, SceneAssetPaths.For(terrain));
                             }
                             break;
                     }
                 }
             }
-            if (!current) { SceneManager.UnloadSceneAsync(loaded); return; }
+            if (!current) { Unload(loaded); return; }
             scene = loaded;
             foreach (var sun in suns) sunLights.AddRange(sun.GetComponentsInChildren<Light>(true).Where(light => light.type == LightType.Directional));
-            ReplayIsolation.Register(scene);
             loading = null;
             ApplyVisibility();
             changed();
@@ -141,6 +290,35 @@ namespace LCReplay.Plugin.Playback
 
         private void ClearSun()
         { suns.Clear(); sunLights.Clear(); sunTargets.Clear(); sunTargetSignature = 0; lastSunTime = -1f; }
+
+        private void MatchLegacyTerrain(Terrain terrain, string path)
+        {
+            if (!terrain || !terrain.terrainData) return;
+            var data = terrain.terrainData;
+            foreach (var geometry in legacyTerrains)
+            {
+                if (geometry.Name != terrain.name ||
+                    Vector3.Distance(terrain.transform.position, new Vector3(geometry.Position.X, geometry.Position.Y, geometry.Position.Z)) > .05f ||
+                    Quaternion.Angle(terrain.transform.rotation, new Quaternion(geometry.Rotation.X, geometry.Rotation.Y, geometry.Rotation.Z, geometry.Rotation.W)) > .05f ||
+                    Vector3.Distance(terrain.transform.lossyScale, new Vector3(geometry.Scale.X, geometry.Scale.Y, geometry.Scale.Z)) > .001f) continue;
+                var vertices = geometry.Vertices;
+                var count = vertices.Length / 3;
+                if (Math.Abs(vertices[(count - 1) * 3] - data.size.x) > .05f ||
+                    Math.Abs(vertices[(count - 1) * 3 + 2] - data.size.z) > .05f) continue;
+                var matches = true;
+                for (var sample = 0; sample <= 8; sample++)
+                {
+                    var offset = (count - 1) * sample / 8 * 3;
+                    var height = data.GetInterpolatedHeight(vertices[offset] / data.size.x, vertices[offset + 2] / data.size.z);
+                    if (Math.Abs(height - vertices[offset + 1]) > .05f) { matches = false; break; }
+                }
+                if (!matches) continue;
+                // The coarse legacy height field proves the installed terrain
+                // matches. Use its full splat layers, holes and height map.
+                restoredTerrains.Add(geometry.Id);
+                terrainPaths.Add(path);
+            }
+        }
 
         // Older recordings already contain the game clock. Evaluate the moon's
         // installed sun curves in this isolated scene, never the live round.
@@ -221,9 +399,10 @@ namespace LCReplay.Plugin.Playback
             disposed = true;
             sceneName = "";
             loading = null;
+            ClearLiveCopies();
             ReplayIsolation.Unregister(scene);
             if (pendingScenes.Count == 0) SceneManager.sceneLoaded -= OnSceneLoaded;
-            if (scene.IsValid() && scene.isLoaded) SceneManager.UnloadSceneAsync(scene);
+            Unload(scene);
             rendererPaths.Clear(); hiddenRendererPaths.Clear(); terrainPaths.Clear(); renderers.Clear(); terrains.Clear();
             ClearSun();
         }

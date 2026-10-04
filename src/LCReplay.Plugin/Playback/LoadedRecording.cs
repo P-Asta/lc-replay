@@ -30,8 +30,11 @@ namespace LCReplay.Plugin.Playback
             if (headerForLayout.Metadata.TryGetValue("singleFile", out var singleFile) && singleFile == "true")
             {
                 progress?.Invoke("Indexing recording", 0.03);
+                // Read a full first playback window before opening the viewer.
+                // A tiny opening window deferred actor, vehicle and item state
+                // until playback was already visible.
                 var fileIndex = ReplayReader.IndexSingleFile(full, cancellation, 48L * 1024 * 1024,
-                    value => progress?.Invoke("Indexing recording", 0.03 + value * 0.17), initialWindowExpandedBytes: 4L * 1024 * 1024,
+                    value => progress?.Invoke("Indexing recording", 0.03 + value * 0.17), initialWindowExpandedBytes: 48L * 1024 * 1024,
                     deferPayloadValidation: true);
                 fileIndex.ReuseWorldPayloads = true;
                 fileIndex.TrimInactiveActorState = true;

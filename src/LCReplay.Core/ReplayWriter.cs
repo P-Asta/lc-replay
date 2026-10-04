@@ -30,6 +30,7 @@ namespace LCReplay.Core
         private int writtenBookmarks;
         private long bulkWorldBytes;
         private TaskCompletionSource<bool>? progress;
+        private const int TransientWriteRetries = 5;
 
         public Exception? Error => Volatile.Read(ref error);
         public long ExpandedBytes => Interlocked.Read(ref expandedBytes);
@@ -62,8 +63,7 @@ namespace LCReplay.Core
                         indexWriter = new BinaryWriter(indexOutput, System.Text.Encoding.UTF8, true);
                         indexWriter.Write(ReplayFileIndex.SidecarMagic);
                     }
-                    catch (IOException e) { DisableIndex(e); }
-                    catch (UnauthorizedAccessException e) { DisableIndex(e); }
+                    catch (Exception e) { DisableIndex(e); }
                 }
                 output.Write(ReplayFormat.Magic, 0, ReplayFormat.Magic.Length);
                 WriteIndexed(first);
@@ -166,12 +166,12 @@ namespace LCReplay.Core
                         duration = Math.Max(duration, record.Time);
                         lock (gate) writtenDuration = duration;
                         if (record.Event?.Category == "marker" && record.Event.Name == "bookmark") Interlocked.Increment(ref writtenBookmarks);
-                        if (lastFlush.Elapsed.TotalSeconds >= 2) { output.Flush(); FlushIndex(false); lastFlush.Restart(); }
+                        if (lastFlush.Elapsed.TotalSeconds >= 2) { FlushOutput(false); FlushIndex(false); lastFlush.Restart(); }
                     }
                     finally { Interlocked.Add(ref queuedBytes, -item.Bytes); Interlocked.Exchange(ref bulkWorldBytes, 0); NotifyProgress(); }
                 }
                 WriteIndexed(new ReplayRecord { Kind = "end", Time = duration });
-                if (output is FileStream file) file.Flush(true); else output.Flush();
+                FlushOutput(true);
                 FlushIndex(true);
             }
             catch (Exception e)
@@ -194,13 +194,21 @@ namespace LCReplay.Core
         private void WriteIndexed(ReplayRecord record)
         {
             var offset = output.Position;
-            int expanded;
-            try { expanded = ReplayFormat.Write(output, record, limits); }
-            catch
+            int expanded = 0;
+            for (var attempt = 0; ; attempt++)
             {
-                // A partial record must not hide the complete records before it.
-                try { output.SetLength(offset); output.Position = offset; } catch { /* Reader also recovers torn tails. */ }
-                throw;
+                try { expanded = ReplayFormat.Write(output, record, limits); break; }
+                catch (Exception failure)
+                {
+                    // A failed write may have left a length header or compressed
+                    // bytes behind. Retry only after removing that entire tail.
+                    // Without a successful rollback, the reader can still recover
+                    // the earlier complete prefix.
+                    var rolledBack = TryRollback(offset);
+                    if (!rolledBack || !(failure is IOException io) || IsDiskFull(io) || attempt >= TransientWriteRetries)
+                        throw;
+                    Thread.Sleep(RetryDelay(attempt));
+                }
             }
             Interlocked.Add(ref expandedBytes, expanded);
             if (indexWriter == null) return;
@@ -222,14 +230,52 @@ namespace LCReplay.Core
                 indexWriter.Write((ushort)key.Length);
                 indexWriter.Write(key);
             }
-            catch (IOException e) { DisableIndex(e); }
-            catch (OutOfMemoryException e) { DisableIndex(e); }
+            catch (Exception e) { DisableIndex(e); }
+        }
+
+        private bool TryRollback(long offset)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                try { output.SetLength(offset); output.Position = offset; return true; }
+                catch (IOException failure)
+                {
+                    if (IsDiskFull(failure) || attempt >= TransientWriteRetries) return false;
+                    Thread.Sleep(RetryDelay(attempt));
+                }
+                catch { return false; }
+            }
+        }
+
+        private void FlushOutput(bool sync)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    if (sync && output is FileStream file) file.Flush(true);
+                    else output.Flush();
+                    return;
+                }
+                catch (IOException failure) when (!IsDiskFull(failure) && attempt < TransientWriteRetries)
+                { Thread.Sleep(RetryDelay(attempt)); }
+            }
+        }
+
+        private static int RetryDelay(int attempt) => 25 << attempt;
+
+        private static bool IsDiskFull(IOException failure)
+        {
+            // Windows ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL and
+            // ERROR_DISK_QUOTA_EXCEEDED. Retrying these cannot create space.
+            var code = failure.HResult & 0xffff;
+            return code == 39 || code == 112 || code == 1295;
         }
 
         private void FlushIndex(bool sync)
         {
             try { if (indexOutput != null) indexOutput.Flush(sync); }
-            catch (IOException e) { DisableIndex(e); }
+            catch (Exception e) { DisableIndex(e); }
         }
         private void DisableIndex(Exception cause)
         {

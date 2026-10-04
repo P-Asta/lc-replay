@@ -25,6 +25,7 @@ var suite = new (string Name, Action Run)[]
     ("Excessive configured roots fail clearly before creating an unusable day folder", ExcessiveRoot),
     ("Atomic saves fit the 259 character boundary and preserve pre-existing temporary files", ExactPathBoundary),
     ("New recordings use one quota/deadline .lcr per day with authoritative metadata", QuotaHierarchy),
+    ("Quota recording recovery keeps numbered continuations in the same day", QuotaContinuation),
     ("Quota groups reuse across reconnects while each deadline recording remains distinct", QuotaReconnects),
     ("Unavailable quota and deadline values remain unknown instead of invented zeroes", UnknownQuota),
     ("Quota hierarchy recovers numeric grouping and header metadata after manifest loss", QuotaRecovery),
@@ -450,7 +451,6 @@ static void QuotaHierarchy() => WithTemp(root =>
         var savedFile = archive.AllocateSegment(clip, 1);
         Check(Path.GetFileName(savedFile.FilePath) == remaining + ".lcr", "quota/day.lcr layout");
         Write(archive, savedFile, 6);
-        Expect<InvalidOperationException>(() => archive.AllocateSegment(clip, 2));
         archive.EndDay(clip, "saved");
         clips.Add(clip);
     }
@@ -468,6 +468,42 @@ static void QuotaHierarchy() => WithTemp(root =>
         && header.Metadata["deadlineDaysRemaining"] == "3" && header.Metadata["deadlineDaysTotal"] == "4" && header.Metadata["quotaCycle"] == "2", "recoverable header metadata");
     Check(saved.Days.All(clip => clip.Segments.Count == 1), "each day has one physical replay file");
     Check(index.FindNextSegment(clips[0].Segments[0].FilePath) == null, "continuation never crosses a deadline recording");
+});
+
+static void QuotaContinuation() => WithTemp(root =>
+{
+    var archive = new ReplayArchive(root); var run = archive.BeginRun(Now());
+    var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
+    var group = archive.BeginQuota(run, Now(), quota, "host");
+    var day = archive.BeginQuotaDay(group, 1, Now(), "Titan", quota);
+    var first = archive.AllocateSegment(day, 1); Write(archive, first, 4);
+    var second = archive.AllocateSegment(day, 2); Write(archive, second, 5);
+    Check(Path.GetFileName(first.FilePath) == "3.lcr" && Path.GetFileName(second.FilePath) == "3-p2.lcr" &&
+        second.Part == 2 && second.DayId == first.DayId, "recovery uses a separate collision-safe file for the same day");
+    archive.EndDay(day, "interrupted");
+    var other = archive.BeginQuotaDay(group, 2, Now().AddMinutes(1), "Titan", quota);
+    var neighbor = archive.AllocateSegment(other, 1); Write(archive, neighbor, 1);
+    var index = archive.Scan();
+    var days = index.Runs.Single().Sessions.Single().Days;
+    var resumed = days.Single(item => item.Id == day.Id);
+    Check(days.Count == 2 && resumed.Segments.Select(item => item.Part).SequenceEqual(new[] { 1, 2 }) &&
+        resumed.Segments.All(item => item.DayId == day.Id), "scan joins only matching continuation identities");
+    Check(index.FindNextSegment(first.FilePath)?.FilePath == second.FilePath &&
+        index.FindNextSegment(second.FilePath) == null, "playback stays inside the recovered day");
+    var loaded = LoadedRecording.Read(index, first.FilePath, CancellationToken.None);
+    Check(loaded.Timeline.Parts.Count == 2, "both readable prefixes open as one playback timeline");
+    File.Delete(Path.Combine(group.DirectoryPath, day.RecordingStem + ".day.json"));
+    File.Delete(Path.ChangeExtension(first.FilePath, ".json"));
+    File.Delete(Path.ChangeExtension(second.FilePath, ".json"));
+    var recoveredIndex = archive.Scan();
+    var recovered = recoveredIndex.Runs.Single().Sessions.Single().Days.Single(item =>
+        item.Segments.Any(segment => segment.FilePath == first.FilePath));
+    Check(recovered.Segments.Select(item => item.Part).SequenceEqual(new[] { 1, 2 }) &&
+        recoveredIndex.FindNextSegment(first.FilePath)?.FilePath == second.FilePath,
+        "matching replay headers restore the continuation after sidecar loss");
+    Check(archive.DeleteRecording(recovered) == 2 && !File.Exists(first.FilePath) && !File.Exists(second.FilePath) &&
+        !File.Exists(Path.Combine(group.DirectoryPath, day.RecordingStem + ".day.json")) && File.Exists(neighbor.FilePath),
+        "deleting the recovered day removes both parts and preserves another day");
 });
 
 static void QuotaReconnects() => WithTemp(root =>
@@ -725,10 +761,11 @@ static void LobbyMembersAndCleanup() => WithTemp(root =>
     var quota = new ArchiveQuotaSnapshot { Target = 130, Fulfilled = 0, DeadlineDaysRemaining = 3 };
     var group = archive.BeginQuota(run, Now(), quota, "host");
     var day = archive.BeginQuotaDay(group, 1, Now(), "Titan", quota);
-    Check(archive.UpdateMembers(day, new[] { "Alice", "Bob", "Alice" }), "new roster saved");
-    Check(!archive.UpdateMembers(day, new[] { "bob" }), "unchanged roster skips manifest write");
+    Check(archive.UpdateMembers(day, new[] { "Alice", "Player #3", "Bob", "Alice" }), "new roster saved without unnamed player slot");
+    Check(!archive.UpdateMembers(day, new[] { "bob", "player #12" }), "unchanged roster skips manifest write");
     var file = archive.AllocateSegment(day, 1);
     Write(archive, file, 1);
+    day.Members.Add("Player #7"); // A manifest from an older release may already contain a placeholder.
     archive.EndDay(day, "saved"); archive.EndSession(group);
     var emptyQuota = new ArchiveQuotaSnapshot { Target = 90, Fulfilled = 0, DeadlineDaysRemaining = 2 };
     var emptyGroup = archive.BeginQuota(run, Now(), emptyQuota, "host");

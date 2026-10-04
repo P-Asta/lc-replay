@@ -127,7 +127,7 @@ namespace LCReplay.Core.Archive
             }
         }
 
-        /// <summary>Creates one collision-safe replay file directly below the quota folder.</summary>
+        /// <summary>Creates a collision-safe replay day directly below the quota folder.</summary>
         public ArchiveDay BeginQuotaDay(ArchiveSession group, int dayNumber, DateTimeOffset now, string moon,
             ArchiveQuotaSnapshot quota, int? campaignDay = null)
         {
@@ -202,11 +202,31 @@ namespace LCReplay.Core.Archive
                 string file;
                 if (day.RecordingStem.Length != 0)
                 {
-                    if (part != 1 || day.Segments.Count != 0)
-                        throw new InvalidOperationException("A quota day has exactly one .lcr file.");
-                    file = Path.Combine(day.DirectoryPath, day.RecordingStem + ".lcr");
-                    if (File.Exists(file) || File.Exists(Path.ChangeExtension(file, ".json")))
-                        throw new IOException("The allocated quota replay file already exists.");
+                    // The ordinary day has one file. If recording fails after
+                    // writing a readable prefix, a numbered continuation keeps
+                    // that prefix and its day identity instead of retrying the
+                    // already occupied filename forever.
+                    if (day.Segments.Count != 0)
+                    {
+                        var latest = day.Segments.Max(segment => segment.Part);
+                        if (part <= latest)
+                        {
+                            if (latest == int.MaxValue) throw new IOException("No free replay continuation number remains.");
+                            part = latest + 1;
+                        }
+                    }
+                    while (true)
+                    {
+                        file = Path.Combine(day.DirectoryPath, part == 1 ? day.RecordingStem + ".lcr" :
+                            day.RecordingStem + "-p" + part.ToString(CultureInfo.InvariantCulture) + ".lcr");
+                        EnsureSafePath(file);
+                        EnsureCompatiblePath(file);
+                        if (!File.Exists(file) && !File.Exists(Path.ChangeExtension(file, ".json")) &&
+                            !File.Exists(Path.ChangeExtension(file, ".lci"))) break;
+                        if (part == 1) throw new IOException("The allocated quota replay file already exists.");
+                        if (part == int.MaxValue) throw new IOException("No free replay continuation number remains.");
+                        part++;
+                    }
                 }
                 else
                 {
@@ -296,7 +316,8 @@ namespace LCReplay.Core.Archive
             {
                 RequireOwned(day);
                 var merged = day.Members.Concat(names).Select(name => Clip(name?.Trim(), 64))
-                    .Where(name => name.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
+                    .Where(name => name.Length != 0 && !IsPlaceholderMember(name))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
                 if (merged.Count == day.Members.Count && merged.SequenceEqual(day.Members)) return false;
                 day.Members = merged;
                 day.LastModifiedUtc = DateTimeOffset.UtcNow;
@@ -392,7 +413,9 @@ namespace LCReplay.Core.Archive
                         files.Add(Path.ChangeExtension(file, ".json"));
                         if (recording.RecordingStem.Length != 0)
                         {
-                            if (!string.Equals(Path.GetFileNameWithoutExtension(file), recording.RecordingStem, StringComparison.OrdinalIgnoreCase))
+                            var expectedStem = segment.Part == 1 ? recording.RecordingStem :
+                                recording.RecordingStem + "-p" + segment.Part.ToString(CultureInfo.InvariantCulture);
+                            if (!string.Equals(Path.GetFileNameWithoutExtension(file), expectedStem, StringComparison.OrdinalIgnoreCase))
                                 throw new IOException("The selected recording stem does not match its replay file.");
                             files.Add(Path.Combine(directory, recording.RecordingStem + ".day.json"));
                         }
@@ -666,5 +689,14 @@ namespace LCReplay.Core.Archive
         }
 
         internal static string Clip(string? value, int maximum) => value == null ? "" : value.Length <= maximum ? value : value.Substring(0, maximum);
+
+        internal static bool IsPlaceholderMember(string name)
+        {
+            const string prefix = "Player #";
+            if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || name.Length == prefix.Length) return false;
+            for (var index = prefix.Length; index < name.Length; index++)
+                if (name[index] < '0' || name[index] > '9') return false;
+            return true;
+        }
     }
 }

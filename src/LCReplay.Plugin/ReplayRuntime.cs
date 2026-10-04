@@ -7,6 +7,8 @@ namespace LCReplay.Plugin
     /// Owns the Unity callbacks on a persistent object independent of BepInEx's shared plugin object.
     /// The plugin still owns recording, UI state, and shutdown.
     /// </summary>
+    // Sample after the game's Animator evaluation and ordinary LateUpdate IK.
+    [DefaultExecutionOrder(32000)]
     public sealed class ReplayRuntime : MonoBehaviour, IDisposable
     {
         private Action? runFrame, drawUi, lateFrame, started;

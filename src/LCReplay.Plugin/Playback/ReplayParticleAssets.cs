@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using LCReplay.Core;
+using LCReplay.Plugin.Capture;
 using UnityEngine;
 using UnityEngine.Rendering;
 using Object = UnityEngine.Object;
@@ -11,11 +12,55 @@ namespace LCReplay.Plugin.Playback
     /// <summary>Copies installed visual-only particle templates while their hierarchy is inactive.</summary>
     internal sealed class ReplayParticleAssets : IDisposable
     {
+        private static GameObject? shipTemplates;
+        private static int shipTemplateAttempt;
         private readonly Transform staging;
         private readonly int layer;
         private readonly ParticleSystem[] sources;
         private readonly Dictionary<string, ParticleSystem?> templates = new Dictionary<string, ParticleSystem?>(StringComparer.Ordinal);
         private readonly Dictionary<string, Mesh> meshes = new Dictionary<string, Mesh>(StringComparer.Ordinal);
+
+        // Ship emitters live in the round scene, unlike enemy prefab assets.
+        // Retain their authored atlas modules before that scene is unloaded;
+        // the material alone cannot reconstruct a texture-sheet animation.
+        internal static void CacheShipMagnet(Component round)
+        {
+            if (shipTemplates || !round || !(GameAccess.Read(round, "magnetParticle") is ParticleSystem magnet) || !magnet) return;
+            var sourceId = magnet.GetInstanceID();
+            if (shipTemplateAttempt == sourceId) return;
+            shipTemplateAttempt = sourceId;
+            GameObject? root = null;
+            try
+            {
+                root = new GameObject("LC Replay cached ship particles") { hideFlags = HideFlags.HideAndDontSave };
+                root.SetActive(false);
+                Object.DontDestroyOnLoad(root);
+                var count = 0;
+                foreach (var source in magnet.GetComponentsInChildren<ParticleSystem>(true).Take(16))
+                {
+                    if (!source || source.transform.childCount > 64) continue;
+                    var group = new GameObject(source.transform.parent ? source.transform.parent.name : "Ship particles");
+                    group.transform.SetParent(root.transform, false);
+                    var copy = CloneParticleObject(source.gameObject, group.transform);
+                    copy.name = source.name;
+                    count++;
+                }
+                if (count == 0) { Object.DestroyImmediate(root); return; }
+                shipTemplates = root;
+            }
+            catch (Exception error)
+            {
+                if (root) Object.DestroyImmediate(root);
+                Debug.LogWarning("LC Replay: could not retain the ship particle template: " + error.Message);
+            }
+        }
+
+        internal static void ClearCachedTemplates()
+        {
+            if (shipTemplates) Object.DestroyImmediate(shipTemplates);
+            shipTemplates = null;
+            shipTemplateAttempt = 0;
+        }
 
         internal ReplayParticleAssets(Transform root, int replayLayer)
         {
@@ -36,18 +81,28 @@ namespace LCReplay.Plugin.Playback
             var source = Find(style, legacyName);
             ParticleSystem effect;
             native = source;
+            GameObject? nativeObject = null;
             if (source)
             {
                 // The staging parent is inactive before Instantiate. No cloned gameplay
                 // behaviour gets Awake/OnEnable; remove it before activating the effect.
-                var obj = Object.Instantiate(source!.gameObject, staging, false);
-                obj.SetActive(false);
-                for (var index = obj.transform.childCount - 1; index >= 0; index--)
-                    Object.DestroyImmediate(obj.transform.GetChild(index).gameObject);
-                foreach (var component in obj.GetComponents<Component>())
-                    if (component && !(component is Transform) && !(component is ParticleSystem) && !(component is ParticleSystemRenderer))
-                        Object.DestroyImmediate(component);
-                effect = obj.GetComponent<ParticleSystem>();
+                try
+                {
+                    nativeObject = CloneParticleObject(source!.gameObject, staging);
+                }
+                catch (Exception error)
+                {
+                    // Never activate a template with an unremoved script or
+                    // audio dependency. Its recorded particle style can still
+                    // use the ordinary visual-only fallback below.
+                    if (nativeObject) Object.DestroyImmediate(nativeObject);
+                    nativeObject = null; source = null; native = false;
+                    Debug.LogWarning("LC Replay: using recorded particle style because its native template could not be isolated: " + error.Message);
+                }
+            }
+            if (nativeObject)
+            {
+                effect = nativeObject!.GetComponent<ParticleSystem>();
                 effect.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear);
                 var collision = effect.collision; collision.enabled = false;
                 var trigger = effect.trigger; trigger.enabled = false;
@@ -73,15 +128,13 @@ namespace LCReplay.Plugin.Playback
             renderer.receiveShadows = false;
             if (style != null)
             {
+                // Invisible trajectory emitters remain invisible. Their
+                // recorded child flare supplies the visible shot; inventing
+                // a stretched parent adds a red tracer absent from the game.
                 renderer.renderMode = (ParticleSystemRenderMode)style.RenderMode;
-                // Vanilla's BulletParticle is a non-rendering emitter whose
-                // child flare draws the shots. Older files stored only the
-                // parent particles, so render their trajectories as tracers.
-                if (style.Name == "BulletParticle" && renderer.renderMode == ParticleSystemRenderMode.None)
-                    renderer.renderMode = (ParticleSystemRenderMode)1;
                 renderer.alignment = (ParticleSystemRenderSpace)style.Alignment;
-                renderer.lengthScale = style.Name == "BulletParticle" ? .18f : style.LengthScale;
-                renderer.velocityScale = style.Name == "BulletParticle" ? .08f : style.VelocityScale;
+                renderer.lengthScale = style.LengthScale;
+                renderer.velocityScale = style.VelocityScale;
                 renderer.cameraVelocityScale = style.CameraVelocityScale;
                 renderer.pivot = Vec(style.Pivot);
                 if (style.VertexStreams.Length != 0)
@@ -137,6 +190,61 @@ namespace LCReplay.Plugin.Playback
             }
             effect.gameObject.SetActive(true);
             return effect;
+        }
+
+        private static GameObject CloneParticleObject(GameObject source, Transform parent)
+        {
+            GameObject? copy = null;
+            try
+            {
+                copy = Object.Instantiate(source, parent, false);
+                copy.SetActive(false);
+                foreach (var audio in copy.GetComponentsInChildren<AudioSource>(true))
+                { audio.playOnAwake = false; audio.Stop(); audio.enabled = false; }
+                for (var index = copy.transform.childCount - 1; index >= 0; index--)
+                    Object.DestroyImmediate(copy.transform.GetChild(index).gameObject);
+                StripGameplay(copy);
+                return copy;
+            }
+            catch
+            {
+                if (copy) Object.DestroyImmediate(copy);
+                throw;
+            }
+        }
+
+        private static void StripGameplay(GameObject obj)
+        {
+            var components = obj.GetComponents<Component>().Where(component => component).ToArray();
+            var pending = components.Where(component => !(component is Transform) &&
+                !(component is ParticleSystem) && !(component is ParticleSystemRenderer))
+                .OrderBy(component => component is MonoBehaviour ? 0 : 1).ToList();
+            var requirements = new Dictionary<Type, Type[]>();
+            Type[] Required(Type type)
+            {
+                if (!requirements.TryGetValue(type, out var result))
+                    requirements[type] = result = type.GetCustomAttributes(typeof(RequireComponent), true).Cast<RequireComponent>()
+                        .SelectMany(attribute => new[] { attribute.m_Type0, attribute.m_Type1, attribute.m_Type2 })
+                        .Where(required => required != null).ToArray()!;
+                return result;
+            }
+            while (pending.Count != 0)
+            {
+                Component? removable = null;
+                foreach (var candidate in pending)
+                {
+                    var required = components.Any(dependent => dependent && dependent != candidate &&
+                        Required(dependent.GetType()).Any(type => type.IsAssignableFrom(candidate.GetType())));
+                    if (!required) { removable = candidate; break; }
+                }
+                // Remove OccludeAudio before AudioSource, and remove script
+                // dependers before any MonoBehaviour they require. Unity can
+                // reject DestroyImmediate without throwing an exception.
+                if (!removable) throw new InvalidOperationException("Particle template has a component dependency cycle.");
+                Object.DestroyImmediate(removable);
+                if (removable) throw new InvalidOperationException("Particle template retained a gameplay component.");
+                pending.Remove(removable!);
+            }
         }
 
         private ParticleSystem? Find(ParticleStyleSnapshot? style, string legacyName)

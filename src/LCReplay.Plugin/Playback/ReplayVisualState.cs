@@ -47,7 +47,7 @@ namespace LCReplay.Plugin.Playback
             foreach (var item in world.Geometry)
                 if (item.EntityId.Length == 0 && !item.IsMovingSceneRenderer)
                     staticBaselines[item.Id] = item.Active;
-            events = source.Where(value => value.Category == "visual" && value.Data != null)
+            events = ReplayTreeBreakTiming.Correct(world, source).Where(value => value.Category == "visual" && value.Data != null)
                 .OrderBy(value => value.Time).ToArray();
             foreach (var evt in events)
             {

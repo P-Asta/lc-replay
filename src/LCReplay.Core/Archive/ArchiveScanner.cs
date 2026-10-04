@@ -62,7 +62,10 @@ namespace LCReplay.Core.Archive
                         else ReadDay(run, session, dayPath, null);
                     }
                     if (session.IsQuotaGroup)
+                    {
                         foreach (var file in sessionEntries.Files) ReadFlatQuotaDay(run, session, file);
+                        JoinRecoveredQuotaContinuations(session);
+                    }
                     else AddLooseFiles(session, sessionEntries.Files);
                     FinalizeSession(session);
                     run.Sessions.Add(session);
@@ -103,22 +106,69 @@ namespace LCReplay.Core.Archive
         private void ReadFlatQuotaDay(ArchiveRun run, ArchiveSession session, string file)
         {
             var stem = Path.GetFileNameWithoutExtension(file);
-            var day = ReadManifest<ArchiveDay>(Path.Combine(session.DirectoryPath, stem + ".day.json"))
-                ?? new ArchiveDay { Id = "recovered:" + file, Status = "recovered" };
+            var dayStem = stem;
+            ArchiveDay? declaredDay = null;
+            var marker = stem.LastIndexOf("-p", StringComparison.OrdinalIgnoreCase);
+            if (marker > 0 && int.TryParse(stem.Substring(marker + 2), NumberStyles.None,
+                    CultureInfo.InvariantCulture, out var continuation) && continuation > 1)
+            {
+                var baseStem = stem.Substring(0, marker);
+                var candidate = ReadManifest<ArchiveDay>(Path.Combine(session.DirectoryPath, baseStem + ".day.json"));
+                var partManifest = ReadManifest<ArchiveSegment>(Path.ChangeExtension(file, ".json"));
+                if (candidate != null && partManifest != null && candidate.RecordingStem == baseStem &&
+                    partManifest.DayId == candidate.Id && partManifest.RunId == run.Id &&
+                    partManifest.SessionId == session.Id && partManifest.Part == continuation)
+                { dayStem = baseStem; declaredDay = candidate; }
+            }
+            declaredDay ??= ReadManifest<ArchiveDay>(Path.Combine(session.DirectoryPath, dayStem + ".day.json"));
+            var day = session.Days.FirstOrDefault(existing => existing.RecordingStem == dayStem &&
+                declaredDay != null && existing.Id == declaredDay.Id) ?? declaredDay ??
+                new ArchiveDay { Id = "recovered:" + file, Status = "recovered" };
             day.DirectoryPath = session.DirectoryPath;
-            day.RecordingStem = stem;
+            day.RecordingStem = dayStem;
             day.RunId = run.Id;
             day.SessionId = session.Id;
             day.QuotaRemaining = day.QuotaRemaining ?? session.QuotaRemaining;
-            day.DeadlineDaysRemaining = day.DeadlineDaysRemaining ?? ParseNumericDirectory(stem.Split('-')[0]);
+            day.DeadlineDaysRemaining = day.DeadlineDaysRemaining ?? ParseNumericDirectory(dayStem.Split('-')[0]);
             day.Segments.Add(ReadSegment(file, day));
             if (day.Status == "recording" && !activeSegments.Contains(file)) day.Status = "interrupted";
             if (day.DayNumber < 1) day.DayNumber = 1;
             day.Label = "Deadline " + (day.DeadlineDaysRemaining?.ToString(CultureInfo.InvariantCulture) ?? "unknown")
                 + (day.DeadlineDaysRemaining.HasValue ? " days" : "");
             FinalizeDay(day);
-            session.Days.Add(day);
+            if (!session.Days.Contains(day)) session.Days.Add(day);
         }
+
+        private void JoinRecoveredQuotaContinuations(ArchiveSession session)
+        {
+            // A crash may lose either sidecar manifest. The bounded headers
+            // still carry the authoritative recording IDs and part numbers.
+            foreach (var continuation in session.Days.ToArray())
+            {
+                if (continuation.Segments.Count != 1) continue;
+                var stem = continuation.RecordingStem;
+                var marker = stem.LastIndexOf("-p", StringComparison.OrdinalIgnoreCase);
+                if (marker <= 0 || !int.TryParse(stem.Substring(marker + 2), NumberStyles.None,
+                        CultureInfo.InvariantCulture, out var part) || part <= 1) continue;
+                var baseStem = stem.Substring(0, marker);
+                var original = session.Days.FirstOrDefault(day => day != continuation && day.RecordingStem == baseStem);
+                if (original == null || original.Segments.Count == 0) continue;
+                var next = continuation.Segments[0];
+                var first = original.Segments[0];
+                if (next.Part != part || !SameIdentity(next, first, "runId") ||
+                    !SameIdentity(next, first, "sessionId") || !SameIdentity(next, first, "dayId") ||
+                    original.Segments.Any(segment => segment.Part == part)) continue;
+                next.DayId = original.Id;
+                original.Segments.Add(next);
+                session.Days.Remove(continuation);
+                FinalizeDay(original);
+            }
+        }
+
+        private static bool SameIdentity(ArchiveSegment left, ArchiveSegment right, string key) =>
+            left.Metadata.TryGetValue(key, out var leftId) && !string.IsNullOrWhiteSpace(leftId) &&
+            right.Metadata.TryGetValue(key, out var rightId) &&
+            string.Equals(leftId, rightId, StringComparison.Ordinal);
 
         private ArchiveSession LooseSession(string runId, string directory, List<string> files)
         {
@@ -348,7 +398,9 @@ namespace LCReplay.Core.Archive
             if (day.DayNumber < 1) day.DayNumber = 1;
             day.Moon = ReplayArchive.Clip(day.Moon, 512);
             day.Members = (day.Members ?? new List<string>()).Where(name => !string.IsNullOrWhiteSpace(name))
-                .Select(name => ReplayArchive.Clip(name.Trim(), 64)).Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
+                .Select(name => ReplayArchive.Clip(name.Trim(), 64))
+                .Where(name => !ReplayArchive.IsPlaceholderMember(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase).Take(32).ToList();
             day.QuotaRemaining = NonNegative(day.QuotaRemaining);
             day.QuotaTarget = NonNegative(day.QuotaTarget);
             day.QuotaFulfilled = NonNegative(day.QuotaFulfilled);

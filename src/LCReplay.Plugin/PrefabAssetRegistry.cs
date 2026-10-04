@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using LCReplay.Core;
 using LCReplay.Plugin.Capture;
+using LCReplay.Plugin.Playback;
 using UnityEngine;
 
 namespace LCReplay.Plugin
@@ -19,6 +20,18 @@ namespace LCReplay.Plugin
         private static readonly Dictionary<string, GeometrySnapshot> Meshes = new Dictionary<string, GeometrySnapshot>(StringComparer.Ordinal);
         private static readonly Queue<string> meshOrder = new Queue<string>();
         private static long meshBytes;
+        internal static RuntimeAnimatorController? LocalPlayerController { get; private set; }
+        internal static RuntimeAnimatorController? RemotePlayerController { get; private set; }
+
+        internal static bool CachePlayerAssets(Component prefab, RuntimeAnimatorController? local, RuntimeAnimatorController? remote)
+        {
+            var playerType = GameAccess.Type("GameNetcodeStuff.PlayerControllerB");
+            if (!prefab || prefab.gameObject.scene.IsValid() || playerType == null || !playerType.IsInstanceOfType(prefab)) return false;
+            Add(prefab, "player");
+            if (local) LocalPlayerController = local;
+            if (remote) RemotePlayerController = remote;
+            return true;
+        }
 
         internal static string Key(Component component, string kind)
         {
@@ -31,17 +44,36 @@ namespace LCReplay.Plugin
 
         internal static void Warm(bool force = false)
         {
+            // A live round can end before the user opens its replay. Preserve
+            // the scene-owned ship effect while its original modules exist.
+            if (GameAccess.Singleton("StartOfRound") is Component liveRound && liveRound)
+                ReplayParticleAssets.CacheShipMagnet(liveRound);
+            var config = GameAccess.Read(GameAccess.Singleton("Unity.Netcode.NetworkManager"), "NetworkConfig");
             // The shared player body should be referenced once instead of
             // reading the same skin/GPU maps for every lobby member.
             if (!Prefabs.TryGetValue("player", out var player) || !player)
             {
                 var playerType = GameAccess.Type("GameNetcodeStuff.PlayerControllerB");
-                var playerObject = GameAccess.Read(GameAccess.Singleton("StartOfRound"), "playerPrefab") as GameObject;
+                var roundSource = GameAccess.Singleton("StartOfRound");
+                var playerObject = GameAccess.Read(roundSource, "playerPrefab") as GameObject;
+                if (!playerObject) playerObject = GameAccess.Read(config, "PlayerPrefab") as GameObject;
+                // A main-menu replay has no live StartOfRound singleton. Its
+                // compact player mesh references still need the installed
+                // player asset, just as enemy references do.
+                if (!playerObject && GameAccess.Type("StartOfRound") is Type roundType)
+                    foreach (var round in Resources.FindObjectsOfTypeAll(roundType))
+                        if (GameAccess.Read(round, "playerPrefab") is GameObject candidate && candidate && !candidate.scene.IsValid())
+                        { playerObject = candidate; roundSource = round; break; }
                 if (playerType != null && playerObject && !playerObject!.scene.IsValid() &&
                     playerObject.GetComponentInChildren(playerType, true) is Component nativePlayer)
-                    Add(nativePlayer, "player");
+                    CachePlayerAssets(nativePlayer,
+                        GameAccess.Read(roundSource, "localClientAnimatorController") as RuntimeAnimatorController,
+                        GameAccess.Read(roundSource, "otherClientsAnimatorController") as RuntimeAnimatorController);
+                if (playerType != null && (!Prefabs.TryGetValue("player", out player) || !player))
+                    foreach (var candidate in Resources.FindObjectsOfTypeAll(playerType).OfType<Component>())
+                        if (candidate && !candidate.gameObject.scene.IsValid())
+                        { Add(candidate, "player"); break; }
             }
-            var config = GameAccess.Read(GameAccess.Singleton("Unity.Netcode.NetworkManager"), "NetworkConfig");
             if (!force && config != null && ReferenceEquals(config, scannedConfig)) return;
             if (!force && config == null && Time.realtimeSinceStartup < nextScan) return;
             nextScan = Time.realtimeSinceStartup + 2f;
@@ -99,6 +131,15 @@ namespace LCReplay.Plugin
             if (owner.Kind != "enemy" && owner.Kind != "item" && owner.Kind != "player") return false;
             Warm();
             var key = Key(owner.Component, owner.Kind);
+            // Mods may load their enemy asset only when it first spawns,
+            // after the network configuration has already been indexed.
+            if (owner.Kind == "enemy" && (!Prefabs.TryGetValue(key, out var known) || !known))
+            {
+                var asset = GameAccess.Read(GameAccess.Read(owner.Component, "enemyType"), "enemyPrefab") as GameObject;
+                var type = GameAccess.Type("EnemyAI");
+                if (asset && !asset!.scene.IsValid() && type != null && asset.GetComponentInChildren(type, true) is Component enemy)
+                    Add(enemy, "enemy");
+            }
             var path = EntityTracker.RelativePath(owner.Component.transform, renderer.transform);
             if (path.Length == 0 || !Renderers.TryGetValue(key + "\n" + path, out var native) || !native ||
                 Mesh(renderer) != Mesh(native)) return false;
@@ -188,6 +229,14 @@ namespace LCReplay.Plugin
         }
 
         private static Mesh? Mesh(Renderer renderer) => renderer is SkinnedMeshRenderer skin ? skin.sharedMesh : renderer.GetComponent<MeshFilter>()?.sharedMesh;
+        internal static Mesh? ResolveMesh(GeometrySnapshot geometry)
+        {
+            if (geometry.PrefabKey.Length == 0 || geometry.PrefabRendererPath.Length == 0 ||
+                !Renderers.TryGetValue(geometry.PrefabKey + "\n" + geometry.PrefabRendererPath, out var renderer) || !renderer)
+                return null;
+            var mesh = Mesh(renderer);
+            return mesh && mesh!.vertexCount == geometry.Vertices.Length / 3 ? mesh : null;
+        }
         internal static Animator? ResolveAnimator(string key, string path) => Animators.TryGetValue(key + "\n" + path, out var animator) && animator ? animator : null;
         internal static Component? ResolvePrefab(string key)
         {

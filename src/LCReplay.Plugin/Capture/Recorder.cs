@@ -75,7 +75,7 @@ namespace LCReplay.Plugin.Capture
         private long droppedEvents;
         private bool indexFailureReported;
         private int maintenancePhase;
-        private bool maintenanceTurn;
+        private int consecutiveSnapshots;
         private IEnumerator<ReplayRecord?>? sampleOutput;
         private bool extraWorldTurn;
         private readonly EnvironmentCapture.ChangingCapture changingPostFx = new EnvironmentCapture.ChangingCapture();
@@ -119,6 +119,7 @@ namespace LCReplay.Plugin.Capture
             };
             header.Capabilities.AddRange(new[] { "entity-transforms", "child-renderer-poses", "sparse-entity-renderer-poses", "primitive-game-fields", "state-transitions", "observed-method-calls", "round-state", "custom-provider-api" });
             header.Capabilities.Add("actor-animation-state-events");
+            header.Capabilities.Add("enemy-visual-bone-poses");
             if (!captureBones) header.Capabilities.Add("actor-animation-parameter-events");
             if (captureBones) header.Capabilities.Add("actor-bone-poses");
             if (captureWorld) header.Capabilities.AddRange(new[] { "render-geometry-and-bounds", "embedded-render-assets",
@@ -143,7 +144,8 @@ namespace LCReplay.Plugin.Capture
             header.Warnings.Add("GPU-only particle states, baked lighting, custom post-processing textures, RNG execution and arbitrary object graphs are not recorded. Short-lived Unity particles are sampled with a per-frame cap; looping emitters and GPU swarms use bounded approximations.");
             header.Warnings.Add("Game sound actions reference installed clips; no waveform or voice chat is recorded.");
             header.Warnings.Add("Fields, arrays, bones, entities, provider state and world geometry are bounded; omissions are recorded.");
-            if (!captureBones) header.Warnings.Add("Actor animation uses sparse Animator state and parameter changes plus reusable short motion tracks. Matching installed game controllers and avatars reproduce their blend trees; unavailable assets use observed tracks where available. Unsupported or unobserved motions can remain in a captured pose. Enable CaptureBones for an independent pose stream.");
+            header.Warnings.Add("Enemy visual bones and rigid model ancestors, including inactive forms, are sampled after animation and procedural movement with a 512-transform limit per enemy. Matching installed prefabs supply controllers, rigs and meshes; custom shader deformation and uncaptured runtime meshes may differ.");
+            if (!captureBones) header.Warnings.Add("Player and item animation uses sparse Animator state and parameter changes plus reusable short motion tracks. Matching installed controllers and avatars reproduce their blend trees; unavailable assets use observed tracks where available. Enable CaptureBones for their independent pose streams.");
             if (captureWorld) header.Warnings.Add("HDRP volume settings are sampled only when their effective values change. Scalar, vector and bounded color-curve settings are saved; custom-pass textures need the installed game assets and may be unavailable after updates.");
             header.Warnings.Add("Method calls may include rejected actions, RPC duplicates or miss overrides; use snapshot transitions for outcomes.");
             foreach (var type in tracker.MissingTypes) header.Warnings.Add("Unavailable component type: " + type);
@@ -307,29 +309,29 @@ namespace LCReplay.Plugin.Capture
                 if (storagePausedAt.HasValue) log("Disk saving caught up; recording sampling resumed.");
                 storagePausedAt = null;
             }
-            // Sparse animation changes retain their own observation timestamps.
-            // Visit bindings even while publishing a large initial snapshot.
-            foreach (var animation in tracker.AnimationChangesStep(now, 4, .25))
-                Write(new ReplayRecord { Kind = "event", Time = animation.Time, Event = animation });
-            if (Error != null || storage.ShouldPauseCapture || Elapsed(tickStarted) >= .75) return;
-            // Finish frozen snapshot records on later frames. Never add scene
-            // scans or another live snapshot to the same output-work frame.
+            // Flush owned output before taking another snapshot, but never let
+            // the old 128-entity limit turn a large lobby into multi-second gaps.
+            // Deadline pressure gets a small extra CPU budget, not an unbounded
+            // synchronous drain or an ever-growing queue of snapshots.
             if (sampleOutput != null)
             {
                 LastWork = "sample-output";
-                var remaining = 8;
-                for (var work = 0; work < 128 && remaining > 0; work++)
+                var outputStarted = Stopwatch.GetTimestamp();
+                var budget = forceFrame || now >= nextFrame ? 1.5 : .4;
+                var remaining = 32;
+                for (var work = 0; work < 4096 && remaining > 0; work++)
                 {
                     if (!sampleOutput.MoveNext())
                     { sampleOutput.Dispose(); sampleOutput = null; break; }
                     if (sampleOutput.Current != null) { Write(sampleOutput.Current); remaining--; }
-                    if (Elapsed(tickStarted) >= .4 || storage.ShouldPauseCapture) break;
+                    if (Elapsed(outputStarted) >= budget || storage.ShouldPauseCapture) break;
                 }
-                return;
+                if (sampleOutput != null || Error != null || storage.ShouldPauseCapture) return;
+                // Refresh the timestamp after output work. Never stamp a new
+                // Unity observation with a time from before that work ran.
+                now = Duration;
             }
-            DrainEvents(now, tickStarted);
-            if (Error != null || storage.ShouldPauseCapture || Elapsed(tickStarted) >= .5) return;
-            if (!maintenanceTurn && (forceFrame || now >= nextFrame))
+            if (forceFrame || now >= nextFrame && consecutiveSnapshots < 2)
             {
                 LastWork = "snapshot";
                 if (now - nextFrame > 1.0 / rate && previous != null)
@@ -350,11 +352,23 @@ namespace LCReplay.Plugin.Capture
                 var motions = itemMotion.Observe(frame, tracker).ToList();
                 sampleOutput = SampleRecords(frame, previous, motions).GetEnumerator();
                 previous = frame;
-                nextFrame = now + 1.0 / rate;
-                maintenanceTurn = true;
+                // Keep the configured cadence across fractional Unity frames.
+                // Skip expired deadlines rather than fabricating catch-up poses.
+                nextFrame = forceFrame ? now + 1.0 / rate :
+                    nextFrame + (Math.Floor(Math.Max(0, now - nextFrame) * rate) + 1) / rate;
+                consecutiveSnapshots++;
                 return;
             }
-            maintenanceTurn = false;
+            // Non-pose work uses the frames between sampling deadlines. An
+            // event burst cannot consume every deadline before Capture runs.
+            // If the requested rate exceeds the game's available frames, still
+            // reserve a maintenance turn after two consecutive observations.
+            consecutiveSnapshots = 0;
+            foreach (var animation in tracker.AnimationChangesStep(now, 4, .25))
+                Write(new ReplayRecord { Kind = "event", Time = animation.Time, Event = animation });
+            if (Error != null || storage.ShouldPauseCapture || Elapsed(tickStarted) >= .75) return;
+            DrainEvents(now, tickStarted);
+            if (Error != null || storage.ShouldPauseCapture || Elapsed(tickStarted) >= .5) return;
             // Give an unfinished map extra idle frames without running multiple
             // maintenance stages together or starving discovery and ambience.
             if (captureWorld && !suspendWorldCapture && worldDirty && extraWorldTurn)
@@ -377,7 +391,7 @@ namespace LCReplay.Plugin.Capture
                     LastWork = "world"; CaptureWorldWork(now, suspendWorldCapture); break;
                 case 4:
                     LastWork = "visual";
-                    if (captureWorld && !worldDirty)
+                    if (captureWorld && worldCaptureSetId.Length != 0)
                         foreach (var visualEvent in tracker.Visual.Scan(now, worldCaptureSetId))
                             Write(new ReplayRecord { Kind = "event", Time = visualEvent.Time, Event = visualEvent });
                     break;
@@ -429,6 +443,11 @@ namespace LCReplay.Plugin.Capture
             var eventBudget = 8;
             while (eventBudget-- > 0 && events.TryDequeue(out var evt))
             {
+                if (evt.Name == "PlayerControllerB.TeleportPlayer" &&
+                    evt.Data.TryGetValue("instanceId", out var teleportedText) &&
+                    int.TryParse(teleportedText, out var teleportedId))
+                    evt.EntityId = tracker.Entries.FirstOrDefault(entry => entry.Kind == "player" &&
+                        entry.Component && entry.Component.GetInstanceID() == teleportedId)?.Id ?? "";
                 if (evt.Name == "EnemyAI.Start" && evt.Data.TryGetValue("instanceId", out var enemyText) &&
                     int.TryParse(enemyText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var enemyId))
                 {
@@ -598,7 +617,8 @@ namespace LCReplay.Plugin.Capture
                     nextLateEntityScan = time + 2;
                 }
                 var report = new ReplayEvent { Time = time, Category = "capture", Name = "world-captured", Data = new Dictionary<string, string> { ["coverage"] = summary } };
-                Write(new ReplayRecord { Kind = "event", Time = time, Event = report });
+                if (!storage.ShouldPauseCapture)
+                    Write(new ReplayRecord { Kind = "event", Time = time, Event = report });
                 log(summary);
                 return;
             }

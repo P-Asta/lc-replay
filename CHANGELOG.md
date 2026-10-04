@@ -1,5 +1,97 @@
+# 0.25.35
+
+- Show top-right notices for eight real-time seconds, with 0.35-second SmoothStep/Lerp slides in from the right and back out to the right.
+- Avoid patching existing BepInEx plugin bootstraps during isolated player-asset loading. Skip optional mod types whose unavailable dependencies prevent type inspection, while retaining guards on scene lifecycle callbacks and failing closed for game assembly errors.
+- Include the failing method and underlying error when a lifecycle guard cannot be installed.
+
+# 0.25.34
+
+- Prioritize due live snapshots over queued call events, animation polling and map maintenance. Keep a maintenance turn after two consecutive snapshots if the requested sampling rate exceeds available Unity frames.
+- Remove the 128-entity output traversal bottleneck. Frozen output remains ordered and memory-bounded; overdue samples allow up to 1.5 ms of output work (0.4 ms otherwise), with 32 records/4096 work units as hard caps. Completed output no longer forces an extra idle frame before a due snapshot.
+- Keep sampling deadlines on the configured cadence instead of adding each Unity scheduling delay to every subsequent deadline. Skip missed deadlines without inventing observations. Disk backpressure and accepted-record preservation remain in effect.
+
+# 0.25.33
+
+- Stop drawing a synthetic straight aim ray over the turret's installed native bullet particles. Preserve recorded aim data for particle orientation; warm native particles when seeking into a paused firing state.
+- Capture mechanism renderer poses before mesh export supplies a baseline, including the first moving-platform/elevator ride. Keep complete bounded mechanism poses so a later baseline cannot change the meaning of earlier frames.
+- Do not bridge known missing indoor player samples with straight-line motion through facility walls. These old gaps hold the last observation and resume at the next sample; the missing path is not recoverable. Outdoor short-gap interpolation remains available.
+- Respect observed short player teleports below the old distance threshold. New call records identify the affected player; legacy calls require a matching destination and observed relocation.
+
+# 0.25.32
+
+- Prevent the replay-only exterior fill from illuminating volumetric fog. Preserve its surface lighting and the recorded fog color, density and world lighting.
+- Restore the native night-vision light's volumetric dimmers instead of HDRP defaults, avoiding additional indoor fog illumination.
+
+# 0.25.31
+
+- Bridge short player sampling gaps when the recorded endpoints allow plausible continuous movement. Preserve discontinuities for death, excessive distance, changed indoor/elevator state, observed teleport calls and gaps longer than five seconds. Missing intervals are interpolated, not recovered observations.
+- Correct delayed tree visibility in older recordings when a later confirmed tree removal matches a positional native break sound. Match the recorded trunk base, retain unmatched events and leave the source recording untouched. Forward playback and backward seeks use the corrected timeline.
+- Continue sparse visual-state scans while exporting a map, preventing world capture from postponing tree destruction/visibility observations until the entire map export finishes.
+
+# 0.25.30
+
+- Keep rigid enemy parts on the same evaluated native hierarchy as their skins. Legacy flattened renderer poses no longer detach Sapsucker eyes/eyelids from an animated head; complete newer procedural bone captures remain authoritative. The rule applies to matching vanilla and modded rigs.
+- Append new actors, anchors and visual resources within an unchanged capture set while retaining the built map. Streaming-window transitions no longer tear down the interior and ship just to add actor geometry. Hide the loading overlay after a completed world build; genuinely different maps still rebuild.
+- Restore legacy embedded terrain from the installed moon only when its level identity, terrain name, transform, dimensions and sampled heights match. This uses native terrain layers, holes and full height data instead of the old single-layer coarse mesh, with the recorded mesh retained when no match is available.
+
+# 0.25.29
+
+- Reuse installed rigid mesh assets without copying their GPU-only draw buffers. This restores separate teeth, jaws and weapon parts through the common prefab path, including matching mod assets. Track borrowed meshes separately so seeking and closing playback cannot destroy game assets.
+- Attach an unambiguous visible held item to its recorded owner when utility-slot mods leave the ordinary selected-item field empty. New captures also retain `ItemOnlySlot` and `isPocketed`; hidden pocket contents remain hidden.
+- Preserve the original availability time of static world records carried into later streaming windows. Large backward seeks no longer defer the ship, exterior and interior until the later window's timestamp.
+- Honor each recorded particle render mode. Invisible bullet emitters no longer produce an extra red stretched tracer; their captured visible flare keeps its original renderer and material.
+
+# 0.25.28
+
+- Smooth native animation state changes in older recordings that contain only partial procedural bone poses. Cache each outgoing pose using the recorded inputs at its transition boundary, including interrupted transitions and backward seeks. Complete visual pose recordings retain their captured transitions.
+- Record the actual held-item owner, attachment transform and runtime item offsets. Follow enemy and player attachment points after native animation and recorded procedural poses have been evaluated; older enemy recordings can resolve an unambiguous nearby installed holder.
+- Clear retained native animation state when navigating forward or backward on the timeline, fixing history-dependent player hand/item offsets. Ordinary playback and paused updates keep their reusable graphs.
+- Discover vehicles before the bulk of other scene entities and preserve their initially disabled renderer branches. Restore an older recording's missing opening Cruiser pose only when its opening geometry and subsequent parked ship-relative motion establish a usable attachment. Hide the inactive destroyed body and vehicle debug bounds.
+- Record vehicle cargo relative to its vehicle and evaluate both at the same playback time. Older closely spaced rest poses can recover a vehicle-relative path when their recorded motion establishes that they travelled together; held, falling, ambiguous and stationary ground items retain their own paths.
+- Rebuild GPU-only player meshes into readable geometry before CPU skinning. This prevents an unreadable lower-detail body from remaining as an oversized, unanimated mesh in v73 recordings.
+- Preserve inert copies of the ship magnet's native particle templates before their scene unloads, including the original sprite-sheet animation and material. Main-menu playback therefore retains the electrical effect instead of drawing the full texture atlas as square billboards.
+
+# 0.25.27
+
+- Capture enemy visual bones and rigid model ancestors generically, including inactive transformation forms and assets loaded by mods after startup. Sample after Animator and ordinary LateUpdate movement, with bounded immutable pose snapshots and omission reporting.
+- Apply recorded procedural outputs after the native Animator/IK graph so spider legs and enemy facing survive evaluation and backward seeks. Keep hidden native visual branches available while recorded renderer states select visible forms.
+- Rebuild retained controller streams on backward seeks so Nutcracker patrol restores its lowered head after inspection. Release owned animation graphs when switching replay windows.
+- Preserve installed mesh blend-shape channels and capture bounded procedural blend-shape weights. Restore weights deterministically when seeking.
+- Restore cold-menu player bodies from the actual installed player prefab and local/remote controllers. Load only in an inactive network session, guard the private asset scene's callbacks, and unload it before playback. Overlap this work with file decoding and retain the assets for later replays.
+- Reduce replay material preparation work with incremental resource indexing, reused texture lookups, and an exact alpha-coverage histogram instead of repeatedly scanning each texture mip.
+- Reuse each blended player skin matrix and its outline direction across vertex channels, reducing body processing without lowering model detail or animation update frequency.
+- Remove native particle-template gameplay components in dependency order and disable their audio before activation. An unstrippable template falls back to recorded visual properties.
+- Pass 109 automated groups, native construction/binding checks for 34 vanilla enemy prefabs, a synthetic mod-style transformation rig, and the supplied replay's player/Spider/Nutcracker/Jester regression checks. Instrumented playback CPU work at 90 seconds decreases from 27.1 to 15.2 ms with all four player bodies visible; this is not a total FPS measurement.
+- Retain the reusable playback sampler and single-LOD rendering optimizations from 0.25.26. Older files cannot supply procedural motion or transformation states they never recorded; arbitrary custom shaders and runtime mesh deformation remain outside this capture stream.
+
+# 0.25.26
+
+- Evaluate enemy controllers and RigBuilder constraints in the same manual graph, including the Jester's closed and opened forms. Enable animation branches that start inactive in the installed prefab.
+- Preserve Nutcracker torso turns independently of its feet. New recordings capture the torso directly; older recordings can recover its single-axis turn from the recorded native shotgun transform. New Jester captures also retain its procedural head target.
+- Advance animation phase without multiplying state speed twice. New observations store normalized cycles per second; older matching observations interpolate their recorded phase, with the already speed-adjusted duration as fallback.
+- Select one complete native LOD level per actor instead of drawing overlapping high/low-detail bodies. Rebuild that selection on map/window changes, and register late-spawn enemy LODs before recording their meshes.
+- Reuse playback pose storage and held-item lookup tables, removing roughly 58 KB of temporary allocations per sample in the supplied recording. Cache camera properties outside the player-outline vertex loop.
+- Release compilation has zero warnings/errors; 107 automated groups and muted native Jester/Nutcracker pose, torso and LOD checks pass. Internal replay frame processing is faster in the supplied-file fixture; total game FPS has not been measured.
+
+# 0.25.25
+
+- Continue an interrupted quota-day recording in a numbered `-p2.lcr` file instead of retrying the occupied first filename every 60 seconds. The archive keeps all parts in one replay and recovers their link from headers if sidecar manifests are lost.
+- Queue one completed large map snapshot behind a busy writer and pause capture until it drains. This addresses the observed capture backlog error that preceded the repeated quota-day alert.
+- Release build has zero warnings/errors; 105 automated Core/archive/lifecycle groups pass. Live game recording after restart remains to be checked.
+
 # 0.25.24
 
+- Open a full first playback window and finish its map/actor build before advancing playback, so the first visible section includes player, vehicle, ship, item and enemy data already recorded there.
+- Attach native rigid enemy parts such as heads, eyes and teeth to their animated prefab transforms; recorded per-renderer poses still take priority for procedural motion. Keep the live menu's input modules enabled during playback so buttons work again after leaving replay.
+- Bound item/player effects, including TZP inhalation, to a nearby 3D range for spectators in both native and older waveform playback. Preserve the recorded runtime range instead of replacing it with the prefab's default range.
+- Accept Unity UI's passive `LayoutElement` on the main Settings button template. The Gale `van host and visual` profile used this component, and rejecting it prevented the Replay menu button from attaching.
+- Preserve a recording after a transient capture exception by closing its readable prefix and automatically starting a numbered continuation after a bounded delay. Freeze late-entity owner lists before yielding across game frames; this fixes the observed `Collection was modified` stop in the supplied Artifice recording.
+- Retry transient primary file writes, rollback and flushes without duplicating records. Disk-full errors stop promptly; an optional sidecar failure does not stop the replay file. Hide `Player #<number>` placeholders from both new and existing crew lists.
+- Keep actor meshes found in the opening map ready across playback windows, hiding their roots until the actor appears. The supplied Artifice cruiser mesh is recorded at the start but its first frame appears in the second window; this avoids a delayed or transparent car.
+- Validate the built scene when seeking across windows and resolve the target world again. A matching file revision alone no longer skips a needed map rebuild when seeking backward.
+- Record a new sparse item pose whenever its Y position or fall target height changes, even within the former 0.02 m tolerance. Keep the existing X/Z and scale tolerance.
+- Keep replay-created scenes out of Netcode's new-client synchronization. Connected playback reuses render-only copies from a matching loaded moon, and releases its scene on close; menu playback waits for scene cleanup before returning to game controls.
+- Stop changing the game's button interactable states for replay UI input. Block the HUD's separate right-click PingScan action during playback and clear its spectator vote hold timer when entering and leaving replay.
 - Restore a visible fallback sky when an older HDRI recording contains six black, quantized cubemap faces. New recordings store RGBE-encoded sky faces so dim HDR sky colors survive PNG capture; replay keeps the restored cubemap when later sky settings change.
 - Hide the moon's recorded exterior fog while replaying the prelanding ship phase, then restore it after departure or on a seek back and forth. This prevents the detached free camera from showing the orbit scene through dense white surface fog.
 - Schedule live snapshots, frozen snapshot output and scene maintenance on different game frames. Keep player, held-item and camera poses at one observation time. Under pressure, do not starve new frames behind the entire method-event backlog.
@@ -11,7 +103,7 @@
 - Keep a bounded motion tail while a large world record is being written; the world alone does not pause every new motion sample. The tail still pauses/resumes at its count/byte watermarks.
 - Apply these small work slices only to recording. Replay keeps its separate fast scene-building loop, asynchronous file loading and full per-render animation updates.
 - Replace the player outline's 2.5% whole-body enlargement with a thin offset along the animated surface. Weld duplicate vertex normals, preserve body transforms and cap protrusion at 5 mm; retain opaque black outlines.
-- Release build has zero warnings/errors; 97 automated groups pass. Native test measurements and the limitations of cooperative work budgets are documented in docs/TESTING.md.
+- Release build has zero warnings/errors; 103 automated groups pass. Native test measurements and the limitations of cooperative work budgets are documented in docs/TESTING.md. The Artifice cruiser/seek changes need an in-game visual check; multiplayer replay and spectator vote fixes still need a two-client game check.
 
 # 0.25.23
 

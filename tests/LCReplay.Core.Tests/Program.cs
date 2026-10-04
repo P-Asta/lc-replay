@@ -27,6 +27,10 @@ if (args.Length == 2 && args[0] == "--inspect-audio")
 
 var suite = new (string Name, Action Run)[]
 {
+    ("Animation clocks avoid double speed and preserve phase continuity and restarts", AnimationClockTests.Run),
+    ("Enemy blendshapes interpolate across seeks without changing discrete state or source frames", BlendShapeTests.Run),
+    ("Vehicle cargo follows the same interpolated translation, rotation and scale without ground or pickup attachment", VehicleCargoTests.Run),
+    ("Delayed opening Cruiser poses require proven parked ship travel and preserve source boundaries", VehicleLeadInTests.Run),
     ("Round trip captures frames, world, events and metadata", RoundTrip),
     ("Every truncated byte boundary recovers only complete records", Truncation),
     ("Reject malformed schemas, sizes, collections, numbers and JSON", Validation),
@@ -35,18 +39,24 @@ var suite = new (string Name, Action Run)[]
     ("Slow disk drains buffered capture in order without stopping recording", StorageBackpressure),
     ("Writer memory accounting applies backpressure to an in-flight large world", WriterMemoryBudget),
     ("Full disk and allocation failures keep readable records and release queues", StorageFailureRecovery),
+    ("Transient output writes and flushes recover without duplicate records", TransientStorageRecovery),
+    ("Disk-full output fails promptly and preserves its prefix", DiskFullNoRetry),
     ("Closed writers release asynchronous capacity waiters", StorageCloseWaiter),
     ("A bounded overflow failure still drains its accepted prefix", StorageOverflowBudget),
+    ("A large world waits behind a busy writer without aborting capture", StorageQueuedLargeWorld),
     ("Early throttling resumes only below the low watermark", StorageLowWatermarks),
     ("A capture tick drains at most its record and elapsed-time budgets", StorageDrainBudget),
     ("Final snapshot records stream after accepted overflow without blocking completion", StorageFinalTail),
     ("Worker PNG encoding preserves bounded RGBA rows and PNG checksums", WorkerPng),
+    ("Histogram mip alpha coverage preserves every threshold and scale tie", AlphaCoverageTests.Run),
     ("A large in-flight map retains a bounded ordered motion tail before throttling", BulkWorldMotionTail),
     ("Optional index creation failure cannot stop the recording", OptionalIndexFailure),
     ("Streaming compression reduces allocations and enforces limits before appending", StreamingRecordWrite),
     ("Timeline seeks and applies discrete lifecycle boundaries", Timeline),
     ("Playback sampler matches independent samples across rapid forward and backward seeks", PlaybackSampler),
+    ("Reusable playback poses preserve seek boundaries without steady-state allocations", ReusablePlaybackSampler),
     ("Player teleports and death relocation do not interpolate through walls", PlayerDiscontinuities),
+    ("Confirmed tree removals recover delayed visibility timing without mutating recordings", TreeBreakTimingTests.Run),
     ("Quaternion interpolation follows the shortest normalized arc", Quaternion),
     ("Recorded player view rotation survives file IO and interpolated seeking", PlayerViewRotation),
     ("Held scrap stays attached while a player turns between samples", HeldItemAttachment),
@@ -805,6 +815,42 @@ static void StorageFailureRecovery() => WithTemp(dir =>
     }
 });
 
+static void TransientStorageRecovery() => WithTemp(dir =>
+{
+    var output = new ControlledRecordingStream();
+    using var writer = new ReplayWriter(output, Header(), 16);
+    output.TransientWriteFailures = 2;
+    output.TransientRollbackFailures = 1;
+    Check(writer.TryWrite(Frame(1, Entity("p", 1))), "frame queued before transient write failure");
+    Check(writer.TryWrite(new ReplayRecord { Kind = "event", Time = 1, Event = new ReplayEvent {
+        Time = 1, Category = "marker", Name = "bookmark" } }), "bookmark queued");
+    output.TransientFlushFailures = 2;
+    writer.Dispose();
+    Check(writer.Error == null && output.Rollbacks >= 2 && output.RollbackAttempts >= 3,
+        "torn record tails and temporary rollback failure recover");
+    Check(output.FlushAttempts >= 3, "temporary flush failures retried");
+    var path = Path.Combine(dir, "transient.lcr"); File.WriteAllBytes(path, output.Bytes);
+    var saved = ReplayReader.Read(path);
+    Check(saved.IsComplete && saved.Frames.Count == 1 && saved.Frames[0].Time == 1,
+        "one complete frame survives transient output failures");
+    Check(saved.Events.Count(e => e.Category == "marker") == 1 && writer.WrittenBookmarkCount == 1,
+        "retry does not duplicate the marker");
+});
+
+static void DiskFullNoRetry() => WithTemp(dir =>
+{
+    var output = new ControlledRecordingStream();
+    using var writer = new ReplayWriter(output, Header(), 2);
+    var initialWrites = output.WriteAttempts;
+    output.Failure = new InjectedDiskFullException();
+    Check(writer.TryWrite(Frame(1)), "frame accepted by output queue");
+    writer.Dispose();
+    Check(writer.Error is InjectedDiskFullException && output.WriteAttempts == initialWrites + 1,
+        "known disk-full error does not repeat the failed write");
+    var path = Path.Combine(dir, "full.lcr"); File.WriteAllBytes(path, output.Bytes);
+    Check(!ReplayReader.Read(path).IsComplete, "complete header prefix remains readable");
+});
+
 static void StorageCloseWaiter()
 {
     var output = new ControlledRecordingStream();
@@ -821,6 +867,27 @@ static void StorageCloseWaiter()
     }
     finally { output.Release.Set(); }
 }
+
+static void StorageQueuedLargeWorld() => WithTemp(dir =>
+{
+    var output = new ControlledRecordingStream(); using var writer = new ReplayWriter(output, Header(), 1);
+    var capture = new ReplayCaptureBuffer(writer, 8, 1024); output.Block = true;
+    Check(capture.TryWrite(Frame(0)) && output.Entered.Wait(TimeSpan.FromSeconds(5)), "writer is busy");
+    try
+    {
+        Check(capture.TryWrite(Frame(1)) && capture.TryWrite(Frame(2)), "ordered motion tail retained");
+        var world = new WorldSnapshot { Geometry = new() {
+            new GeometrySnapshot { Id = "late-map", Vertices = new float[3000], Triangles = new[] { 0, 1, 2 } } } };
+        Check(capture.TryWrite(new ReplayRecord { Kind = "world", Time = 2, World = world }) &&
+            capture.Error == null && capture.ShouldPauseCapture, "one oversized completed map pauses capture instead of failing");
+        var done = capture.CompleteAsync(); output.Release.Set(); Check(done.Wait(TimeSpan.FromSeconds(10)), "map drains after writer resumes");
+        var file = Path.Combine(dir, "queued-world.lcr"); File.WriteAllBytes(file, output.Bytes);
+        var saved = ReplayReader.Read(file);
+        Check(saved.Frames.Count == 3 && saved.Worlds.Count == 1 && capture.PendingBytes == 0 && writer.Error == null,
+            "motion and map remain readable in order");
+    }
+    finally { output.Release.Set(); }
+});
 
 static void StorageOverflowBudget() => WithTemp(dir =>
 {
@@ -998,6 +1065,60 @@ static void PlaybackSampler()
     Check(held.Entities[0].State["held"] == "flashlight", "later samples do not replace earlier poses");
 }
 
+static void ReusablePlaybackSampler()
+{
+    var first = new ReplayFrame { Time = 0 };
+    var second = new ReplayFrame { Time = 1 };
+    foreach (var frame in new[] { first, second })
+    {
+        frame.State["phase"] = frame.Time.ToString();
+        frame.Anchors.Add(new AnchorPose { Id = "ship", Position = new Vec3(0, (float)frame.Time, 0) });
+        frame.SceneRenderers.Add(new RenderPose { Id = "door", Active = frame.Time == 0 });
+        frame.Lines.Add(new LinePose { Id = "beam", Positions = new[] { (float)frame.Time, 1f, 2f }, StartWidth = .02f });
+        frame.Particles.Add(new ParticlePose { EmitterId = "smoke", RandomSeed = 1, RemainingLifetime = 2f - (float)frame.Time });
+        frame.ParticleStyles.Add(new ParticleStyleSnapshot { Id = "smoke", Name = "smoke", Time = (float)frame.Time });
+        for (var actor = 0; actor < 12; actor++)
+        {
+            var entity = Entity("actor" + actor, (float)frame.Time);
+            entity.ViewPosition = new Vec3(0, (float)frame.Time, 0);
+            entity.ViewRotation = Quat.Identity;
+            for (var bone = 0; bone < 48; bone++)
+                entity.Bones.Add(new BonePose { Path = "bone" + bone, Position = new Vec3((float)frame.Time, bone, actor) });
+            entity.Renderers.Add(new RenderPose { Id = "mesh" + actor, Active = frame.Time == 0 });
+            frame.Entities.Add(entity);
+        }
+        frame.Entities.Add(new EntitySnapshot { Id = "item", Kind = "item", Position = new Vec3(1, 0, 0),
+            State = new() { ["isHeld"] = "True", ["$heldBy"] = "actor0" } });
+    }
+    var last = new ReplayFrame { Time = 2, Entities = new() { new EntitySnapshot { Id = "new-actor", Kind = "enemy", Active = false } } };
+    var session = new ReplaySession { Duration = 2, Frames = new() { first, second, last } };
+    var sampler = new ReplayTimelineSampler();
+    var recordingBefore = JsonConvert.SerializeObject(session);
+    foreach (var time in new[] { .5, 1.5, 2, 0, 1, .2, 2, .8 })
+    {
+        var expected = JsonConvert.SerializeObject(ReplayTimeline.Sample(session, time));
+        var actual = JsonConvert.SerializeObject(sampler.SampleReusable(session, time));
+        Check(actual == expected, "reusable pose parity through lifecycle changes and backward seeks at " + time);
+    }
+    var stable = sampler.Sample(session, .25);
+    sampler.SampleReusable(session, .75);
+    Near(stable.Entities[0].Position.X, .25);
+    Check(recordingBefore == JsonConvert.SerializeObject(session), "reusable samples do not mutate recorded frames");
+    var empty = sampler.SampleReusable(new ReplaySession(), 0);
+    Check(empty.Entities.Count == 0 && empty.Anchors.Count == 0 && empty.SceneRenderers.Count == 0 &&
+        empty.Lines.Count == 0 && empty.Particles.Count == 0 && empty.ParticleStyles.Count == 0 && empty.State.Count == 0,
+        "empty sessions clear every reused collection and state");
+    for (var i = 0; i < 100; i++) sampler.SampleReusable(session, .5);
+    var allocated = GC.GetAllocatedBytesForCurrentThread();
+    for (var i = 0; i < 100; i++) sampler.SampleReusable(session, .25 + i * .005);
+    allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+    Check(allocated < 1024, "dense actor interpolation should not allocate per pose or held item after warmup; allocated " + allocated);
+    var independent = ReplayTimeline.Sample(session, 0);
+    independent.Lines[0].Positions[0] = 99; independent.Lines[0].StartColor[0] = 0;
+    Check(first.Lines[0].Positions[0] == 0 && first.Lines[0].StartColor[0] == 1,
+        "independent endpoint sampling owns line positions and colors");
+}
+
 static void PlayerDiscontinuities()
 {
     var before = Entity("player", 0); before.State["isPlayerDead"] = "False";
@@ -1010,6 +1131,12 @@ static void PlayerDiscontinuities()
     falling.Position = new Vec3(0, -4, 0);
     session.Frames[1].Entities[0] = falling;
     Near(ReplayTimeline.Sample(session, .1).Entities[0].Position.Y, -2);
+    session.Events.Add(new ReplayEvent { Time = .1, Category = "call", Name = "PlayerControllerB.TeleportPlayer",
+        Data = new() { ["pos"] = "0,-4,0" } });
+    Near(ReplayTimeline.Sample(session, .1).Entities[0].Position.Y, 0);
+    session.Events[0].EntityId = "another-player";
+    Near(ReplayTimeline.Sample(session, .1).Entities[0].Position.Y, -2);
+    session.Events.Clear();
     var dead = Entity("player", 1000); dead.State["isPlayerDead"] = "True";
     session.Frames[1].Entities[0] = dead;
     Near(ReplayTimeline.Sample(session, .1).Entities[0].Position.X, 0);
@@ -1017,7 +1144,18 @@ static void PlayerDiscontinuities()
     session.Frames[1] = Frame(1, afterGap).Frame!;
     session.Duration = 1;
     session.Events.Add(new ReplayEvent { Time = 1, Category = "capture", Name = "sample-gap" });
+    Near(ReplayTimeline.Sample(session, .5).Entities[0].Position.X, 2.5);
+    session.Frames[1].Entities[0].State["isInsideFactory"] = "True";
     Near(ReplayTimeline.Sample(session, .5).Entities[0].Position.X, 0);
+    session.Frames[0].Entities[0].State["isInsideFactory"] = "True";
+    Near(ReplayTimeline.Sample(session, .5).Entities[0].Position.X, 0);
+    session.Frames[0].Entities[0].State.Remove("isInsideFactory");
+    session.Frames[1].Entities[0].State.Remove("isInsideFactory");
+    session.Events.Add(new ReplayEvent { Time = .6, Category = "call", Name = "PlayerControllerB.TeleportPlayer" });
+    Near(ReplayTimeline.Sample(session, .5).Entities[0].Position.X, 0);
+    session.Events.RemoveAt(1);
+    session.Frames[1].Time = 6; session.Duration = 6;
+    Near(ReplayTimeline.Sample(session, 3).Entities[0].Position.X, 0);
 }
 
 static void Quaternion()
@@ -2358,23 +2496,50 @@ sealed class ControlledRecordingStream : Stream
     public readonly ManualResetEventSlim Entered = new(false), Release = new(false);
     public readonly SemaphoreSlim RecordPermits = new(0);
     public volatile bool Block, TornTail, FailTruncate, StepRecords;
+    public int TransientWriteFailures, TransientFlushFailures, TransientRollbackFailures;
+    public int Rollbacks, RollbackAttempts, FlushAttempts, WriteAttempts;
     public Exception? Failure;
     public byte[] Bytes => data.ToArray();
     public override void Write(byte[] buffer, int offset, int count)
     {
+        WriteAttempts++;
         if (Block) { Entered.Set(); if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Slow-disk test did not release output"); }
         if (StepRecords && count > 8) { Entered.Set(); if (!RecordPermits.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Step disk was not released"); }
+        if (TransientWriteFailures > 0)
+        {
+            TransientWriteFailures--;
+            data.Write(buffer, offset, Math.Min(3, count));
+            throw new IOException("injected transient output failure");
+        }
         if (Failure is Exception failure) { if (TornTail) data.Write(buffer, offset, Math.Min(3, count)); throw failure; }
         data.Write(buffer, offset, count);
     }
     public override void Write(ReadOnlySpan<byte> buffer) { var bytes = buffer.ToArray(); Write(bytes, 0, bytes.Length); }
-    public override void Flush() { }
+    public override void Flush()
+    {
+        FlushAttempts++;
+        if (TransientFlushFailures > 0)
+        { TransientFlushFailures--; throw new IOException("injected transient flush failure"); }
+    }
     public override bool CanRead => false;
     public override bool CanSeek => true;
     public override bool CanWrite => true;
     public override long Length => data.Length;
     public override long Position { get => data.Position; set => data.Position = value; }
-    public override void SetLength(long value) { if (FailTruncate) throw new IOException("injected truncate failure"); data.SetLength(value); }
+    public override void SetLength(long value)
+    {
+        RollbackAttempts++;
+        if (TransientRollbackFailures > 0)
+        { TransientRollbackFailures--; throw new IOException("injected transient truncate failure"); }
+        if (FailTruncate) throw new IOException("injected truncate failure");
+        Rollbacks++; data.SetLength(value);
+    }
     public override long Seek(long offset, SeekOrigin origin) => data.Seek(offset, origin);
     public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+sealed class InjectedDiskFullException : IOException
+{
+    public InjectedDiskFullException() : base("injected full disk")
+    { HResult = unchecked((int)0x80070070); }
 }
