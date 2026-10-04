@@ -325,6 +325,29 @@ namespace LCReplay.Plugin.Playback
 
             internal void Tick()
             {
+                if (cleaned && !Completed)
+                {
+                    // Harmony recompiles each restored method. Hundreds of
+                    // synchronous unpatches can freeze a close/cancel frame.
+                    // The private scene is already gone; retire guards over
+                    // bounded main-thread turns before allowing another load.
+                    var watch = System.Diagnostics.Stopwatch.StartNew();
+                    for (var count = 0; guardedMethods.Count != 0 && count < 8; count++)
+                    {
+                        var index = guardedMethods.Count - 1;
+                        var method = guardedMethods[index];
+                        guardedMethods.RemoveAt(index);
+                        try { harmony.Unpatch(method, HarmonyPatchType.Prefix, PatchId); }
+                        catch (Exception error) { Debug.LogError("LC Replay player asset guard cleanup failed: " + error.Message); }
+                        if (watch.Elapsed.TotalMilliseconds >= 3) break;
+                    }
+                    if (guardedMethods.Count == 0)
+                    {
+                        roots.Clear(); Completed = true;
+                        if (ReferenceEquals(current, this)) current = null;
+                    }
+                    return;
+                }
                 if (handlingLoaded && !cleaned && unloading == null &&
                     (loading == null || loading.isDone) && Time.realtimeSinceStartup >= nextCleanupAttempt)
                     Unload();
@@ -346,13 +369,7 @@ namespace LCReplay.Plugin.Playback
             {
                 if (cleaned) return;
                 cleaned = true;
-                Completed = true;
                 ReplayIsolation.Unregister(scene);
-                foreach (var method in guardedMethods)
-                    try { harmony.Unpatch(method, HarmonyPatchType.Prefix, PatchId); }
-                    catch (Exception error) { Debug.LogError("LC Replay player asset guard cleanup failed: " + error.Message); }
-                guardedMethods.Clear(); roots.Clear();
-                if (ReferenceEquals(current, this)) current = null;
             }
         }
     }

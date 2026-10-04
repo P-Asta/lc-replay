@@ -135,9 +135,16 @@ namespace LCReplay.Plugin.Playback
         private Vector3 _shipCabinCenter;
         private int _screenWidth, _screenHeight;
         private readonly Dictionary<string, GameObject> _geometryObjects = new Dictionary<string, GameObject>();
+        private readonly Dictionary<string, Renderer> _geometryRenderers = new Dictionary<string, Renderer>(StringComparer.Ordinal);
+        private readonly Dictionary<string, EntitySnapshot> _frameEntities = new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
         private readonly Dictionary<string, List<GameObject>> _maskEyesObjects = new Dictionary<string, List<GameObject>>();
         private readonly Dictionary<string, EntitySnapshot> _audioEntities = new Dictionary<string, EntitySnapshot>();
         private readonly HashSet<string> _hazardsWithModel = new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<Renderer>> _hazardModelRenderers = new Dictionary<string, List<Renderer>>(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<Renderer>> _entityGeometryRenderers = new Dictionary<string, List<Renderer>>(StringComparer.Ordinal);
+        private readonly List<Renderer> _landmineRenderers = new List<Renderer>();
+        private MeshFilter? _landmineTemplate;
+        private float _landmineTemplateRetryAt = float.NegativeInfinity;
         private readonly Dictionary<string, BakedPlayerBody> _bakedPlayers = new Dictionary<string, BakedPlayerBody>(StringComparer.Ordinal);
         private readonly HashSet<string> _nativeSkinIds = new HashSet<string>(StringComparer.Ordinal);
         private readonly Dictionary<string, Transform> _nativeRigidParts = new Dictionary<string, Transform>(StringComparer.Ordinal);
@@ -307,7 +314,7 @@ namespace LCReplay.Plugin.Playback
             _sparseRendererPoses = session.Header.Capabilities.Contains("sparse-entity-renderer-poses");
             _savedCursorLock = Cursor.lockState;
             _savedCursorVisible = Cursor.visible;
-            _resolutionScale = Mathf.Clamp(resolutionScale, 0.25f, 1f);
+            _resolutionScale = Mathf.Clamp(resolutionScale, 0.25f, 4.5f);
             _gamma = Mathf.Clamp(gamma, 0.5f, 2f);
             _disableInteriorCulling = disableInteriorCulling;
             _mutePlayerAudio = mutePlayerAudio;
@@ -1244,14 +1251,12 @@ namespace LCReplay.Plugin.Playback
         private void CacheMineMeshes(EntityVisual visual, EntitySnapshot entity)
         {
             visual.MineMeshes.Clear();
-            foreach (var pair in _geometryObjects)
-            {
-                var obj = pair.Value; if (!obj || !(obj.GetComponent<Renderer>() is Renderer renderer)) continue;
-                if (_dynamicGeometry.TryGetValue(pair.Key, out var geometry) && geometry.EntityId == entity.Id ||
-                    obj.name.IndexOf("Landmine", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                    renderer.bounds.SqrDistance(visual.Root.transform.position) < .25f)
+            if (_entityGeometryRenderers.TryGetValue(entity.Id, out var owned))
+                foreach (var renderer in owned) if (renderer) visual.MineMeshes.Add(renderer);
+            var position = visual.Root.transform.position;
+            foreach (var renderer in _landmineRenderers)
+                if (renderer && renderer.bounds.SqrDistance(position) < .25f && !visual.MineMeshes.Contains(renderer))
                     visual.MineMeshes.Add(renderer);
-            }
         }
 
         private void ApplyHeldItemPlacement()
@@ -1432,8 +1437,10 @@ namespace LCReplay.Plugin.Playback
             _completeRendererLists.Clear();
             _currentRendererPoses.Clear();
             _currentSceneRendererPoses.Clear();
+            _frameEntities.Clear();
             foreach (var entity in _frame.Entities)
             {
+                _frameEntities[entity.Id] = entity;
                 if (!_sparseRendererPoses && (_hasRendererPoseCapability || entity.Renderers.Count != 0) &&
                     !entity.State.ContainsKey("$omittedRenderers"))
                     _completeRendererLists.Add(entity.Id);
@@ -1460,10 +1467,7 @@ namespace LCReplay.Plugin.Playback
                         // Keep attached eyes/jaws on the same evaluated hierarchy.
                         // New captures already apply procedural local bone poses
                         // to this hierarchy after the Animator has evaluated.
-                        if (obj.transform.parent != nativePart) obj.transform.SetParent(nativePart, false);
-                        obj.transform.localPosition = Vector3.zero;
-                        obj.transform.localRotation = Quaternion.identity;
-                        obj.transform.localScale = Vector3.one;
+                        AttachNativeRigidPart(obj.transform, nativePart);
                     }
                     else if (_nativeRigidParts.ContainsKey(pair.Key) && actor != null)
                     {
@@ -1479,10 +1483,7 @@ namespace LCReplay.Plugin.Playback
                 {
                     if (_nativeRigidParts.TryGetValue(pair.Key, out var animatedPart) && animatedPart)
                     {
-                        if (obj.transform.parent != animatedPart) obj.transform.SetParent(animatedPart, false);
-                        obj.transform.localPosition = Vector3.zero;
-                        obj.transform.localRotation = Quaternion.identity;
-                        obj.transform.localScale = Vector3.one;
+                        AttachNativeRigidPart(obj.transform, animatedPart);
                     }
                     else if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
                     // Older files use complete lists: a missing ID marks a
@@ -1494,33 +1495,32 @@ namespace LCReplay.Plugin.Playback
                     // damage state until an explicit renderer pose is available.
                     if (actor?.Kind == "vehicle" && (baseline.Name == "MainBody" || baseline.Name == "MainBodyDestroyed"))
                     {
-                        var vehicle = _frame.Entities.FirstOrDefault(value => value.Id == baseline.EntityId);
+                        _frameEntities.TryGetValue(baseline.EntityId, out var vehicle);
                         if (vehicle?.Name.StartsWith("CompanyCruiser", StringComparison.Ordinal) == true &&
                             vehicle.State.TryGetValue("carDestroyed", out var destroyed) && bool.TryParse(destroyed, out var wrecked))
                             active = baseline.Name == "MainBodyDestroyed" ? wrecked : !wrecked;
                     }
                     SetActiveIfChanged(obj, preferredLod && active);
                 }
-                if (obj.activeSelf) actor?.NativeRig?.EnsureVisibleBranch(obj.transform);
-            }
-            foreach (var player in _players)
-            {
-                if (IsDead(player)) continue;
-                foreach (var pair in _dynamicGeometry)
-                    if (pair.Value.EntityId == player.Id && pair.Value.Name.StartsWith("LOD", StringComparison.Ordinal) &&
-                        (_entities[player.Id].NativeRig?.IsPreferredLod(pair.Key) ?? true) &&
-                        _geometryObjects.TryGetValue(pair.Key, out var body) && body)
-                    {
-                        SetActiveIfChanged(body, true);
-                        if (body.GetComponent<Renderer>() is Renderer skin) skin.enabled = true;
-                    }
+                // Player LOD restoration belongs to this same renderer pass;
+                // scanning the whole geometry table once per player repeats it.
+                if (actor?.Kind == "player" && preferredLod && baseline.Name.StartsWith("LOD", StringComparison.Ordinal) &&
+                    _frameEntities.TryGetValue(baseline.EntityId, out var player) && player.Active && !IsDead(player))
+                {
+                    SetActiveIfChanged(obj, true);
+                    if (_geometryRenderers.TryGetValue(pair.Key, out var skin) && skin && !skin.enabled) skin.enabled = true;
+                }
+                // An active hierarchy already proves every ancestor is active.
+                // Only traverse the native rig when an animation hid a branch.
+                if (obj.activeSelf && !obj.activeInHierarchy) actor?.NativeRig?.EnsureVisibleBranch(obj.transform);
             }
             foreach (var pair in _movingSceneGeometry)
             {
                 if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || !obj) continue;
                 if (_doorMeshLinks.TryGetValue(pair.Key, out var link))
                 {
-                    var door = _frame.Entities.FirstOrDefault(entity => entity.Id == link.EntityId && entity.Kind == "door");
+                    _frameEntities.TryGetValue(link.EntityId, out var door);
+                    if (door?.Kind != "door") door = null;
                     if (door == null) _firstDoorPoses.TryGetValue(link.EntityId, out door);
                     if (door != null)
                     {
@@ -1550,14 +1550,25 @@ namespace LCReplay.Plugin.Playback
             return result;
         }
 
+        private static void AttachNativeRigidPart(Transform displayed, Transform parent)
+        {
+            // This renderer clone has no Animator or procedural script of its
+            // own. Its identity offset only needs restoring when reparented;
+            // the parent continues evaluating the native animation every frame.
+            if (displayed.parent == parent) return;
+            displayed.SetParent(parent, false);
+            displayed.localPosition = Vector3.zero;
+            displayed.localRotation = Quaternion.identity;
+            displayed.localScale = Vector3.one;
+        }
+
         private void ConfigureProxy(EntityVisual visual, EntitySnapshot entity)
         {
             var kind = entity.Kind;
             if (entity.Name == "Landmine" && visual.GeometryCount == 0 &&
                 !entity.State.ContainsKey("hasExploded") && !visual.NativeHazard)
             {
-                var source = Resources.FindObjectsOfTypeAll<MeshFilter>().FirstOrDefault(filter =>
-                    filter && filter.name == "Landmine" && filter.sharedMesh && filter.GetComponent<Renderer>()?.sharedMaterial);
+                var source = NativeLandmineTemplate();
                 if (source)
                 {
                     var native = NewObject("Native landmine", visual.Root.transform);
@@ -1567,11 +1578,11 @@ namespace LCReplay.Plugin.Playback
             }
             if (visual.GeometryCount != 0 && visual.NativeHazard)
             { visual.NativeHazard!.SetActive(false); Object.Destroy(visual.NativeHazard); visual.NativeHazard = null; }
-            visual.Proxy.SetActive(visual.GeometryCount == 0 &&
+            SetActiveIfChanged(visual.Proxy, visual.GeometryCount == 0 &&
                 (kind == "hazard" && !visual.NativeHazard && !HasNearbyHazardModel(entity) || _showSkeletons && IsVisualKind(kind)));
-            if (kind == "player") visual.Root.name = "Recorded player body (render only)";
             if (visual.Kind == kind) return;
             visual.Kind = kind;
+            if (kind == "player") visual.Root.name = "Recorded player body (render only)";
             visual.Proxy.GetComponent<MeshRenderer>().sharedMaterial = GetMaterial(EntityColor(kind));
             switch (kind.ToLowerInvariant())
             {
@@ -1606,18 +1617,56 @@ namespace LCReplay.Plugin.Playback
             if (modelName.Length == 0) return false;
             if (_hazardsWithModel.Contains(entity.Id)) return true;
             var position = ToVector(entity.Position);
-            foreach (var obj in _geometryObjects.Values)
-            {
-                if (!obj || obj.name != modelName) continue;
-                var renderer = obj.GetComponent<Renderer>();
-                if (renderer && (renderer.bounds.center - position).sqrMagnitude < (entity.Name == "Landmine" ? .25f : 4f))
-                { _hazardsWithModel.Add(entity.Id); return true; }
-            }
+            if (_hazardModelRenderers.TryGetValue(modelName, out var candidates))
+                foreach (var renderer in candidates)
+                    if (renderer && (renderer.bounds.center - position).sqrMagnitude < (entity.Name == "Landmine" ? .25f : 4f))
+                    { _hazardsWithModel.Add(entity.Id); return true; }
             if (entity.Name == "Landmine")
                 foreach (var visual in _entities.Values)
                     if (visual.NativeHazard && (visual.NativeHazard!.transform.position - position).sqrMagnitude < .25f)
                     { _hazardsWithModel.Add(entity.Id); return true; }
             return false;
+        }
+
+        private MeshFilter? NativeLandmineTemplate()
+        {
+            if (_landmineTemplate && _landmineTemplate!.sharedMesh &&
+                _landmineTemplate.GetComponent<Renderer>()?.sharedMaterial) return _landmineTemplate;
+            // Missing optional assets must not scan every loaded mesh once per
+            // mine per frame. Retry late mod arrivals, and invalidate the miss
+            // immediately when the replay's asynchronous moon load completes.
+            var now = UnityEngine.Time.realtimeSinceStartup;
+            if (now < _landmineTemplateRetryAt) return null;
+            _landmineTemplateRetryAt = now + .25f;
+            return _landmineTemplate = Resources.FindObjectsOfTypeAll<MeshFilter>().FirstOrDefault(filter =>
+                filter && filter.name == "Landmine" && filter.sharedMesh && filter.GetComponent<Renderer>()?.sharedMaterial);
+        }
+
+        private void IndexHazardRenderer(GeometrySnapshot geometry, GameObject obj, Renderer renderer)
+        {
+            if (geometry.EntityId.Length != 0)
+            {
+                if (!_entityGeometryRenderers.TryGetValue(geometry.EntityId, out var owned))
+                    _entityGeometryRenderers[geometry.EntityId] = owned = new List<Renderer>();
+                owned.Add(renderer);
+            }
+            var name = obj.name;
+            if (name == "World Mount" || name == "World Landmine")
+            {
+                if (!_hazardModelRenderers.TryGetValue(name, out var candidates))
+                    _hazardModelRenderers[name] = candidates = new List<Renderer>();
+                candidates.Add(renderer);
+            }
+            if (name.IndexOf("Landmine", StringComparison.OrdinalIgnoreCase) >= 0) _landmineRenderers.Add(renderer);
+        }
+
+        private void ClearHazardRendererIndex()
+        {
+            _hazardModelRenderers.Clear();
+            _entityGeometryRenderers.Clear();
+            _landmineRenderers.Clear();
+            _landmineTemplate = null;
+            _landmineTemplateRetryAt = float.NegativeInfinity;
         }
 
         // Circuit bees and docile locusts are VFX Graph particles in the live
@@ -1652,8 +1701,17 @@ namespace LCReplay.Plugin.Playback
             if (bones != null)
                 foreach (var bone in bones)
                 {
-                    if (string.IsNullOrEmpty(bone.Path) || bone.Path.Length > 4096 || bone.Path.Count(c => c == '/') > 127) continue;
-                    SetTransform(GetBone(visual, bone.Path), bone.Position, bone.Rotation, bone.Scale);
+                    if (string.IsNullOrEmpty(bone.Path)) continue;
+                    if (!visual.ValidRecordedBonePaths.Contains(bone.Path))
+                    {
+                        if (bone.Path.Length > 4096 || bone.Path.Count(c => c == '/') > 127) continue;
+                        visual.ValidRecordedBonePaths.Add(bone.Path);
+                    }
+                    if (!visual.Bones.TryGetValue(bone.Path, out var node) || !node)
+                    {
+                        node = GetBone(visual, bone.Path);
+                    }
+                    SetTransform(node, bone.Position, bone.Rotation, bone.Scale);
                 }
             if (!_showSkeletons || bones == null || bones.Count == 0)
             {
@@ -1690,6 +1748,8 @@ namespace LCReplay.Plugin.Playback
             foreach (var visual in _entities.Values)
             { visual.NativeTransitions.Clear(); visual.ActiveNativeTransitions.Clear(); }
             _transitionSession.Events = _session.Events;
+            _sampler.PrepareEvents(_session);
+            _transitionSampler.PrepareEvents(_transitionSession);
             _transitionSession.Frames.Clear();
             _transitionLeft.Entities.Clear();
             _transitionRight.Entities.Clear();
@@ -2709,8 +2769,11 @@ namespace LCReplay.Plugin.Playback
         {
             if (_camera == null || _displayImage == null || Screen.width < 1 || Screen.height < 1) return;
             _screenWidth = Screen.width; _screenHeight = Screen.height;
-            var width = Math.Max(64, Mathf.RoundToInt(_screenWidth * _resolutionScale));
-            var height = Math.Max(64, Mathf.RoundToInt(_screenHeight * _resolutionScale));
+            var width = ReplayGraphicsDefaults.ResolutionWidth(_resolutionScale);
+            var height = ReplayGraphicsDefaults.ResolutionHeight(_resolutionScale);
+            // The low-resolution scene is stretched over the native-resolution
+            // UI. Keep its perspective matched to the displayed viewport.
+            _camera.aspect = (float)_screenWidth / _screenHeight;
             if (_displayTexture != null && _displayTexture.width == width && _displayTexture.height == height) return;
             var replacement = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB)
             { name = "LCReplay scene resolution", filterMode = FilterMode.Point, antiAliasing = 1, useMipMap = false, hideFlags = HideFlags.DontSave };
@@ -2723,7 +2786,7 @@ namespace LCReplay.Plugin.Playback
 
         private void SetResolutionScale(float value)
         {
-            _resolutionScale = Mathf.Clamp(value, 0.25f, 1f);
+            _resolutionScale = Mathf.Clamp(value, 0.25f, 4.5f);
             ResizeDisplay();
             _saveResolution?.Invoke(_resolutionScale);
         }
@@ -2847,8 +2910,10 @@ namespace LCReplay.Plugin.Playback
             _worldParticles.Clear();
             _localFogs.Clear();
             _geometryObjects.Clear();
+            _geometryRenderers.Clear();
             _maskEyesObjects.Clear();
             _hazardsWithModel.Clear();
+            ClearHazardRendererIndex();
             _dynamicGeometry.Clear();
             _movingSceneGeometry.Clear();
             _doorMeshLinks.Clear();
@@ -2878,8 +2943,8 @@ namespace LCReplay.Plugin.Playback
                 _environment?.Dispose(); _environment = null;
                 _structureAudio?.Dispose(); _structureAudio = null;
             }
-            var legacyItemLights = world != null ? LegacyItemEmissionLights(world).ToArray() : Array.Empty<LightSnapshot>();
-            _worldHasLighting = world != null && (world.Lights.Count != 0 || legacyItemLights.Length != 0);
+            var legacyItemLights = Array.Empty<LightSnapshot>();
+            _worldHasLighting = world != null && world.Lights.Any(light => !IsSyntheticEmissionLight(light.Id));
             foreach (var visual in _entities.Values)
             {
                 if (append) continue;
@@ -2904,6 +2969,12 @@ namespace LCReplay.Plugin.Playback
             if (world.Geometry.Any(geometry => geometry.PrefabKey == "player" ||
                 _entities.TryGetValue(geometry.EntityId, out var actor) && actor.Kind == "player"))
                 foreach (var step in NativePlayerAssetLoader.Prepare()) yield return .04f + .03f * step;
+            // A fresh menu did not have the player prefab when the viewer camera
+            // was constructed. Refresh after its isolated asset load completes.
+            if (_spectatorLight) ConfigureNightVision(_spectatorLight!);
+            var cameraDataType = GameAccess.Type("UnityEngine.Rendering.HighDefinition.HDAdditionalCameraData");
+            var cameraData = cameraDataType == null ? null : _camera!.GetComponent(cameraDataType);
+            if (cameraData) { CopyNativeCameraSettings(cameraData!); EnableAtmosphericRendering(cameraData!); }
             _environment = new ReplayEnvironment(world, _root!.transform, ReplayLayer,
                 _session.Header.Capabilities.Contains("world-postfx-without-player-filters"));
             _environment.SetFogEnabled(_fogEnabled);
@@ -2913,6 +2984,7 @@ namespace LCReplay.Plugin.Playback
             // Indexing resources before its asynchronous load completes would cache
             // false misses and recreate effects with fallback shaders for this world.
             while (_assetScene?.IsLoading == true) yield return .08f;
+            _landmineTemplateRetryAt = float.NegativeInfinity;
             _environment.SetGamma(_gamma);
             // Indexed windows share immutable file payloads. Native asset
             // repairs belong to this displayed world only, never that cache.
@@ -3116,6 +3188,8 @@ namespace LCReplay.Plugin.Playback
                 }
                 if (obj.GetComponent<Renderer>() is Renderer recordedRenderer)
                 {
+                    _geometryRenderers[geometry.Id] = recordedRenderer;
+                    IndexHazardRenderer(geometry, obj, recordedRenderer);
                     owner?.NativeRig?.BindRenderer(geometry);
                     if (owner == null && firstSeen.TryGetValue(geometry.Id, out var availableAt))
                     {
@@ -3170,11 +3244,10 @@ namespace LCReplay.Plugin.Playback
                     foreach (var animator in visual.Animators.Values.Distinct())
                         if (animator) animator.Rebind();
             }
-            var exteriorShadows = 0;
-            var interiorShadows = 0;
             foreach (var snapshot in world.Lights.Concat(legacyItemLights))
             {
                 if (append && _worldLights.Any(pair => pair.Value.Id == snapshot.Id)) continue;
+                if (IsSyntheticEmissionLight(snapshot.Id)) continue;
                 if (snapshot.Name == "NightVision" || snapshot.Name == "NightVisionRadar") continue;
                 var parent = snapshot.EntityId.Length != 0 ? GetEntity(snapshot.EntityId).Root.transform :
                     snapshot.AnchorId.Length != 0 && _anchorRoots.TryGetValue(snapshot.AnchorId, out var anchor) ? anchor : _root!.transform;
@@ -3182,21 +3255,23 @@ namespace LCReplay.Plugin.Playback
                 _worldObjects.Add(obj);
                 SetTransform(obj.transform, snapshot.Position, snapshot.Rotation, Vec3.One);
                 var light = obj.AddComponent<Light>();
-                light.type = snapshot.Type == "Directional" ? LightType.Directional : snapshot.Type == "Spot" ? LightType.Spot : LightType.Point;
+                light.type = snapshot.Type == "Directional" ? LightType.Directional : snapshot.Type == "Spot" ? LightType.Spot :
+                    snapshot.Type == "Rectangle" ? LightType.Rectangle : snapshot.Type == "Disc" ? LightType.Disc : LightType.Point;
                 light.color = new Color(snapshot.Color[0], snapshot.Color[1], snapshot.Color[2], snapshot.Color[3]);
                 light.useColorTemperature = snapshot.UseColorTemperature;
                 if (snapshot.UseColorTemperature) light.colorTemperature = snapshot.ColorTemperature;
                 light.range = snapshot.Range;
                 light.spotAngle = snapshot.SpotAngle;
-                var shadowCount = snapshot.IsInterior ? interiorShadows : exteriorShadows;
                 // A baked/mixed fixture may have Light.shadows set in the source,
                 // but replaying it as a realtime point shadow creates new hard
                 // occlusion. Legacy files lack bake metadata; avoid point shadows.
                 var realtimeShadow = snapshot.BakeType == "Realtime";
-                var castShadow = snapshot.Shadows && realtimeShadow && shadowCount < (snapshot.IsInterior ? 4 : 2);
+                // Preserve every authored realtime shadow. Assigning a budget
+                // to the first four exported fixtures left later rooms lit
+                // through walls regardless of the camera's current location.
+                var castShadow = snapshot.Shadows && realtimeShadow;
                 light.shadows = castShadow ? LightShadows.Soft : LightShadows.None;
                 light.shadowStrength = Mathf.Clamp01(snapshot.ShadowStrength);
-                if (castShadow) { if (snapshot.IsInterior) interiorShadows++; else exteriorShadows++; }
                 light.shadowResolution = LightShadowResolution.Medium;
                 light.cullingMask = 1 << ReplayLayer;
                 AddRenderPipelineLightData(obj, snapshot.Intensity);
@@ -3207,7 +3282,13 @@ namespace LCReplay.Plugin.Playback
                     SetOptionalMember(hdLight!, "lightDimmer", snapshot.LightDimmer);
                     SetOptionalMember(hdLight!, "shadowDimmer", snapshot.ShadowDimmer);
                 }
-                light.intensity = snapshot.Intensity;
+                var pipeline = snapshot.LightPipelineParameters;
+                if (pipeline.Count == 0)
+                {
+                    var source = ResolveLightTemplate(snapshot, light.transform);
+                    if (source && hdLightType != null) pipeline = ReplayLightProperties.Capture(source!.GetComponent(hdLightType));
+                }
+                ReplayLightProperties.Apply(hdLight, pipeline, light, snapshot.Intensity);
                 _nativeShadowModes[light] = light.shadows;
                 _worldLights.Add(new KeyValuePair<Light, LightSnapshot>(light, snapshot));
                 if (snapshot.EntityId.Length == 0 && firstSeen.TryGetValue("light:" + snapshot.Id, out var lightAt))
@@ -3306,6 +3387,30 @@ namespace LCReplay.Plugin.Playback
             yield return 1f;
         }
 
+        private static bool IsSyntheticEmissionLight(string id) => id.StartsWith("item-emission:", StringComparison.Ordinal) ||
+            id.StartsWith("emissive:", StringComparison.Ordinal) || id.StartsWith("legacy-item-emission:", StringComparison.Ordinal);
+
+        private Light? ResolveLightTemplate(LightSnapshot snapshot, Transform displayed)
+        {
+            if (snapshot.EntityId.Length == 0)
+                return _assetScene?.ResolveLightTemplate(snapshot, displayed.position, displayed.rotation);
+            var key = _dynamicGeometry.Values.FirstOrDefault(geometry => geometry.EntityId == snapshot.EntityId && geometry.PrefabKey.Length != 0)?.PrefabKey;
+            var prefab = key == null ? null : PrefabAssetRegistry.ResolvePrefab(key);
+            if (!prefab) return null;
+            Light? match = null;
+            foreach (var source in prefab!.GetComponentsInChildren<Light>(true))
+            {
+                if (!source) continue;
+                var typeName = source.type == LightType.Rectangle ? "Rectangle" : source.type == LightType.Disc ? "Disc" : source.type.ToString();
+                if (source.name != snapshot.Name || typeName != snapshot.Type ||
+                    (prefab.transform.InverseTransformPoint(source.transform.position) - ToVector(snapshot.Position)).sqrMagnitude > .0001f ||
+                    Quaternion.Angle(Quaternion.Inverse(prefab.transform.rotation) * source.transform.rotation, ToQuaternion(snapshot.Rotation)) > .1f) continue;
+                if (match) return null;
+                match = source;
+            }
+            return match;
+        }
+
         private IEnumerable<LightSnapshot> LegacyItemEmissionLights(WorldSnapshot world)
         {
             var items = _frame.Entities.Where(entity => entity.Kind == "item" && !NativeMaskState.IsMask(entity))
@@ -3398,7 +3503,9 @@ namespace LCReplay.Plugin.Playback
                 if (members.Count == 0) continue;
                 var reference = members[0].Value;
                 var ground = members.Any(member => RenderVisibilityPolicy.IsGroundSurface(member.Value.Name));
-                var switchDistance = Mathf.Clamp(Mathf.Max(100f, reference.LodSwitchDistance * 3f), 100f, 300f);
+                // Use the captured native LOD distance without the old 3x
+                // replay extension. Ground keeps its complete surface mesh.
+                var switchDistance = reference.LodSwitchDistance > 0 ? reference.LodSwitchDistance : 100f;
                 var near = ground || (ToVector(reference.LodCenter) - position).sqrMagnitude <=
                     switchDistance * switchDistance;
                 var desiredLevel = near ? 0 : 1;
@@ -3446,7 +3553,9 @@ namespace LCReplay.Plugin.Playback
             foreach (var renderer in _fogGeometry)
                 if (renderer && !fogVisible) renderer.forceRenderingOff = true;
             if (_spectatorLight) _spectatorLight!.enabled = _worldHasLighting && indoor && !_noShadow;
-            if (_exteriorFill) _exteriorFill!.enabled = _worldHasLighting && (_noShadow || !indoor);
+            // A camera-facing directional fill changes the same material when
+            // looking around. It belongs only to the explicit visibility assist.
+            if (_exteriorFill) _exteriorFill!.enabled = _worldHasLighting && _noShadow;
             // A recorded ship fog-exclusion volume softens the outdoor fog in the
             // cabin. Keep global fog active only while that volume covers the camera;
             // without it, exterior height fog would wash the cabin out.
@@ -4501,16 +4610,15 @@ namespace LCReplay.Plugin.Playback
             foreach (var entry in _dynamicGeometry)
             {
                 if (!_entities.TryGetValue(entry.Value.EntityId, out var owner) || owner.Kind != "player" ||
-                    !_geometryObjects.TryGetValue(entry.Key, out var obj) || !obj) continue;
-                var renderer = obj.GetComponent<Renderer>();
-                if (renderer) renderer.forceRenderingOff = _bakedPlayers.ContainsKey(entry.Key) ||
-                    hideSelected && entry.Value.EntityId == _selectedId;
+                    !_geometryRenderers.TryGetValue(entry.Key, out var renderer) || !renderer) continue;
+                var hidden = _bakedPlayers.ContainsKey(entry.Key) || hideSelected && entry.Value.EntityId == _selectedId;
+                if (renderer.forceRenderingOff != hidden) renderer.forceRenderingOff = hidden;
             }
             foreach (var body in _bakedPlayers.Values)
             {
                 var hidden = hideSelected && body.EntityId == _selectedId;
-                if (body.Renderer) body.Renderer.forceRenderingOff = hidden;
-                if (body.Outline) body.Outline.forceRenderingOff = hidden;
+                if (body.Renderer && body.Renderer.forceRenderingOff != hidden) body.Renderer.forceRenderingOff = hidden;
+                if (body.Outline && body.Outline.forceRenderingOff != hidden) body.Outline.forceRenderingOff = hidden;
             }
         }
 
@@ -4720,8 +4828,9 @@ namespace LCReplay.Plugin.Playback
                 var type = assembly.GetType("UnityEngine.Rendering.HighDefinition.HDAdditionalCameraData", false);
                 if (type == null || !typeof(Component).IsAssignableFrom(type)) continue;
                 var data = camera.AddComponent(type);
+                CopyNativeCameraSettings(data);
                 SetOptionalMember(data, "volumeLayerMask", (LayerMask)(1 << ReplayLayer));
-                SetOptionalMember(data, "probeLayerMask", (LayerMask)0);
+                SetOptionalMember(data, "probeLayerMask", (LayerMask)(1 << ReplayLayer));
                 SetOptionalMember(data, "backgroundColorHDR", new Color(0.025f, 0.035f, 0.05f));
                 SetOptionalEnum(data, "clearColorMode", "Sky");
                 EnableAtmosphericRendering(data);
@@ -4750,11 +4859,7 @@ namespace LCReplay.Plugin.Playback
                 var bits = bitsField?.GetValue(mask);
                 var indexer = bits?.GetType().GetProperty("Item", new[] { typeof(uint) });
                 if (fieldType == null || setEnabled == null || bitsField == null || bits == null || indexer == null) return;
-                foreach (var name in new[] { "AtmosphericScattering", "Volumetrics", "ReprojectionForVolumetrics",
-                    "CustomPass", "Postprocess", "CustomPostProcess", "MotionVectors", "ObjectMotionVectors",
-                    "ContactShadows", "SSAO", "SSR", "VolumetricClouds", "ExposureControl", "DepthOfField",
-                    "MotionBlur", "Bloom", "LensDistortion", "ChromaticAberration", "Vignette",
-                    "ColorGrading", "FilmGrain", "Tonemapping" })
+                foreach (var name in new[] { "AtmosphericScattering", "Volumetrics", "CustomPass", "Postprocess", "ShadowMaps" })
                 {
                     if (!Enum.IsDefined(fieldType, name)) continue;
                     var field = Enum.Parse(fieldType, name);
@@ -4769,11 +4874,33 @@ namespace LCReplay.Plugin.Playback
             catch { /* Different HDRP versions retain their camera defaults. */ }
         }
 
+        private static void CopyNativeCameraSettings(Component data)
+        {
+            var prefab = PrefabAssetRegistry.ResolvePrefab("player");
+            var camera = GameAccess.Read(prefab, "gameplayCamera") as Camera;
+            var source = camera ? camera!.GetComponent(data.GetType()) : null;
+            if (source)
+            {
+                // Value-type frame settings and mask: never alter the original
+                // camera or the game's shared render-pipeline quality asset.
+                var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                foreach (var name in new[] { "m_RenderingPathCustomFrameSettings", "renderingPathCustomFrameSettingsOverrideMask" })
+                {
+                    var field = data.GetType().GetField(name, flags);
+                    if (field != null) field.SetValue(data, field.GetValue(source));
+                }
+            }
+            SetOptionalEnum(data, "antialiasing", "None");
+        }
+
         private static void ConfigureNightVision(Light target)
         {
             var type = GameAccess.Type("GameNetcodeStuff.PlayerControllerB");
-            var source = type == null ? null : Resources.FindObjectsOfTypeAll(type).OfType<Component>()
-                .Select(player => GameAccess.Read(player, "nightVision") as Light).FirstOrDefault(light => light);
+            var player = PrefabAssetRegistry.ResolvePrefab("player");
+            var source = player ? GameAccess.Read(player, "nightVision") as Light : null;
+            if (!source && type != null) source = Resources.FindObjectsOfTypeAll(type).OfType<Component>()
+                .Where(candidate => candidate && !ReplayIsolation.IsReplayScene(candidate.gameObject.scene))
+                .Select(candidate => GameAccess.Read(candidate, "nightVision") as Light).FirstOrDefault(light => light);
             var hdType = GameAccess.Type("UnityEngine.Rendering.HighDefinition.HDAdditionalLightData");
             var data = hdType == null ? null : target.GetComponent(hdType);
             var native = source && hdType != null ? source!.GetComponent(hdType) : null;
@@ -5082,7 +5209,10 @@ namespace LCReplay.Plugin.Playback
                 _fogGeometry.Clear();
                 _worldObjects.Clear();
                 _geometryObjects.Clear();
+                _geometryRenderers.Clear();
+                _frameEntities.Clear();
                 _hazardsWithModel.Clear();
+                ClearHazardRendererIndex();
                 _dynamicGeometry.Clear();
                 _movingSceneGeometry.Clear();
                 _completeRendererLists.Clear();
@@ -5117,6 +5247,7 @@ namespace LCReplay.Plugin.Playback
             internal readonly List<NativeTransitionPose> NativeTransitions = new List<NativeTransitionPose>();
             internal readonly List<NativeTransitionPose> ActiveNativeTransitions = new List<NativeTransitionPose>();
             internal readonly Dictionary<string, Transform> Bones = new Dictionary<string, Transform>();
+            internal readonly HashSet<string> ValidRecordedBonePaths = new HashSet<string>(StringComparer.Ordinal);
             internal readonly Dictionary<string, BonePose> RestBones = new Dictionary<string, BonePose>(StringComparer.Ordinal);
             internal string Kind = "";
             internal int GeometryCount;

@@ -35,6 +35,9 @@ namespace LCReplay.Plugin.Playback
         private int liveSourceHandle;
         private readonly List<Animator> suns = new List<Animator>();
         private readonly List<Light> sunLights = new List<Light>();
+        private readonly List<Light> lightTemplates = new List<Light>();
+        private readonly List<GameObject> reflectionCopies = new List<GameObject>();
+        private readonly HashSet<int> copiedReflectionIds = new HashSet<int>();
         private readonly Dictionary<Light, Light> sunTargets = new Dictionary<Light, Light>();
         private int sunTargetSignature;
         private float lastSunTime = -1f;
@@ -159,9 +162,14 @@ namespace LCReplay.Plugin.Playback
                 ClearLiveCopies();
                 liveSourceHandle = source.handle;
             }
+            var indexLights = lightTemplates.Count == 0;
             foreach (var root in source.GetRootGameObjects())
+            {
+                if (indexLights) lightTemplates.AddRange(root.GetComponentsInChildren<Light>(true));
+                CopyReflectionProbes(root, parent, parent.gameObject.scene);
                 foreach (var terrain in root.GetComponentsInChildren<Terrain>(true))
                     MatchLegacyTerrain(terrain, SceneAssetPaths.For(terrain));
+            }
             if (rendererPaths.IsSubsetOf(clonedRendererPaths) && terrainPaths.IsSubsetOf(clonedTerrainPaths)) return;
             var missingRenderers = rendererPaths.Count(path => !clonedRendererPaths.Contains(path));
             var missingTerrains = terrainPaths.Count(path => !clonedTerrainPaths.Contains(path));
@@ -220,6 +228,7 @@ namespace LCReplay.Plugin.Playback
 
         private void ClearLiveCopies()
         {
+            ClearLightingCopies();
             foreach (var copy in liveCopies) if (copy) UnityEngine.Object.Destroy(copy);
             liveCopies.Clear();
             clonedRendererPaths.Clear();
@@ -238,6 +247,9 @@ namespace LCReplay.Plugin.Playback
             var current = !disposed && loaded.name == sceneName;
             foreach (var root in loaded.GetRootGameObjects())
             {
+                // Capture author-enabled probe assets before the inert-scene
+                // pass disables their HDRP behaviour. Copies never render cubes.
+                if (current) CopyReflectionProbes(root, null, loaded);
                 // Isolate the hierarchy in one traversal instead of seven recursive
                 // component searches. No work is yielded before scripts are disabled.
                 foreach (var component in root.GetComponentsInChildren<Component>(true))
@@ -248,7 +260,11 @@ namespace LCReplay.Plugin.Playback
                         case MonoBehaviour behaviour: behaviour.enabled = false; break;
                         case Collider collider: collider.enabled = false; break;
                         case Camera camera: camera.enabled = false; break;
-                        case Light light: light.enabled = false; break;
+                        case Light light:
+                            if (current) lightTemplates.Add(light);
+                            light.enabled = false;
+                            break;
+                        case ReflectionProbe reflection: reflection.enabled = false; break;
                         case AudioSource audio: audio.enabled = false; break;
                         case Animator animator:
                             if (current && animator.runtimeAnimatorController && animator.parameters.Any(parameter =>
@@ -289,7 +305,42 @@ namespace LCReplay.Plugin.Playback
         }
 
         private void ClearSun()
-        { suns.Clear(); sunLights.Clear(); sunTargets.Clear(); sunTargetSignature = 0; lastSunTime = -1f; }
+        { suns.Clear(); sunLights.Clear(); sunTargets.Clear(); sunTargetSignature = 0; lastSunTime = -1f; ClearLightingCopies(); }
+
+        internal Light? ResolveLightTemplate(LightSnapshot snapshot, Vector3 position, Quaternion rotation)
+        {
+            Light? match = null;
+            foreach (var light in lightTemplates)
+            {
+                if (!light || light.name != snapshot.Name) continue;
+                var typeName = light.type == LightType.Rectangle ? "Rectangle" : light.type == LightType.Disc ? "Disc" : light.type.ToString();
+                if (typeName != snapshot.Type) continue;
+                if (light.type != LightType.Directional &&
+                    ((light.transform.position - position).sqrMagnitude > .0001f || Quaternion.Angle(light.transform.rotation, rotation) > .1f)) continue;
+                if (match) return null;
+                match = light;
+            }
+            return match;
+        }
+
+        private void CopyReflectionProbes(GameObject root, Transform? parent, Scene destination)
+        {
+            foreach (var source in root.GetComponentsInChildren<ReflectionProbe>(true))
+            {
+                if (!source || copiedReflectionIds.Contains(source.GetInstanceID())) continue;
+                var copy = ReplayReflectionProbe.Copy(source, parent, destination, replayLayer);
+                if (!copy) continue;
+                copiedReflectionIds.Add(source.GetInstanceID());
+                reflectionCopies.Add(copy!);
+            }
+        }
+
+        private void ClearLightingCopies()
+        {
+            lightTemplates.Clear(); copiedReflectionIds.Clear();
+            foreach (var copy in reflectionCopies) if (copy) { copy.SetActive(false); UnityEngine.Object.Destroy(copy); }
+            reflectionCopies.Clear();
+        }
 
         private void MatchLegacyTerrain(Terrain terrain, string path)
         {
@@ -375,6 +426,8 @@ namespace LCReplay.Plugin.Playback
 
         private void ApplyVisibility()
         {
+            foreach (var copy in reflectionCopies)
+                if (copy && copy.activeSelf != (!suspended && !indoor)) copy.SetActive(!suspended && !indoor);
             foreach (var entry in renderers)
                 if (entry.Key)
                 {

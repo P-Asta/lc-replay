@@ -39,9 +39,10 @@ namespace LCReplay.Core
             var result = reusePoses ? scratch!.BeginFrame() : new ReplayFrame();
             result.Time = time;
             result.State = scratch == null ? Copy(left.State) : left.State;
+            var eventIndex = scratch?.EventsFor(session);
             ReplayFrame? right = leftIndex + 1 < frames.Count && time > left.Time ? frames[leftIndex + 1] : null;
             double amount = right == null ? 0 : Math.Max(0, Math.Min(1, (time - left.Time) / (right.Time - left.Time)));
-            var sampleGap = right != null && right.Time - left.Time > .25 && HasSampleGap(session, left.Time, right.Time);
+            var sampleGap = right != null && right.Time - left.Time > .25 && HasSampleGap(session, eventIndex, left.Time, right.Time);
             SampleParticles(left, right, result, amount, Math.Max(0, time - left.Time), scratch);
             var rightLines = scratch?.RightLines ?? new Dictionary<string, LinePose>(StringComparer.Ordinal);
             rightLines.Clear();
@@ -108,8 +109,8 @@ namespace LCReplay.Core
                         string.Equals(oldDead, "True", StringComparison.OrdinalIgnoreCase);
                     var isDead = other.State.TryGetValue("isPlayerDead", out var newDead) &&
                         string.Equals(newDead, "True", StringComparison.OrdinalIgnoreCase);
-                    if (sampleGap && !CanBridgePlayerGap(session, entity, other, left.Time, right.Time) || wasDead != isDead ||
-                        HasPlayerTeleport(session, entity, other, left.Time, right.Time) ||
+                    if (sampleGap && !CanBridgePlayerGap(session, eventIndex, entity, other, left.Time, right.Time) || wasDead != isDead ||
+                        HasPlayerTeleport(session, eventIndex, entity, other, left.Time, right.Time) ||
                         dx * dx + dz * dz > horizontalReach * horizontalReach ||
                         Math.Abs(dy) > verticalReach)
                         other = null;
@@ -163,7 +164,8 @@ namespace LCReplay.Core
             return result;
         }
 
-        private static bool CanBridgePlayerGap(ReplaySession session, EntitySnapshot before, EntitySnapshot after, double start, double end)
+        private static bool CanBridgePlayerGap(ReplaySession session, ReplayTimelineEventIndex? eventIndex,
+            EntitySnapshot before, EntitySnapshot after, double start, double end)
         {
             // Older recordings can miss several seconds while exporting the
             // world. Holding a living player until the next sample invents a
@@ -181,16 +183,21 @@ namespace LCReplay.Core
                 after.State.TryGetValue(field, out var b);
                 if (!string.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return false;
             }
+            if (eventIndex != null) return !eventIndex.HasTeleport(start, end);
             foreach (var evt in session.Events)
                 if (evt.Time > start && evt.Time <= end && evt.Category == "call" &&
                     evt.Name.IndexOf("TeleportPlayer", StringComparison.OrdinalIgnoreCase) >= 0) return false;
             return true;
         }
 
-        private static bool HasPlayerTeleport(ReplaySession session, EntitySnapshot before, EntitySnapshot after, double start, double end)
+        private static bool HasPlayerTeleport(ReplaySession session, ReplayTimelineEventIndex? eventIndex,
+            EntitySnapshot before, EntitySnapshot after, double start, double end)
         {
-            foreach (var evt in session.Events)
+            IReadOnlyList<ReplayEvent> events = eventIndex != null ? eventIndex.Teleports : session.Events;
+            for (var index = eventIndex?.FirstTeleportAfter(start) ?? 0; index < events.Count; index++)
             {
+                var evt = events[index];
+                if (eventIndex != null && evt.Time > end) break;
                 if (evt.Time <= start || evt.Time > end || evt.Category != "call" ||
                     evt.Name.IndexOf("TeleportPlayer", StringComparison.OrdinalIgnoreCase) < 0) continue;
                 if (evt.EntityId.Length != 0)
@@ -212,8 +219,9 @@ namespace LCReplay.Core
             return false;
         }
 
-        private static bool HasSampleGap(ReplaySession session, double start, double end)
+        private static bool HasSampleGap(ReplaySession session, ReplayTimelineEventIndex? eventIndex, double start, double end)
         {
+            if (eventIndex != null) return eventIndex.HasSampleGap(start, end);
             foreach (var evt in session.Events)
                 if (evt.Category == "capture" && evt.Name == "sample-gap" && evt.Time > start && evt.Time <= end + .0001)
                     return true;
@@ -408,6 +416,52 @@ namespace LCReplay.Core
         }
     }
 
+    // Prepared only for playback windows whose event records remain read-only.
+    // Sparse time indexes avoid scanning sound/animation events for every player
+    // on every displayed frame. General-purpose sampling retains the live scan.
+    internal sealed class ReplayTimelineEventIndex
+    {
+        private readonly List<ReplayEvent> source;
+        private readonly int sourceCount;
+        internal readonly List<ReplayEvent> Teleports = new List<ReplayEvent>();
+        private readonly List<ReplayEvent> sampleGaps = new List<ReplayEvent>();
+
+        internal ReplayTimelineEventIndex(List<ReplayEvent> events)
+        {
+            source = events; sourceCount = events.Count;
+            foreach (var evt in events)
+                if (evt.Category == "call" && evt.Name.IndexOf("TeleportPlayer", StringComparison.OrdinalIgnoreCase) >= 0)
+                    Teleports.Add(evt);
+                else if (evt.Category == "capture" && evt.Name == "sample-gap") sampleGaps.Add(evt);
+            Teleports.Sort((a, b) => a.Time.CompareTo(b.Time));
+            sampleGaps.Sort((a, b) => a.Time.CompareTo(b.Time));
+        }
+
+        internal bool Matches(List<ReplayEvent> events) => ReferenceEquals(events, source) && events.Count == sourceCount;
+        internal int FirstTeleportAfter(double time) => FirstAfter(Teleports, time);
+        internal bool HasTeleport(double start, double end)
+        {
+            var index = FirstTeleportAfter(start);
+            return index < Teleports.Count && Teleports[index].Time <= end;
+        }
+        internal bool HasSampleGap(double start, double end)
+        {
+            var index = FirstAfter(sampleGaps, start);
+            return index < sampleGaps.Count && sampleGaps[index].Time <= end + .0001;
+        }
+        private static int FirstAfter(List<ReplayEvent> events, double time)
+        {
+            int low = 0, high = events.Count;
+            while (low < high)
+            {
+                var middle = low + (high - low) / 2;
+                if (events[middle].Time <= time) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        }
+    }
+
     /// <summary>
     /// Reuses interpolation lookup tables and particle/style objects during playback.
     /// Consume sampled effects before calling Sample again. State dictionaries and
@@ -415,6 +469,23 @@ namespace LCReplay.Core
     /// </summary>
     public sealed class ReplayTimelineSampler
     {
+        private ReplayTimelineEventIndex? eventIndex;
+
+        /// <summary>
+        /// Indexes a read-only playback window's teleport and capture-gap events.
+        /// The event list and event records must remain unchanged until the next
+        /// call. Call again after editing an event or changing playback windows.
+        /// Without this opt-in, sampling continues to read mutable events directly.
+        /// </summary>
+        public void PrepareEvents(ReplaySession session)
+        {
+            if (session == null) throw new ArgumentNullException(nameof(session));
+            eventIndex = new ReplayTimelineEventIndex(session.Events);
+        }
+
+        internal ReplayTimelineEventIndex? EventsFor(ReplaySession session) =>
+            eventIndex != null && eventIndex.Matches(session.Events) ? eventIndex : null;
+
         internal readonly ReplayBlendShapes.Cache BlendShapes = new ReplayBlendShapes.Cache();
         internal readonly Dictionary<(string, uint), ParticlePose?> RightParticles = new Dictionary<(string, uint), ParticlePose?>();
         internal readonly Dictionary<string, ParticleStyleSnapshot> RightParticleStyles = new Dictionary<string, ParticleStyleSnapshot>(StringComparer.Ordinal);

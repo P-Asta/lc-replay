@@ -62,6 +62,7 @@ namespace LCReplay.Plugin.Playback
                 baseline[snapshot.Type] = snapshot;
                 applied[snapshot.Type] = snapshot;
                 foreach (var parameter in snapshot.Parameters) Apply(component, parameter);
+                if (snapshot.Type == "Fog") SetVanillaFogQuality(component);
             }
             Cubemap? cube = null;
             if (environment.SkyFaces.Count == 6) cube = RestoreSky(environment.SkyFaces, environment.SkyFaceEncoding);
@@ -204,11 +205,25 @@ namespace LCReplay.Plugin.Playback
             if (typeName == "HDRISky" || typeName == "VisualEnvironment" || typeName == "GradientSky") EnsureSky();
             if (typeName == "Fog")
             {
+                SetVanillaFogQuality(component);
                 fogEnabled = GameAccess.Read(component, "enabled");
                 recordedFog = target.Parameters.Count != 0 && GameAccess.Read(fogEnabled, "value") is bool enabled && enabled;
                 SetIndoor(indoor, preLandingOrbit);
             }
             if (typeName == "LiftGammaGain") SetGamma(requestedGamma);
+        }
+
+        private static void SetVanillaFogQuality(object fog)
+        {
+            // HDLethalCompany FogQuality=1 keeps the game's authored low-cost
+            // custom fog quality. These are the native shared/Rend Fog values,
+            // not Fog's constructor defaults. Density, color and extent remain
+            // recorded weather values, including after animated volume changes.
+            SetParameter(fog, "quality", 3);
+            SetParameter(fog, "m_VolumetricFogBudget", .166f);
+            SetParameter(fog, "m_ResolutionDepthRatio", .666f);
+            var control = GameAccess.Type("UnityEngine.Rendering.HighDefinition.FogControl");
+            if (control?.IsEnum == true) SetParameter(fog, "m_FogControlMode", Enum.Parse(control, "Balance"));
         }
 
         private static object? Add(Object profile, Type type)

@@ -292,7 +292,7 @@ namespace LCReplay.Plugin.Capture
             { indexFailureReported = true; log("Replay index saving failed; recording continues and the index can be rebuilt: " + writer.IndexError.Message); }
             LastWork = "storage";
             var tickStarted = Stopwatch.GetTimestamp();
-            storage.Drain(4, .15);
+            storage.Drain(32, .25);
             var now = Duration;
             if (storage.ShouldPauseCapture)
             {

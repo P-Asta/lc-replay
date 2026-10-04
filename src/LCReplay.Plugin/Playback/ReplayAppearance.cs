@@ -200,50 +200,55 @@ namespace LCReplay.Plugin.Playback
                 // native tints intact unless they have their own recorded value.
                 foreach (var property in new[] { "_BaseColor", "_UnlitColor", "_Color" })
                     if (material.HasProperty(property)) { material.SetColor(property, color); break; }
-                foreach (var property in snapshot.Properties)
+                void ApplyCapturedProperties()
                 {
-                    if (!material.HasProperty(property.Name)) continue;
-                    var value = property.Values;
-                    try
+                    foreach (var property in snapshot.Properties)
                     {
-                        switch (property.Kind)
+                        if (!material.HasProperty(property.Name)) continue;
+                        var value = property.Values;
+                        try
                         {
-                            case "float" when value.Length == 1: material.SetFloat(property.Name, value[0]); break;
-                            case "color" when value.Length == 4:
-                                material.SetColor(property.Name, new Color(value[0], value[1], value[2], value[3])); break;
-                            case "vector" when value.Length == 4:
-                                material.SetVector(property.Name, new Vector4(value[0], value[1], value[2], value[3])); break;
-                            case "texture":
-                                var nativeMap = RecordedMap(OriginalMap(original, property.Name), property.TextureId);
-                                if (nativeMap) material.SetTexture(property.Name, nativeMap);
-                                else if (textures.TryGetValue(property.TextureId, out var map)) material.SetTexture(property.Name, map);
-                                material.SetTextureScale(property.Name, new Vector2(property.TextureScaleOffset[0], property.TextureScaleOffset[1]));
-                                material.SetTextureOffset(property.Name, new Vector2(property.TextureScaleOffset[2], property.TextureScaleOffset[3]));
-                                break;
+                            switch (property.Kind)
+                            {
+                                case "float" when value.Length == 1: material.SetFloat(property.Name, value[0]); break;
+                                case "color" when value.Length == 4:
+                                    material.SetColor(property.Name, new Color(value[0], value[1], value[2], value[3])); break;
+                                case "vector" when value.Length == 4:
+                                    material.SetVector(property.Name, new Vector4(value[0], value[1], value[2], value[3])); break;
+                                case "texture":
+                                    // An explicit null property-block texture differs
+                                    // from a texture omitted by an older capture budget.
+                                    if (value.Length == 1 && value[0] == 0f)
+                                    { material.SetTexture(property.Name, null); break; }
+                                    var nativeMap = RecordedMap(OriginalMap(original, property.Name), property.TextureId);
+                                    if (nativeMap) material.SetTexture(property.Name, nativeMap);
+                                    else if (textures.TryGetValue(property.TextureId, out var map)) material.SetTexture(property.Name, map);
+                                    material.SetTextureScale(property.Name, new Vector2(property.TextureScaleOffset[0], property.TextureScaleOffset[1]));
+                                    material.SetTextureOffset(property.Name, new Vector2(property.TextureScaleOffset[2], property.TextureScaleOffset[3]));
+                                    break;
+                            }
                         }
+                        catch { /* Unsupported property combinations fall back to the other recorded values. */ }
                     }
-                    catch { /* Unsupported property combinations fall back to the other recorded values. */ }
                 }
-                foreach (var keyword in snapshot.Keywords) material.EnableKeyword(keyword);
+                ApplyCapturedProperties();
+                // A copied installed material may have features disabled in the
+                // recording. Native-prefab placeholders have no property capture
+                // and must retain their native shader configuration.
+                var completeKeywords = snapshot.KeywordsComplete ??
+                    (snapshot.Properties.Count != 0 && snapshot.Keywords.Count < 64);
+                var restoreKeywords = completeKeywords && material.shader.name == shaderName;
+                if (!restoreKeywords) foreach (var keyword in snapshot.Keywords) material.EnableKeyword(keyword);
                 var originalMainTexture = OriginalMainMap(original);
                 var mainTexture = RecordedMap(originalMainTexture, snapshot.TextureId);
                 if (!mainTexture && textures.TryGetValue(snapshot.TextureId, out var decoded)) mainTexture = decoded;
-                if (mainTexture && mainTexture != originalMainTexture)
-                {
-                    var uv = snapshot.TextureScaleOffset;
-                    foreach (var property in new[] { "_UnlitColorMap", "_BaseColorMap", "_MainTex", "_BaseMap" })
-                    {
-                        if (!material.HasProperty(property)) continue;
-                        material.SetTexture(property, mainTexture);
-                        material.SetTextureScale(property, new Vector2(uv[0], uv[1]));
-                        material.SetTextureOffset(property, new Vector2(uv[2], uv[3]));
-                    }
-                    if (selectedShader.name.Contains("Unlit")) material.EnableKeyword("_UNLIT_COLOR_MAP");
-                }
+                ApplyPrimaryMap(material, snapshot, mainTexture);
                 if (snapshot.AlphaClip)
                 {
                     material.EnableKeyword("_ALPHATEST_ON");
-                    SetFloat(material, "_AlphaCutoffEnable", 1); SetFloat(material, "_AlphaCutoff", snapshot.Cutoff); SetFloat(material, "_Cutoff", snapshot.Cutoff);
+                    if (!HasProperty(snapshot, "_AlphaCutoffEnable")) SetFloat(material, "_AlphaCutoffEnable", 1);
+                    if (!HasProperty(snapshot, "_AlphaCutoff")) SetFloat(material, "_AlphaCutoff", snapshot.Cutoff);
+                    if (!HasProperty(snapshot, "_Cutoff")) SetFloat(material, "_Cutoff", snapshot.Cutoff);
                 }
                 if (snapshot.Transparent && !original)
                 {
@@ -268,6 +273,15 @@ namespace LCReplay.Plugin.Playback
                 // properties. A new Material(shader) does not initialize those passes merely
                 // because _ALPHATEST_ON was enabled, leaving transparent leaf texels opaque.
                 ValidateHdrpMaterial(material);
+                // HDRP validation also recomputes shader uniforms from authoring
+                // controls, including emission intensity, UV/displacement scalars
+                // and GI aliases. Runtime scripts and property blocks can override
+                // those uniforms directly; their recorded values remain authoritative.
+                if (material.shader.name.StartsWith("HDRP/", StringComparison.Ordinal)) ApplyCapturedProperties();
+                // Validation restores HDRP passes but may infer new features
+                // from property-block textures. Blocks cannot enable keywords
+                // in the source renderer, so retain the captured variant set.
+                if (restoreKeywords) material.shaderKeywords = snapshot.Keywords.ToArray();
                 if (snapshot.RenderQueue >= 0) material.renderQueue = snapshot.RenderQueue;
                 materials[snapshot.Id] = material;
                 yield return .02f + .98f * ++completed / total;
@@ -325,6 +339,43 @@ namespace LCReplay.Plugin.Playback
                 }
             return null;
         }
+
+        private static void ApplyPrimaryMap(Material material, MaterialSnapshot snapshot, Texture? mainTexture)
+        {
+            var property = snapshot.TextureId.Length == 0 ? null : MainMapProperty(material, snapshot);
+            if (property == null || HasProperty(snapshot, property)) return;
+            // Legacy snapshots retain the primary UV transform even when the
+            // installed texture is reused. Custom shaders can use multiple
+            // primary aliases for different maps; never overwrite their own
+            // per-property captures with this legacy primary-map fallback.
+            var uv = snapshot.TextureScaleOffset;
+            if (mainTexture) material.SetTexture(property, mainTexture);
+            material.SetTextureScale(property, new Vector2(uv[0], uv[1]));
+            material.SetTextureOffset(property, new Vector2(uv[2], uv[3]));
+            if (mainTexture && material.shader.name.Contains("Unlit")) material.EnableKeyword("_UNLIT_COLOR_MAP");
+        }
+
+        private static string? MainMapProperty(Material material, MaterialSnapshot snapshot)
+        {
+            foreach (var name in MainMapNames)
+                foreach (var property in snapshot.Properties)
+                    if (property.Name == name && property.Kind == "texture" && property.TextureId == snapshot.TextureId &&
+                        material.HasProperty(name)) return name;
+            foreach (var property in snapshot.Properties)
+                if (property.Kind == "texture" && property.TextureId == snapshot.TextureId &&
+                    IsColorMapName(property.Name) && material.HasProperty(property.Name)) return property.Name;
+            foreach (var name in MainMapNames) if (GetMap(material, name)) return name;
+            foreach (var name in material.GetTexturePropertyNames())
+                if (IsColorMapName(name) && material.GetTexture(name)) return name;
+            foreach (var name in MainMapNames) if (material.HasProperty(name)) return name;
+            foreach (var name in material.GetTexturePropertyNames()) if (IsColorMapName(name)) return name;
+            return null;
+        }
+
+        private static bool IsColorMapName(string name) =>
+            name.IndexOf("albedo", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            name.IndexOf("diffuse", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            name.IndexOf("basecolor", StringComparison.OrdinalIgnoreCase) >= 0;
         private static bool HasProperty(MaterialSnapshot snapshot, string name)
         {
             foreach (var property in snapshot.Properties) if (property.Name == name) return true;
@@ -361,7 +412,9 @@ namespace LCReplay.Plugin.Playback
 
         internal Material[] Resolve(GeometrySnapshot geometry, Material fallback, GeometrySnapshot? source = null)
         {
-            int count = Math.Max(1, (source ?? geometry).SubmeshTriangles.Count);
+            // Unity draws surplus material slots over the last submesh. Modded
+            // outlines and layered surfaces use those additional passes.
+            int count = Math.Max(1, Math.Max(geometry.MaterialIds.Count, (source ?? geometry).SubmeshTriangles.Count));
             var result = new Material[count];
             for (int i = 0; i < count; i++)
                 result[i] = i < geometry.MaterialIds.Count && materials.TryGetValue(geometry.MaterialIds[i], out var material) ? material : fallback;

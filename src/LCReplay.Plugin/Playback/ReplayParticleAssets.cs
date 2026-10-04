@@ -14,6 +14,7 @@ namespace LCReplay.Plugin.Playback
     {
         private static GameObject? shipTemplates;
         private static int shipTemplateAttempt;
+        private static GameObject? weatherTemplates;
         private readonly Transform staging;
         private readonly int layer;
         private readonly ParticleSystem[] sources;
@@ -25,6 +26,7 @@ namespace LCReplay.Plugin.Playback
         // the material alone cannot reconstruct a texture-sheet animation.
         internal static void CacheShipMagnet(Component round)
         {
+            CacheWeather(round);
             if (shipTemplates || !round || !(GameAccess.Read(round, "magnetParticle") is ParticleSystem magnet) || !magnet) return;
             var sourceId = magnet.GetInstanceID();
             if (shipTemplateAttempt == sourceId) return;
@@ -57,9 +59,41 @@ namespace LCReplay.Plugin.Playback
 
         internal static void ClearCachedTemplates()
         {
+            if (weatherTemplates) Object.DestroyImmediate(weatherTemplates);
+            weatherTemplates = null;
             if (shipTemplates) Object.DestroyImmediate(shipTemplates);
             shipTemplates = null;
             shipTemplateAttempt = 0;
+        }
+
+        private static void CacheWeather(Component round)
+        {
+            if (weatherTemplates || !round) return;
+            var type = GameAccess.Type("StormyWeather");
+            if (type == null) return;
+            var weather = Resources.FindObjectsOfTypeAll(type).OfType<Component>()
+                .FirstOrDefault(value => value && value.gameObject.scene == round.gameObject.scene);
+            if (!weather) return;
+            var root = new GameObject("LC Replay cached weather particles") { hideFlags = HideFlags.HideAndDontSave };
+            root.SetActive(false);
+            Object.DontDestroyOnLoad(root);
+            try
+            {
+                foreach (var source in weather!.GetComponentsInChildren<ParticleSystem>(true).Take(32))
+                {
+                    if (!source || source.transform.childCount > 64) continue;
+                    var group = new GameObject(source.transform.parent ? source.transform.parent.name : weather.name);
+                    group.transform.SetParent(root.transform, false);
+                    var copy = CloneParticleObject(source.gameObject, group.transform);
+                    copy.name = source.name;
+                }
+                weatherTemplates = root;
+            }
+            catch (Exception error)
+            {
+                Object.DestroyImmediate(root);
+                Debug.LogWarning("LC Replay: could not retain weather particle templates: " + error.Message);
+            }
         }
 
         internal ReplayParticleAssets(Transform root, int replayLayer)

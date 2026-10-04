@@ -1,3 +1,28 @@
+# 0.25.38
+
+- Remove the camera-facing outdoor fill in normal playback and stop inventing point lights for emissive materials. Keep the explicit NoShadow visibility assist and refresh native night vision after player assets finish loading.
+- Record bounded HDRP light shapes, attenuation, diffuse/specular response and volumetric settings. Restore native intensity units and preserve area light types; supplement older files only from an unambiguous matching installed light.
+- Restore installed baked/custom reflection probes on the replay layer without realtime cubemap rendering or changing the source scene.
+- Preserve captured shader keyword sets, UV transforms when reusing native textures, additional material slots, and renderer/material property-block overrides in new captures.
+- Retain the vanilla graphics baseline and 0.25.37 animation/per-frame optimizations. Missing historical material overrides and baked GI are not reconstructed from guesses; this release does not establish a 200 FPS result.
+
+# 0.25.37
+
+- Save a vanilla graphics baseline: 860×520 at resolution multiplier 1, neutral gamma, fog/shadows on and normal interior culling. Migrate once; subsequent Settings changes persist. Show actual dimensions in the resolution control.
+- Use installed player-camera HDRP frame settings, no AA, native custom fog quality and recorded LOD distances without the previous 3× distance extension. Preserve recorded weather properties and complete ground surfaces.
+- Index teleport/capture-gap events per immutable playback window instead of scanning every sound/animation event for every player and display frame. Preserve general mutable sampler behavior.
+- Reuse renderer, actor and hazard lookup tables; avoid redundant hierarchy traversal, component lookup, activation and transform writes. Invalidate caches on world rebuilds and keep late mod asset retries.
+- Reuse exact bone-weight matrices and parallelize skin/outline numeric work without changing the evaluated animation poses or mesh channels.
+
+# 0.25.36
+
+- Retain isolated native storm particle templates, including the lightning warning's authored texture-sheet animation, before unloading the round asset scene.
+- Preserve recorded realtime light shadows in every room instead of enabling only the first four exported indoor fixtures.
+- Parallelize large player skin calculations over bounded numeric-array chunks; keep Unity object access and mesh uploads on the main thread with unchanged skinning equations.
+- Capture animated exterior scene renderers as moving geometry, including main entrance doors, and observe entrance open/finish calls in new recordings.
+- Let the bounded capture buffer absorb motion/state records while a large map is compressed and while its tail catches up. Raise the bulk-tail count watermark from 48 records to three quarters of the configured buffer capacity, retaining byte limits and disk-failure handling.
+- Publish disconnect metadata in the background after accepted recording data is saved. Retire isolated player-scene Harmony guards over bounded main-thread turns instead of unpatching hundreds on one close/cancel frame.
+
 # 0.25.35
 
 - Show top-right notices for eight real-time seconds, with 0.35-second SmoothStep/Lerp slides in from the right and back out to the right.

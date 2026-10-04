@@ -16,15 +16,29 @@ namespace LCReplay.Plugin.Capture
     {
         private const int MaxTextureBytes = 32 * 1024 * 1024;
         private const int MaxIndividualTextureBytes = 5 * 1024 * 1024;
+        // Property blocks replace shader uniforms, not HDRP's material-derived
+        // draw state. Baking these overrides into a Material would incorrectly
+        // change its passes, blend factors, depth writes or face culling.
+        private static readonly HashSet<string> HdrpRenderStateProperties = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "_SurfaceType", "_BlendMode", "_SrcBlend", "_DstBlend", "_AlphaSrcBlend", "_AlphaDstBlend",
+            "_ZWrite", "_TransparentZWrite", "_ZTestDepthEqualForOpaque", "_ZTestGBuffer", "_ZTestTransparent",
+            "_Cull", "_CullMode", "_CullModeForward", "_DoubleSidedEnable", "_AlphaCutoffEnable",
+            "_ReceivesSSR", "_ReceivesSSRTransparent", "_MaterialID", "_ExcludeFromTUAndAA",
+            "_TransparentSortPriority", "_TransparentBackfaceEnable", "_TransparentDepthPrepassEnable", "_TransparentDepthPostpassEnable",
+            "_DistortionEnable", "_DistortionOnly", "_DistortionDepthTest", "_ZTestModeDistortion",
+            "_DistortionSrcBlend", "_DistortionDstBlend", "_DistortionBlurSrcBlend", "_DistortionBlurDstBlend", "_DistortionBlurBlendMode"
+        };
         private readonly WorldSnapshot world;
         private readonly Dictionary<int, string> materials = new Dictionary<int, string>();
+        private readonly Dictionary<string, string> overriddenMaterials = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly Dictionary<int, string> textures = new Dictionary<int, string>();
         private int textureBytes;
         internal int OmittedTextures { get; private set; }
         internal AppearanceCapture(WorldSnapshot world) { this.world = world; }
 
         internal void Capture(Renderer renderer, GeometrySnapshot geometry) =>
-            Capture(renderer.sharedMaterials, renderer is SkinnedMeshRenderer, renderer.name, geometry);
+            Capture(renderer.sharedMaterials, renderer is SkinnedMeshRenderer, renderer.name, geometry, renderer);
 
         internal void Capture(Material material, string name, GeometrySnapshot geometry) =>
             Capture(new[] { material }, false, name, geometry);
@@ -71,48 +85,70 @@ namespace LCReplay.Plugin.Capture
             if (terrain.materialTemplate) Capture(terrain.materialTemplate, terrain.name, geometry);
         }
 
-        private void Capture(Material[] sourceMaterials, bool skinned, string rendererName, GeometrySnapshot geometry)
+        private void Capture(Material[] sourceMaterials, bool skinned, string rendererName, GeometrySnapshot geometry, Renderer? renderer = null)
         {
-            foreach (var material in sourceMaterials)
+            MaterialPropertyBlock? rendererBlock = null, materialBlock = null;
+            if (renderer && renderer!.HasPropertyBlock())
             {
+                rendererBlock = new MaterialPropertyBlock(); materialBlock = new MaterialPropertyBlock();
+                renderer.GetPropertyBlock(rendererBlock);
+            }
+            for (var slot = 0; slot < sourceMaterials.Length; slot++)
+            {
+                var material = sourceMaterials[slot];
                 if (geometry.MaterialIds.Count >= 16) break;
                 if (!material) { geometry.MaterialIds.Add(""); continue; }
+                MaterialPropertyBlock? block = null;
+                if (materialBlock != null)
+                {
+                    materialBlock.Clear(); renderer!.GetPropertyBlock(materialBlock, slot);
+                    // Unity uses the per-material block in preference to the
+                    // entire renderer block; the two blocks are not merged.
+                    block = !materialBlock.isEmpty ? materialBlock : rendererBlock;
+                    if (block!.isEmpty) block = null;
+                }
                 int key = material.GetInstanceID();
-                if (materials.TryGetValue(key, out var known)) { geometry.MaterialIds.Add(known); continue; }
+                var overrideId = block == null ? null : "m" + key + ":r" + renderer!.GetInstanceID() + ":s" + slot;
+                if (overrideId == null && materials.TryGetValue(key, out var known)) { geometry.MaterialIds.Add(known); continue; }
+                if (overrideId != null && overriddenMaterials.TryGetValue(overrideId, out known)) { geometry.MaterialIds.Add(known); continue; }
                 if (world.Materials.Count >= 1024) { geometry.MaterialIds.Add(""); continue; }
-                var snapshot = new MaterialSnapshot { Id = "m" + key, Name = GameAccess.Scalar(material.name) ?? "",
+                var snapshot = new MaterialSnapshot { Id = overrideId ?? "m" + key, Name = GameAccess.Scalar(material.name) ?? "",
                     ShaderName = material.shader ? GameAccess.Scalar(material.shader.name) ?? "" : "" };
                 var ground = RenderVisibilityPolicy.IsGroundSurface(rendererName) || RenderVisibilityPolicy.IsGroundSurface(material.name);
                 var architecture = RenderVisibilityPolicy.IsArchitectureSurface(rendererName) ||
                     RenderVisibilityPolicy.IsArchitectureSurface(material.name);
-                var property = TextureProperty(material);
+                var property = TextureProperty(material, block);
                 var color = Color.white;
                 foreach (var candidate in new[] { "_BaseColor", "_UnlitColor", "_Color" })
-                    if (material.HasProperty(candidate)) { color = material.GetColor(candidate); break; }
+                    if (material.HasProperty(candidate)) { color = ReadColor(material, block, candidate); break; }
                 snapshot.Color = new[] { Finite(color.r, 1), Finite(color.g, 1), Finite(color.b, 1), Finite(color.a, 1) };
                 if (property != null)
                 {
-                    var texture = material.GetTexture(property);
-                    if (texture) snapshot.TextureId = CaptureTexture(texture,
+                    var texture = ReadTexture(material, block, property);
+                    if (texture) snapshot.TextureId = CaptureTexture(texture!,
                         ground ? 2048 : architecture || skinned || IsNaturalSurface(rendererName, material.name) ? 1024 : 512);
-                    var scale = material.GetTextureScale(property); var offset = material.GetTextureOffset(property);
-                    snapshot.TextureScaleOffset = new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
+                    snapshot.TextureScaleOffset = TextureScaleOffset(material, block, property);
                 }
                 snapshot.AlphaClip = material.IsKeywordEnabled("_ALPHATEST_ON") ||
                     (material.HasProperty("_AlphaCutoffEnable") && material.GetFloat("_AlphaCutoffEnable") > 0);
                 snapshot.Transparent = !snapshot.AlphaClip && ((material.HasProperty("_SurfaceType") && material.GetFloat("_SurfaceType") > 0)
                     || (material.HasProperty("_Mode") && material.GetFloat("_Mode") >= 2) || material.renderQueue >= 3000);
-                snapshot.Cutoff = material.HasProperty("_AlphaCutoff") ? Mathf.Clamp01(material.GetFloat("_AlphaCutoff")) :
-                    material.HasProperty("_Cutoff") ? Mathf.Clamp01(material.GetFloat("_Cutoff")) : 0.5f;
+                snapshot.Cutoff = material.HasProperty("_AlphaCutoff") ? Mathf.Clamp01(ReadFloat(material, block, "_AlphaCutoff")) :
+                    material.HasProperty("_Cutoff") ? Mathf.Clamp01(ReadFloat(material, block, "_Cutoff")) : 0.5f;
                 if (!GameAccess.Finite(snapshot.Cutoff)) snapshot.Cutoff = 0.5f;
                 snapshot.RenderQueue = Mathf.Clamp(material.renderQueue, -1, 5000);
-                snapshot.Keywords = material.shaderKeywords.Where(keyword => keyword.Length <= 128).Take(64).ToList();
-                CaptureProperties(material, snapshot, ground, architecture);
-                world.Materials.Add(snapshot); materials[key] = snapshot.Id; geometry.MaterialIds.Add(snapshot.Id);
+                var keywords = material.shaderKeywords;
+                snapshot.Keywords = keywords.Where(keyword => keyword.Length <= 128).Take(64).ToList();
+                snapshot.KeywordsComplete = snapshot.Keywords.Count == keywords.Length;
+                CaptureProperties(material, snapshot, ground, architecture, block);
+                world.Materials.Add(snapshot);
+                if (overrideId == null) materials[key] = snapshot.Id;
+                else overriddenMaterials[overrideId] = snapshot.Id;
+                geometry.MaterialIds.Add(snapshot.Id);
             }
         }
 
-        private void CaptureProperties(Material material, MaterialSnapshot snapshot, bool ground, bool architecture)
+        private void CaptureProperties(Material material, MaterialSnapshot snapshot, bool ground, bool architecture, MaterialPropertyBlock? block = null)
         {
             var shader = material.shader;
             if (!shader) return;
@@ -135,32 +171,36 @@ namespace LCReplay.Plugin.Capture
                     {
                         case ShaderPropertyType.Float:
                         case ShaderPropertyType.Range:
-                            var number = material.GetFloat(name);
+                            var number = ReadFloat(material, block, name);
                             if (!GameAccess.Finite(number)) continue;
                             entry.Kind = "float"; entry.Values = new[] { number }; break;
                         case ShaderPropertyType.Color:
-                            var color = material.GetColor(name);
+                            var color = ReadColor(material, block, name);
                             if (!FiniteColor(color)) continue;
                             entry.Kind = "color"; entry.Values = new[] { color.r, color.g, color.b, color.a }; break;
                         case ShaderPropertyType.Vector:
-                            var vector = material.GetVector(name);
+                            var vector = block?.HasProperty(name) == true ? block.GetVector(name) : material.GetVector(name);
                             if (!GameAccess.Finite(new Vector3(vector.x, vector.y, vector.z)) || !GameAccess.Finite(vector.w)) continue;
                             entry.Kind = "vector"; entry.Values = new[] { vector.x, vector.y, vector.z, vector.w }; break;
                         case ShaderPropertyType.Texture:
-                            var texture = material.GetTexture(name);
-                            if (!texture) continue;
+                            var texture = ReadTexture(material, block, name);
+                            if (!texture)
+                            {
+                                if (block?.HasProperty(name) != true) continue;
+                                entry.Kind = "texture"; entry.Values = new[] { 0f };
+                                break;
+                            }
                             var colorMap = name.IndexOf("basecolor", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("albedo", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("diffuse", StringComparison.OrdinalIgnoreCase) >= 0;
                             var surfaceMap = name.IndexOf("normal", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("mask", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 name.IndexOf("detail", StringComparison.OrdinalIgnoreCase) >= 0;
-                            entry.Kind = "texture"; entry.TextureId = CaptureTexture(texture,
+                            entry.Kind = "texture"; entry.TextureId = CaptureTexture(texture!,
                                 ground ? colorMap ? 2048 : 1024 :
                                 architecture ? colorMap || surfaceMap ? 1024 : 512 :
                                 IsNaturalSurface(material.name, name) || colorMap || surfaceMap ? 512 : 256);
-                            var scale = material.GetTextureScale(name); var offset = material.GetTextureOffset(name);
-                            entry.TextureScaleOffset = new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
+                            entry.TextureScaleOffset = TextureScaleOffset(material, block, name);
                             break;
                         default: continue;
                     }
@@ -338,14 +378,35 @@ namespace LCReplay.Plugin.Capture
             Dispose();
         }
 
-        private static string? TextureProperty(Material material)
+        private static float ReadFloat(Material material, MaterialPropertyBlock? block, string name)
+        {
+            if (block?.HasProperty(name) != true) return material.GetFloat(name);
+            var fixedState = material.shader && material.shader.name.StartsWith("HDRP/", StringComparison.Ordinal) &&
+                (HdrpRenderStateProperties.Contains(name) || name.StartsWith("_Stencil", StringComparison.Ordinal));
+            return fixedState ? material.GetFloat(name) : block.GetFloat(name);
+        }
+        private static Color ReadColor(Material material, MaterialPropertyBlock? block, string name) =>
+            block?.HasProperty(name) == true ? block.GetColor(name) : material.GetColor(name);
+        private static Texture? ReadTexture(Material material, MaterialPropertyBlock? block, string name) =>
+            block?.HasProperty(name) == true ? block.GetTexture(name) : material.GetTexture(name);
+        private static float[] TextureScaleOffset(Material material, MaterialPropertyBlock? block, string name)
+        {
+            if (block?.HasProperty(name + "_ST") == true)
+            {
+                var value = block.GetVector(name + "_ST");
+                return new[] { Finite(value.x, 1), Finite(value.y, 1), Finite(value.z, 0), Finite(value.w, 0) };
+            }
+            var scale = material.GetTextureScale(name); var offset = material.GetTextureOffset(name);
+            return new[] { Finite(scale.x, 1), Finite(scale.y, 1), Finite(offset.x, 0), Finite(offset.y, 0) };
+        }
+        private static string? TextureProperty(Material material, MaterialPropertyBlock? block = null)
         {
             foreach (var name in new[] { "_BaseColorMap", "_UnlitColorMap", "_MainTex", "_BaseMap", "_BaseColorTexture" })
-                if (material.HasProperty(name) && material.GetTexture(name)) return name;
+                if (material.HasProperty(name) && ReadTexture(material, block, name)) return name;
             foreach (var name in material.GetTexturePropertyNames())
             {
                 var lower = name.ToLowerInvariant();
-                if ((lower.Contains("albedo") || lower.Contains("diffuse") || lower.Contains("basecolor")) && material.GetTexture(name)) return name;
+                if ((lower.Contains("albedo") || lower.Contains("diffuse") || lower.Contains("basecolor")) && ReadTexture(material, block, name)) return name;
             }
             return null;
         }

@@ -32,6 +32,7 @@ namespace LCReplay.Plugin.Capture
             ["EnemyAI"] = new[] { "Start", "HitEnemy", "KillEnemy", "SwitchToBehaviourState" },
             ["SandSpiderAI"] = new[] { "SpawnWebTrapClientRpc" },
             ["DoorLock"] = new[] { "OpenOrCloseDoor", "SetDoorAsOpen", "UnlockDoor", "LockDoor" },
+            ["EntranceTeleport"] = new[] { "StartOpeningEntrance", "FinishOpeningEntrance", "SyncStartOpeningDoorRpc", "SyncFinishOpeningDoorRpc" },
             ["TerminalAccessibleObject"] = new[] { "SetDoorOpen", "CallFunctionFromTerminal" },
             ["Landmine"] = new[] { "Detonate" }, ["Turret"] = new[] { "ToggleTurretEnabled", "SwitchTurretMode" },
             ["ShipTeleporter"] = new[] { "PressTeleportButtonOnLocalClient" }

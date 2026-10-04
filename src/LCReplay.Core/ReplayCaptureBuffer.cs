@@ -17,6 +17,7 @@ namespace LCReplay.Core
         private bool pendingLargeWorld;
         private bool completing;
         private bool throttled;
+        private bool drainingBulkTail;
         public Exception? Error { get; private set; }
         public int PendingCount => pending.Count;
         public long PendingBytes => pendingBytes;
@@ -25,15 +26,22 @@ namespace LCReplay.Core
             get
             {
                 var bulk = writer.BulkWorldBytes;
-                if (bulk != 0)
+                if (bulk != 0) drainingBulkTail = true;
+                else if (pending.Count == 0 && writer.QueuedCount <= 12 && writer.QueuedBytes <= 1024 * 1024)
+                    drainingBulkTail = false;
+                if (drainingBulkTail)
                 {
                     // A single exported map can exceed the writer's memory cap.
                     // Keep a small, ordered motion tail instead of treating the
                     // in-flight map alone as a reason to freeze all sampling.
                     var motionBytes = pendingBytes + Math.Max(0, writer.QueuedBytes - bulk);
                     var motionCount = pending.Count + writer.QueuedCount;
-                    if (motionCount >= 48 || motionBytes >= 4L * 1024 * 1024) throttled = true;
-                    else if (motionCount <= 12 && motionBytes <= 1024 * 1024) throttled = false;
+                    // Animation/state records are not sample frames: 48 records
+                    // can represent less than one second of a busy lobby. Use
+                    // the existing bounded buffer to absorb map compression.
+                    if (motionCount >= Math.Max(1, capacity * 3 / 4) ||
+                        motionBytes >= maxBytes * 3 / 4) throttled = true;
+                    else if (motionCount <= capacity / 4 && motionBytes <= maxBytes / 4) throttled = false;
                     return throttled;
                 }
                 // Resume at a lower watermark to avoid repeated allocation bursts.

@@ -238,7 +238,7 @@ namespace LCReplay.Plugin.Capture
                 var interior = roomId.Length != 0;
                 if (layer == "interior" && (!interior || owner != null)) continue;
                 if (layer == "exterior" && interior && owner == null) continue;
-                var movingSceneRenderer = owner == null && (shipDoorRenderer || interior && IsMovingSceneRenderer(renderer, tile));
+                var movingSceneRenderer = owner == null && (shipDoorRenderer || IsMovingSceneRenderer(renderer, tile));
                 if (layer == "exterior" && includeContext && sceneAssets != null && owner == null && !movingSceneRenderer &&
                     sceneAssets.TryRenderer(renderer, out var assetPath) &&
                     CaptureVisibility.VisibleLayer(renderer, cameraMask, visibility.CullerManaged.Contains(renderer)) &&
@@ -586,8 +586,8 @@ namespace LCReplay.Plugin.Capture
             if (includeContext || onlyEntityIds != null)
             {
                 CaptureLights(world, anchors, owners, layer == "interior", onlyEntityIds);
-                if (layer == "interior" && includeContext) CaptureEmissiveRooms(world);
-                CaptureEmissiveItems(world, tracker);
+                // Emission remains a material property. Inventing point lights
+                // for glowing surfaces changes authored illumination and shadows.
             }
             var localFogMaskBytes = 0;
             if (includeContext)
@@ -750,7 +750,7 @@ namespace LCReplay.Plugin.Capture
                 if (!light.enabled && light.type != LightType.Directional && (tileType == null || !light.GetComponentInParent(tileType))) continue;
                 world.Lights.Add(new LightSnapshot { Id = "l" + light.GetInstanceID(), Name = light.name, AnchorId = anchor?.Key ?? "",
                     EntityId = owner?.Id ?? "", IsInterior = indoor,
-                    Type = light.type == LightType.Rectangle || light.type == LightType.Disc ? "Point" : light.type.ToString(),
+                    Type = light.type == LightType.Rectangle ? "Rectangle" : light.type == LightType.Disc ? "Disc" : light.type.ToString(),
                     Position = GameAccess.Vec(position), Rotation = GameAccess.Rot(rotation),
                     Color = new[] { color.r, color.g, color.b, color.a },
                     UseColorTemperature = light.useColorTemperature,
@@ -764,6 +764,7 @@ namespace LCReplay.Plugin.Capture
                     Shadows = light.shadows != LightShadows.None && light.shadowStrength > .01f && shadowDimmer > .01f,
                     ShadowStrength = Mathf.Clamp01(light.shadowStrength),
                     ShadowDimmer = shadowDimmer,
+                    LightPipelineParameters = ReplayLightProperties.Capture(hdLight),
                     BakeType = GameAccess.Read(light, "lightmapBakeType")?.ToString() ??
                         GameAccess.Read(GameAccess.Read(light, "bakingOutput"), "lightmapBakeType")?.ToString() ?? "" });
             }

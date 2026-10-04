@@ -122,11 +122,12 @@ namespace LCReplay.Plugin.Playback
             NativeReplayUi.SetRect((RectTransform)settingsScroll.transform, Vector2.zero, Vector2.one,
                 new Vector2(0, 14), new Vector2(0, -62));
             settingsContent.sizeDelta = new Vector2(0, 578);
-            var resolutionTitle = _ui.CreateText(settingsContent, "Render resolution", 23);
+            var resolutionTitle = _ui.CreateText(settingsContent, "Resolution (1x = vanilla)", 23);
             NativeReplayUi.Place(resolutionTitle.rectTransform, 18, 70, 320, 38);
             _resolutionValue = _ui.CreateText(settingsContent, "", 22, alignment: TextAlignmentOptions.MidlineRight);
             NativeReplayUi.Place(_resolutionValue.rectTransform, 330, 70, 188, 38);
-            _resolutionSlider = _ui.CreateSlider(settingsContent, "Render resolution", .25f, 1f, resolutionScale, setResolution);
+            _resolutionSlider = _ui.CreateSlider(settingsContent, "Render resolution",
+                ReplayGraphicsDefaults.MinResolutionMultiplier, ReplayGraphicsDefaults.MaxResolutionMultiplier, resolutionScale, setResolution);
             NativeReplayUi.Place((RectTransform)_resolutionSlider.transform, 18, 108, 500, 42);
             var gammaTitle = _ui.CreateText(settingsContent, "Gamma", 23);
             NativeReplayUi.Place(gammaTitle.rectTransform, 18, 160, 320, 38);
@@ -296,7 +297,8 @@ namespace LCReplay.Plugin.Playback
             _cameraLabel.text = follow && (player != null || !string.IsNullOrEmpty(focusName))
                 ? "Camera: " + (player?.Name ?? focusName) : "Camera: Freecam";
             _visualLabel.text = diagnostics ? "Labels: on" : "Labels: off";
-            _resolutionValue.text = Math.Round(_resolutionSlider.value * 100).ToString(CultureInfo.InvariantCulture) + "%";
+            _resolutionValue.text = ReplayGraphicsDefaults.ResolutionWidth(_resolutionSlider.value) + "x" +
+                ReplayGraphicsDefaults.ResolutionHeight(_resolutionSlider.value);
             _gammaValue.text = _gammaSlider.value.ToString("0.00", CultureInfo.InvariantCulture);
             _cameraSpeedValue.text = _cameraSpeedSlider.value.ToString("0.0", CultureInfo.InvariantCulture);
             var cameraSignature = selectedId + "|" + follow + "|" + string.Join("|", players.Select(value =>

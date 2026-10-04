@@ -280,7 +280,7 @@ namespace LCReplay.Core
                 String(light.BakeType, l); String(light.Name, l);
                 if (light.Id.Length == 0 || !lightIds.Add(light.Id) ||
                     (light.AnchorId.Length != 0 && light.EntityId.Length != 0) ||
-                    (light.Type != "Directional" && light.Type != "Point" && light.Type != "Spot")) Fail("Invalid light identifier or type.");
+                    (light.Type != "Directional" && light.Type != "Point" && light.Type != "Spot" && light.Type != "Rectangle" && light.Type != "Disc")) Fail("Invalid light identifier or type.");
                 Vector(light.Position); Rotation(light.Rotation); Floats(light.Color, 4, false);
                 if (!Finite(light.ColorTemperature) || light.ColorTemperature < 1000 || light.ColorTemperature > 20000 ||
                     !Finite(light.Intensity) || light.Intensity < 0 || light.Intensity > 1000000 ||
@@ -291,6 +291,22 @@ namespace LCReplay.Core
                     !Finite(light.ShadowDimmer) || light.ShadowDimmer < 0 || light.ShadowDimmer > 16 ||
                     light.BakeType != "" && light.BakeType != "Realtime" && light.BakeType != "Baked" && light.BakeType != "Mixed")
                     Fail("Invalid light parameters.");
+                if (light.LightPipelineParameters == null || light.LightPipelineParameters.Count > 40)
+                    Fail("Invalid light pipeline parameter count.");
+                var pipelineNames = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var parameter in light.LightPipelineParameters!)
+                {
+                    if (parameter == null) Fail("Null light pipeline parameter.");
+                    String(parameter.Name, l); String(parameter.Kind, l); String(parameter.Text, l);
+                    if (parameter.Name.Length == 0 || parameter.Name.Length > 64 || !pipelineNames.Add(parameter.Name) ||
+                        parameter.Text.Length > 64 || parameter.Values == null || parameter.CurveKeys == null || parameter.CurveKeys.Length != 0 ||
+                        parameter.Kind != "float" && parameter.Kind != "bool" && parameter.Kind != "enum" ||
+                        (parameter.Kind == "enum" ? parameter.Text.Length == 0 || parameter.Values.Length != 0 :
+                            parameter.Text.Length != 0 || parameter.Values.Length != 1)) Fail("Invalid light pipeline parameter.");
+                    foreach (var value in parameter.Values)
+                        if (!Finite(value) || Math.Abs(value) > 1000000 || parameter.Kind == "bool" && value != 0 && value != 1)
+                            Fail("Invalid light pipeline value.");
+                }
             }
             if (w.Textures == null || w.Textures.Count > l.MaxTexturesPerWorld) Fail("World texture count exceeds limit.");
             var textureIds = new HashSet<string>(StringComparer.Ordinal);

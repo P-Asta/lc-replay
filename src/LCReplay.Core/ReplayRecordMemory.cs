@@ -50,6 +50,9 @@ namespace LCReplay.Core
                 }
                 foreach (var fog in world.LocalFogs) if (fog != null) bytes += 2048 + (fog.MaskRgba?.LongLength ?? 0);
                 bytes += world.Lights.Count * 2048L + world.Rooms.Count * 4096L + world.ParticleEmitters.Count * 4096L;
+                foreach (var light in world.Lights) if (light != null)
+                    foreach (var property in light.LightPipelineParameters) if (property != null)
+                        bytes += 512 + Text(property.Name) + Text(property.Kind) + Array(property.Values) + Text(property.Text);
                 if (world.Environment is EnvironmentSnapshot environment)
                 {
                     foreach (var texture in environment.SkyFaces) if (texture != null) bytes += 512 + (texture.Png?.LongLength ?? 0);

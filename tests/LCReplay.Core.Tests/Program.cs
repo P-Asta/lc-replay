@@ -27,6 +27,8 @@ if (args.Length == 2 && args[0] == "--inspect-audio")
 
 var suite = new (string Name, Action Run)[]
 {
+    ("Material keyword completeness and explicit renderer overrides preserve legacy compatibility", MaterialCaptureMetadataTests.Run),
+    ("Bounded native light pipeline settings round trip and account for queue memory", LightPipelineTests.Run),
     ("Animation clocks avoid double speed and preserve phase continuity and restarts", AnimationClockTests.Run),
     ("Enemy blendshapes interpolate across seeks without changing discrete state or source frames", BlendShapeTests.Run),
     ("Vehicle cargo follows the same interpolated translation, rotation and scale without ground or pickup attachment", VehicleCargoTests.Run),
@@ -50,12 +52,14 @@ var suite = new (string Name, Action Run)[]
     ("Worker PNG encoding preserves bounded RGBA rows and PNG checksums", WorkerPng),
     ("Histogram mip alpha coverage preserves every threshold and scale tie", AlphaCoverageTests.Run),
     ("A large in-flight map retains a bounded ordered motion tail before throttling", BulkWorldMotionTail),
+    ("Map completion does not pause a healthy motion tail while it catches up", BulkWorldTailCatchup),
     ("Optional index creation failure cannot stop the recording", OptionalIndexFailure),
     ("Streaming compression reduces allocations and enforces limits before appending", StreamingRecordWrite),
     ("Timeline seeks and applies discrete lifecycle boundaries", Timeline),
     ("Playback sampler matches independent samples across rapid forward and backward seeks", PlaybackSampler),
     ("Reusable playback poses preserve seek boundaries without steady-state allocations", ReusablePlaybackSampler),
     ("Player teleports and death relocation do not interpolate through walls", PlayerDiscontinuities),
+    ("Prepared sparse event queries preserve teleport/gap boundaries, window refresh and mutable sampler behavior", TimelineEventIndexTests.Run),
     ("Confirmed tree removals recover delayed visibility timing without mutating recordings", TreeBreakTimingTests.Run),
     ("Quaternion interpolation follows the shortest normalized arc", Quaternion),
     ("Recorded player view rotation survives file IO and interpolated seeking", PlayerViewRotation),
@@ -702,21 +706,44 @@ static void BulkWorldMotionTail() => WithTemp(dir =>
         Check(capture.TryWrite(new ReplayRecord { Kind = "world", World = world }), "large map accepted in empty output");
         Check(output.Entered.Wait(TimeSpan.FromSeconds(5)), "map serialization in flight");
         Check(!capture.ShouldPauseCapture, "isolated bulk map does not pause pose sampling");
-        for (var i = 0; i < 48; i++)
+        for (var i = 0; i < 3072; i++)
         {
             Check(capture.TryWrite(Frame(i)), "bounded pose tail retained");
-            if (i < 47) Check(!capture.ShouldPauseCapture, "tail below watermark keeps capture active");
+            if (i < 3071) Check(!capture.ShouldPauseCapture, "tail below watermark keeps capture active");
         }
-        Check(capture.ShouldPauseCapture && capture.PendingBytes < 1024 * 1024, "tail throttles at count limit, not unbounded growth");
+        Check(capture.ShouldPauseCapture && capture.PendingBytes < 6L * 1024 * 1024, "tail throttles at count limit, not unbounded growth");
         var finishing = capture.CompleteAsync(); Check(!finishing.IsCompleted, "completion waits for stalled bulk output");
         output.Release.Set(); finishing.GetAwaiter().GetResult();
         Check(writer.Error == null && capture.PendingBytes == 0 && writer.QueuedBytes == 0, "bulk and motion reservations released");
         var path = Path.Combine(dir, "bulk-tail.lcr"); File.WriteAllBytes(path, output.Bytes);
         var saved = ReplayReader.Read(path);
-        Check(saved.IsComplete && saved.Worlds.Count == 1 && saved.Frames.Count == 48 && saved.Frames.Last().Time == 47, "ordered tail survives bulk compression");
+        Check(saved.IsComplete && saved.Worlds.Count == 1 && saved.Frames.Count == 3072 && saved.Frames.Last().Time == 3071, "ordered tail survives bulk compression");
     }
     finally { output.Release.Set(); }
 });
+
+static void BulkWorldTailCatchup()
+{
+    var output = new ControlledRecordingStream();
+    using var writer = new ReplayWriter(output, Header(), 64, 4L * 1024 * 1024);
+    var capture = new ReplayCaptureBuffer(writer);
+    output.Block = true;
+    try
+    {
+        var world = new WorldSnapshot { Geometry = new() { new GeometrySnapshot { Id = "bulk",
+            Vertices = new float[1200000], Triangles = new[] { 0, 1, 2 } } } };
+        Check(capture.TryWrite(new ReplayRecord { Kind = "world", World = world }), "map admitted");
+        Check(output.Entered.Wait(TimeSpan.FromSeconds(5)), "map is in flight");
+        Check(!capture.ShouldPauseCapture, "bulk mode detected");
+        for (var i = 0; i < 128; i++) Check(capture.TryWrite(Frame(i)), "motion retained during map save");
+        output.Block = false; output.Release.Set();
+        Check(SpinWait.SpinUntil(() => writer.QueuedBytes == 0, TimeSpan.FromSeconds(5)), "map completes before tail drain");
+        Check(capture.PendingCount == 128 && !capture.ShouldPauseCapture, "completed map does not cause a new sample gap");
+        var finishing = capture.CompleteAsync(); finishing.GetAwaiter().GetResult();
+        Check(capture.Error == null && writer.Error == null && writer.WrittenDuration == 127, "complete ordered tail saved");
+    }
+    finally { output.Block = false; output.Release.Set(); }
+}
 
 static void WorkerPng()
 {

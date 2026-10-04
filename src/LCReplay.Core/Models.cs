@@ -312,6 +312,8 @@ namespace LCReplay.Core
         public float ShadowDimmer { get; set; } = 1f;
         // Older recordings did not distinguish realtime from baked fixtures.
         public string BakeType { get; set; } = "";
+        public List<EnvironmentParameterSnapshot> LightPipelineParameters { get; set; } = new List<EnvironmentParameterSnapshot>();
+        public bool ShouldSerializeLightPipelineParameters() => LightPipelineParameters.Count != 0;
         public bool ShouldSerializeShadowStrength() => ShadowStrength != 1f;
         public bool ShouldSerializeLightDimmer() => LightDimmer != 1f;
         public bool ShouldSerializeShadowDimmer() => ShadowDimmer != 1f;
@@ -420,6 +422,10 @@ namespace LCReplay.Core
         public float Cutoff { get; set; } = 0.5f;
         public int RenderQueue { get; set; } = -1;
         public List<string> Keywords { get; set; } = new List<string>();
+        // Null identifies older captures or native-asset placeholders. False
+        // explicitly preserves a keyword list truncated by capture limits.
+        public bool? KeywordsComplete { get; set; }
+        public bool ShouldSerializeKeywordsComplete() => KeywordsComplete.HasValue;
         public List<MaterialPropertySnapshot> Properties { get; set; } = new List<MaterialPropertySnapshot>();
     }
 

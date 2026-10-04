@@ -27,7 +27,7 @@ namespace LCReplay.Plugin
     public sealed class ReplayPlugin : BaseUnityPlugin
     {
         public const string Guid = "io.lcreplay.recorder";
-        public const string Version = "0.25.35";
+        public const string Version = "0.25.38";
         private GUIStyle? overlayLabel;
         private GUIStyle? errorNoticeLabel;
         private ConfigEntry<bool> bones = null!, world = null!, chat = null!, disableInteriorCulling = null!, noShadow = null!, showDebugOverlay = null!, cinematicMove = null!, showFog = null!;
@@ -59,6 +59,7 @@ namespace LCReplay.Plugin
         private ArchiveSegment? segment;
         private IReadOnlyList<WorldSnapshot>? reusableWorld;
         private readonly List<Task<SaveResult>> pendingSaves = new List<Task<SaveResult>>();
+        private readonly List<Task> pendingGroupSaves = new List<Task>();
         private DayLifecycle dayLifecycle = new DayLifecycle();
         private Component? sessionRound;
         private Component? deletedLobbyRound;
@@ -122,17 +123,11 @@ namespace LCReplay.Plugin
             }
             folder = Config.Bind("Storage", "ReplayDirectory", "replays", "Absolute folder, or relative to BepInEx. Restart after changing.");
             extraTypes = Config.Bind("Compatibility", "ExtraTrackedTypes", "", "Comma-separated full Unity Component names supplied by other mods.");
-            replayResolution = Config.Bind("Playback", "RenderResolutionScale", 1f,
-                new ConfigDescription("Replay scene resolution as a fraction of the window; UI remains sharp.", new AcceptableValueRange<float>(0.25f, 1f)));
+            replayResolution = Config.Bind("Playback", "ResolutionMultiplier", 1f,
+                new ConfigDescription("Replay resolution relative to the HDLethalCompany vanilla baseline: 1 = 860x520. Independent of window size; UI stays sharp. Replaces RenderResolutionScale.",
+                    new AcceptableValueRange<float>(ReplayGraphicsDefaults.MinResolutionMultiplier, ReplayGraphicsDefaults.MaxResolutionMultiplier)));
             var playbackSettingsVersion = Config.Bind("Compatibility", "PlaybackSettingsVersion", 0,
                 "Internal playback defaults migration version.");
-            if (playbackSettingsVersion.Value < 2)
-            {
-                // Previous releases defaulted the whole replay image to half
-                // resolution. Upgrade that exact default; preserve other choices.
-                if (Math.Abs(replayResolution.Value - 0.5f) < 0.0001f) replayResolution.Value = 1f;
-                playbackSettingsVersion.Value = 2;
-            }
             replayGamma = Config.Bind("Playback", "Gamma", 1f,
                 new ConfigDescription("Replay image gamma; 1.0 is neutral.", new AcceptableValueRange<float>(0.5f, 2f)));
             disableInteriorCulling = Config.Bind("Playback", "DisableInteriorCulling", false,
@@ -141,6 +136,18 @@ namespace LCReplay.Plugin
                 "Keep outside illumination inside the facility and disable replay light shadows.");
             showFog = Config.Bind("Playback", "ShowFog", true,
                 "Render recorded HDRP fog, local fog and fog-named scenery in replay.");
+            if (playbackSettingsVersion.Value < 3)
+            {
+                // Adopt the requested vanilla baseline once. Subsequent changes
+                // in replay Settings survive reopening playback and restarting.
+                replayResolution.Value = 1f;
+                replayGamma.Value = 1f;
+                disableInteriorCulling.Value = false;
+                noShadow.Value = false;
+                showFog.Value = true;
+                playbackSettingsVersion.Value = 3;
+                Config.Save();
+            }
             cinematicMove = Config.Bind("Playback", "CinematicMove", false,
                 "Use smooth acceleration and deceleration for the replay free camera. Press C in replay to toggle.");
             cameraSpeed = Config.Bind("Playback", "CameraSpeed", 8f,
@@ -534,6 +541,14 @@ namespace LCReplay.Plugin
         }
         private void CompleteSaves()
         {
+            for (var i = pendingGroupSaves.Count - 1; i >= 0; i--)
+            {
+                var task = pendingGroupSaves[i];
+                if (!task.IsCompleted) continue;
+                pendingGroupSaves.RemoveAt(i);
+                if (task.IsFaulted) ReportCompletedSaveFailure("Archive group save failed", task.Exception!.GetBaseException());
+                RefreshArchiveIfOpen();
+            }
             for (var i = pendingSaves.Count - 1; i >= 0; i--)
             {
                 var task = pendingSaves[i];
@@ -566,14 +581,25 @@ namespace LCReplay.Plugin
         private void EndSession()
         {
             StopSegment();
-            try
-            {
-                if (day != null) archive?.EndDay(day, recordingBlocked || dayHadRecoveryGap ? "interrupted" :
-                    dayLifecycle.HasDeparted ? "saved" : "preparing");
-                if (session != null) archive?.EndSession(session);
-            }
-            catch (Exception ex) { ReportCompletedSaveFailure("Archive group save failed", ex); }
-            finally { day = null; session = null; sessionRound = null; part = 0; dayHadRecoveryGap = false; dayLifecycle = new DayLifecycle(); }
+            var closingDay = day;
+            var closingSession = session;
+            var target = archive;
+            var closingStatus = recordingBlocked || dayHadRecoveryGap ? "interrupted" :
+                dayLifecycle.HasDeparted ? "saved" : "preparing";
+            var saves = pendingSaves.ToArray();
+            // Atomic manifest publication may flush storage and retry sharing
+            // violations. Never perform those waits on the disconnect frame.
+            if (target != null && (closingDay != null || closingSession != null))
+                pendingGroupSaves.Add(Task.Run(async () =>
+                {
+                    try { await Task.WhenAll(saves).ConfigureAwait(false); }
+                    finally
+                    {
+                        if (closingDay != null) target.EndDay(closingDay, closingStatus);
+                        if (closingSession != null) target.EndSession(closingSession);
+                    }
+                }));
+            day = null; session = null; sessionRound = null; part = 0; dayHadRecoveryGap = false; dayLifecycle = new DayLifecycle();
             reusableWorld = null;
             RefreshArchiveIfOpen();
         }
@@ -661,7 +687,7 @@ namespace LCReplay.Plugin
             try
             {
                 Component? closedRound = null;
-                if (run != null && day == null && recorder == null && pendingSaves.All(save => save.IsCompleted) &&
+                if (run != null && day == null && recorder == null && pendingSaves.All(save => save.IsCompleted) && pendingGroupSaves.All(save => save.IsCompleted) &&
                     selected.Any(candidate => candidate.RunId == run.Id) &&
                     index.Runs.Where(candidate => candidate.Id == run.Id).SelectMany(candidate => candidate.Sessions)
                         .SelectMany(group => group.Days).Where(candidate => candidate.Segments.Count > 0)
@@ -1120,7 +1146,7 @@ namespace LCReplay.Plugin
             Application.quitting -= ApplicationQuitting;
             runtime?.Dispose(); runtime = null;
             EndSession();
-            try { Task.WhenAll(pendingSaves).GetAwaiter().GetResult(); CompleteSaves(); }
+            try { Task.WhenAll(pendingSaves.Cast<Task>().Concat(pendingGroupSaves)).GetAwaiter().GetResult(); CompleteSaves(); }
             catch (Exception ex) { Logger.LogError("Replay background save failed: " + ex); }
             try { if (run != null) archive?.EndRun(run); }
             catch (Exception ex) { Logger.LogError("Run metadata save failed: " + ex); }
