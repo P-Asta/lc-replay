@@ -1,3 +1,21 @@
+# 0.25.41
+
+- Rename the BepInEx plugin ID to pasta.replay. Import the previous io.lcreplay.recorder.cfg on first launch only when the new config does not exist, preserving both the old file and any existing new settings.
+
+# 0.25.40
+
+- Carry the replay free camera with the ship while inside its cabin. Preserve local camera position, ship-relative turning and smooth movement; release on leaving the cabin and avoid double movement while following a player. Keep the camera outside the disposable ship hierarchy.
+- Show the recorded turret targeting beam during charging even when native bullet effects are available. Suppress the duplicate straight ray only while the turret is actually firing; retain the native glowing bullet trails.
+- Shade the targeting beam through its soft HDR base-color texture instead of constant emission that can fill the entire line quad in installed shader variants.
+
+# 0.25.39
+
+- Share player skin positions and outline work only when both the original position and bone weights match exactly. Retain separate surface normals, tangents and topology at seams and hard edges.
+- Calculate body and outline in one worker pass and compute mesh bounds once after uploading each mesh, retaining normal renderer notifications.
+- Add an optional Windows x64 numeric skinning accelerator using the same four-influence matrix and outline equations. Validate its ABI and indices, pin arrays only during the synchronous calculation, and retain managed fallback when unavailable or incompatible. Native Unity object access remains on the main thread.
+- Cache unchanged local poses only for owned renderer clones; animated rig nodes and reparented rigid parts retain their authoritative updates. Remove the redundant second held-item placement per frame.
+- Retain the vanilla graphics baseline, native lighting/material restoration and full animation evaluation on every playback frame.
+
 # 0.25.38
 
 - Remove the camera-facing outdoor fill in normal playback and stop inventing point lights for emissive materials. Keep the explicit NoShadow visibility assist and refresh native night vision after player assets finish loading.

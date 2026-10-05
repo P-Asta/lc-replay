@@ -135,6 +135,7 @@ namespace LCReplay.Plugin.Playback
         private Vector3 _shipCabinCenter;
         private int _screenWidth, _screenHeight;
         private readonly Dictionary<string, GameObject> _geometryObjects = new Dictionary<string, GameObject>();
+        private readonly Dictionary<string, OwnedGeometryPose> _ownedGeometryPoses = new Dictionary<string, OwnedGeometryPose>(StringComparer.Ordinal);
         private readonly Dictionary<string, Renderer> _geometryRenderers = new Dictionary<string, Renderer>(StringComparer.Ordinal);
         private readonly Dictionary<string, EntitySnapshot> _frameEntities = new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
         private readonly Dictionary<string, List<GameObject>> _maskEyesObjects = new Dictionary<string, List<GameObject>>();
@@ -630,7 +631,6 @@ namespace LCReplay.Plugin.Playback
             ApplyBurstParticles();
             ApplyLines();
             UpdatePlayerBodyOcclusion();
-            ApplyHeldItemPlacement();
             foreach (var effect in _worldParticles) if (effect) { var main = effect.main; main.simulationSpeed = IsPlaying ? Speed : 0f; }
             SyncAudio();
             SyncItemImpacts();
@@ -1181,8 +1181,7 @@ namespace LCReplay.Plugin.Playback
         {
             ApplyPostProcessing();
             ApplyDaylight();
-            foreach (var anchor in _frame.Anchors)
-                if (_anchorRoots.TryGetValue(anchor.Id, out var root)) SetTransform(root, anchor.Position, anchor.Rotation, anchor.Scale);
+            ApplyAnchors();
             _inactiveEntities.Clear();
             foreach (var id in _entities.Keys) _inactiveEntities.Add(id);
             _players.Clear();
@@ -1226,6 +1225,38 @@ namespace LCReplay.Plugin.Playback
                 _visualState?.Sync(LocalTime);
             }
             ApplyMaskEffects();
+        }
+
+        private bool InShipCabin(Vector3 position)
+        {
+            if (!_shipCabinAnchor) return false;
+            var offset = _shipCabinAnchor!.InverseTransformPoint(position) - _shipCabinCenter;
+            return Mathf.Abs(offset.x) < 8.5f && Mathf.Abs(offset.y) < 4f && Mathf.Abs(offset.z) < 5.5f;
+        }
+
+        private void ApplyAnchors()
+        {
+            // Test against the old cabin pose before advancing the ship. A
+            // moving ship must not leave its free camera behind between samples.
+            // Keep the camera outside the ship hierarchy so rebuilding/unloading
+            // recorded geometry cannot destroy it or leave a stale parent.
+            var carry = !_follow && _camera && InShipCabin(_camera!.transform.position);
+            var before = carry ? _shipCabinAnchor!.localToWorldMatrix : Matrix4x4.identity;
+            var local = carry ? _shipCabinAnchor!.InverseTransformPoint(_camera!.transform.position) : Vector3.zero;
+            var oldRotation = carry ? _shipCabinAnchor!.rotation : Quaternion.identity;
+            foreach (var anchor in _frame.Anchors)
+                if (_anchorRoots.TryGetValue(anchor.Id, out var root)) SetTransform(root, anchor.Position, anchor.Rotation, anchor.Scale);
+            if (!carry || before.Equals(_shipCabinAnchor!.localToWorldMatrix)) return;
+            _camera!.transform.position = _shipCabinAnchor.TransformPoint(local);
+            var rotation = _shipCabinAnchor.rotation * Quaternion.Inverse(oldRotation);
+            var view = rotation * _camera.transform.rotation;
+            var angles = view.eulerAngles;
+            var pitch = Mathf.Clamp(Mathf.DeltaAngle(0, angles.x), -89f, 89f);
+            _lookTargetYaw += Mathf.DeltaAngle(_yaw, angles.y);
+            _lookTargetPitch = Mathf.Clamp(_lookTargetPitch + pitch - _pitch, -89f, 89f);
+            _yaw = angles.y; _pitch = pitch;
+            _camera.transform.rotation = Quaternion.Euler(_pitch, _yaw, 0);
+            _cinematicVelocity = rotation * _cinematicVelocity;
         }
 
         private bool MaskAttaching(EntitySnapshot entity)
@@ -1476,7 +1507,7 @@ namespace LCReplay.Plugin.Playback
                         if (obj.transform.parent != actor.Root.transform) obj.transform.SetParent(actor.Root.transform, false);
                         SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
                     }
-                    else if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
+                    else if (!_nativeSkinIds.Contains(pair.Key)) SetOwnedGeometryTransform(pair.Key, obj, pose.Position, pose.Rotation, pose.Scale);
                     SetActiveIfChanged(obj, pose.Active && preferredLod);
                 }
                 else
@@ -1485,7 +1516,7 @@ namespace LCReplay.Plugin.Playback
                     {
                         AttachNativeRigidPart(obj.transform, animatedPart);
                     }
-                    else if (!_nativeSkinIds.Contains(pair.Key)) SetTransform(obj.transform, baseline.Position, baseline.Rotation, baseline.Scale);
+                    else if (!_nativeSkinIds.Contains(pair.Key)) SetOwnedGeometryTransform(pair.Key, obj, baseline.Position, baseline.Rotation, baseline.Scale);
                     // Older files use complete lists: a missing ID marks a
                     // destroyed child. Sparse files store explicit tombstones.
                     var active = baseline.AttachedBonePath.Length != 0 || _sparseRendererPoses ? baseline.Active :
@@ -1560,6 +1591,26 @@ namespace LCReplay.Plugin.Playback
             displayed.localPosition = Vector3.zero;
             displayed.localRotation = Quaternion.identity;
             displayed.localScale = Vector3.one;
+        }
+
+        private struct OwnedGeometryPose
+        {
+            internal GameObject Object;
+            internal Vec3 Position, Scale;
+            internal Quat Rotation;
+        }
+
+        private void SetOwnedGeometryTransform(string id, GameObject obj, Vec3 position, Quat rotation, Vec3 scale)
+        {
+            // Only detached renderer clones use this cache. Animated native rig
+            // nodes and reparented rigid parts always take the uncached path.
+            // Moving the actor/hand ancestor does not change these local poses.
+            if (_ownedGeometryPoses.TryGetValue(id, out var previous) && ReferenceEquals(previous.Object, obj) &&
+                previous.Position.X == position.X && previous.Position.Y == position.Y && previous.Position.Z == position.Z &&
+                previous.Rotation.X == rotation.X && previous.Rotation.Y == rotation.Y && previous.Rotation.Z == rotation.Z && previous.Rotation.W == rotation.W &&
+                previous.Scale.X == scale.X && previous.Scale.Y == scale.Y && previous.Scale.Z == scale.Z) return;
+            SetTransform(obj.transform, position, rotation, scale);
+            _ownedGeometryPoses[id] = new OwnedGeometryPose { Object = obj, Position = position, Rotation = rotation, Scale = scale };
         }
 
         private void ConfigureProxy(EntityVisual visual, EntitySnapshot entity)
@@ -2910,6 +2961,7 @@ namespace LCReplay.Plugin.Playback
             _worldParticles.Clear();
             _localFogs.Clear();
             _geometryObjects.Clear();
+            _ownedGeometryPoses.Clear();
             _geometryRenderers.Clear();
             _maskEyesObjects.Clear();
             _hazardsWithModel.Clear();
@@ -3478,13 +3530,7 @@ namespace LCReplay.Plugin.Playback
                 if (RoomContains(room, position, 1f)) { indoor = true; break; }
             }
             _indoor = indoor;
-            var inShipCabin = false;
-            if (_shipCabinAnchor)
-            {
-                var cabinOffset = _shipCabinAnchor!.InverseTransformPoint(position) - _shipCabinCenter;
-                inShipCabin = Mathf.Abs(cabinOffset.x) < 8.5f && Mathf.Abs(cabinOffset.y) < 4f &&
-                    Mathf.Abs(cabinOffset.z) < 5.5f;
-            }
+            var inShipCabin = InShipCabin(position);
             foreach (var renderer in _exteriorRenderers)
                 if (renderer) renderer.forceRenderingOff = indoor;
             _assetScene?.SetIndoor(indoor);
@@ -4067,12 +4113,14 @@ namespace LCReplay.Plugin.Playback
             foreach (var id in _frameLines.Keys) _inactiveLines.Add(id);
             foreach (var pose in FrameLines())
             {
-                // turret-laser is a recorded aim ray used to orient native bullet
-                // particles, not a beam rendered by the game's turret. Drawing
-                // both adds an opaque straight stripe over the native glowing trail.
+                // Native bullets replace the recorded ray only while firing.
+                // During charging they are stopped, so hiding the aim ray just
+                // because a bullet prefab exists loses the targeting indicator.
                 if (pose.Id.StartsWith("turret-laser-", StringComparison.Ordinal) &&
                     _entities.TryGetValue(pose.Id.Substring("turret-laser-".Length), out var turret) &&
-                    turret.NativeTurret?.Bullets) continue;
+                    turret.NativeTurret?.Bullets &&
+                    _frameEntities.TryGetValue(pose.Id.Substring("turret-laser-".Length), out var turretState) &&
+                    NativeTurretEffect.IsFiring(turretState)) continue;
                 if ((pose.IsInterior ? !_indoor && !_disableInteriorCulling : _indoor) || pose.Positions.Length < 6) continue;
                 if (!_frameLines.TryGetValue(pose.Id, out var line) || !line)
                 {
@@ -4630,12 +4678,12 @@ namespace LCReplay.Plugin.Playback
                 var active = body.Source.gameObject.activeInHierarchy && body.Source.enabled;
                 SetActiveIfChanged(body.Object, active);
                 if (!active) continue;
-                body.Baker.Bake(body.Mesh, body.Object.transform);
-                var worldCenter = body.Object.transform.TransformPoint(body.Mesh.bounds.center);
                 if (body.Outline)
                 {
-                    body.Baker.BakeOutline(body.OutlineMesh, body.Object.transform, _camera!);
+                    body.Baker.BakeWithOutline(body.Mesh, body.OutlineMesh, body.Object.transform, _camera!);
                 }
+                else body.Baker.Bake(body.Mesh, body.Object.transform);
+                var worldCenter = body.Object.transform.TransformPoint(body.Mesh.bounds.center);
                 // Skin evaluation mutates an existing Mesh; HDRP can otherwise keep the
                 // original empty bounds and cull the visible body from the frame.
                 body.Renderer.bounds = new Bounds(worldCenter, Vector3.one * 4f);
@@ -4747,14 +4795,30 @@ namespace LCReplay.Plugin.Playback
             {
                 var distance = Mathf.Abs((y + .5f - 32f) / 32f);
                 var alpha = Mathf.Exp(-distance * distance * 18f) * Mathf.Clamp01((1f - distance) * 4f);
-                for (var x = 0; x < 32; x++) pixels[y * 32 + x] = new Color32(255, 255, 255, (byte)(255 * alpha));
+                // Fade radiance as well as coverage across the beam.
+                var coverage = (byte)(255 * alpha);
+                for (var x = 0; x < 32; x++) pixels[y * 32 + x] = new Color32(coverage, coverage, coverage, coverage);
             }
             _turretBeamTexture.SetPixels32(pixels); _turretBeamTexture.Apply(false, true);
             var material = CreateParticleMaterial(_turretBeamTexture, "Replay turret beam");
-            var beamColor = new Color(1f, .025f, .012f, 1f);
+            foreach (var property in new[] { "_BaseColorMap", "_UnlitColorMap", "_MainTex", "_BaseMap" })
+                if (material.HasProperty(property))
+                {
+                    material.SetTexture(property, _turretBeamTexture);
+                    material.SetTextureScale(property, Vector2.one);
+                    material.SetTextureOffset(property, Vector2.zero);
+                }
+            // Keep HDR radiance in the textured base color. Installed player
+            // shaders can omit the textured-emission variant; constant emission
+            // then fills the whole line quad instead of its soft texture.
+            if (material.HasProperty("_EmissiveColorMap")) material.SetTexture("_EmissiveColorMap", null);
+            material.DisableKeyword("_EMISSIVE_COLOR_MAP");
+            if (material.HasProperty("_UseEmissiveIntensity")) material.SetFloat("_UseEmissiveIntensity", 0f);
+            ReplayAppearance.ValidateHdrpMaterial(material);
+            var beamColor = new Color(4f, .1f, .048f, 1f);
             foreach (var property in new[] { "_UnlitColor", "_BaseColor", "_Color" })
                 if (material.HasProperty(property)) material.SetColor(property, beamColor);
-            if (material.HasProperty("_EmissiveColor")) material.SetColor("_EmissiveColor", beamColor * 4f);
+            if (material.HasProperty("_EmissiveColor")) material.SetColor("_EmissiveColor", Color.black);
             if (material.HasProperty("_CullMode")) material.SetFloat("_CullMode", (float)CullMode.Off);
             if (material.HasProperty("_Cull")) material.SetFloat("_Cull", (float)CullMode.Off);
             material.renderQueue = (int)RenderQueue.Transparent;
@@ -5209,6 +5273,7 @@ namespace LCReplay.Plugin.Playback
                 _fogGeometry.Clear();
                 _worldObjects.Clear();
                 _geometryObjects.Clear();
+                _ownedGeometryPoses.Clear();
                 _geometryRenderers.Clear();
                 _frameEntities.Clear();
                 _hazardsWithModel.Clear();

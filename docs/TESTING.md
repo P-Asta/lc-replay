@@ -1,5 +1,29 @@
 # Verification status and runtime checks
 
+## Ship free camera and turret targeting (0.25.40)
+
+- Ship camera checks cover translation, rotation, nonuniform scale, 100 stationary updates, leaving/reentering the cabin, backward ship motion and exclusion while following a player. The camera stays under its existing independent parent. The actual Offense file supplies a `ship-elevator` cabin anchor; cabin membership uses the same ship-local volume as replay interior lighting.
+- The supplied Offense Day 3 recording (`1-2.lcr`, retained under `artifacts/offense-regression-02533`) exercises Charging at 30.5 seconds, Detection at 31.9, Firing at 36.3, and a backward seek to Charging. Charging shows its recorded line with no bullet particles; Detection disables the old line; Firing retains 33 native particles and no duplicate ray. The beam uses a textured HDR base color to avoid constant emission filling its full quad.
+- Managed Release builds with zero warnings/errors; the existing 71 core, 39 archive and 6 lifecycle groups pass. Native game evidence and final renders are under `artifacts/ship-turret-02540`. Original recordings are unchanged. No new FPS target is claimed by this behavioral fix.
+
+## Same-quality playback acceleration (0.25.39)
+
+- Compare the tested 0.25.38 binaries against the final 0.25.39 binaries on the supplied Lobby-성인_마필_xoch-306cb96f553a/231/2.lcr recording. Hardware: i5-13600KF, RTX 3060. Both use 860×520, neutral gamma, fog and shadows enabled, normal interior culling, VSync off and no FPS cap. Each fixed camera samples 600 rendered frames over exactly replay 90–96 seconds, with a fixed 0.01-second replay step and matching warm-up. These are isolated fixture results, not a guarantee for every mod profile or scene.
+
+| View | 0.25.38 mean FPS | 0.25.39 mean FPS | Old → new p95 frame time |
+| --- | ---: | ---: | ---: |
+| Outside | 104.88 | 137.78 | 13.85 → 11.68 ms |
+| Close indoor view | 110.73 | 147.30 | 9.98 → 8.00 ms |
+| Furnished indoor room | 89.85 | 122.08 | 13.57 → 9.21 ms |
+
+- Furnished-room player skin CPU time falls from 3.26 to 0.98 ms/frame; viewer Tick falls from 6.67 to 4.06 ms/frame. Animation evaluation remains per frame; no fidelity or resolution reduction is part of this release. GPU timing is unavailable in this game build, so no separate GPU millisecond result is claimed. These runs do not reach 200 FPS.
+- Body and outline share identical weighted positions while preserving separate normals and tangents at seams. The optional Windows x64 C++ backend retains the same equations with precise floating-point operations. It validates the binary/struct ABI and immutable indices, uses scoped pins around joined numeric workers, and leaves Unity access/uploads on the main thread. A missing or incompatible accelerator retains managed playback.
+- Independent original-implementation fixtures cover serial, dominant-weight fallback and mixed-weight meshes, five forward/backward poses, nonuniform scale, rotation, both camera projection modes, bounds and separate/combined outline entry points. All pass within 0.00002; the native combined fixture maximum is below 0.0000002. Actual four-player skins pass the existing channel checks across 10 → 90 → 5 → 180 → 90 seconds, with errors below 0.000001. Renderer clone pose caches also pass at each seek.
+- Final runtime checks verify all four active player bakers actually used the production native backend and released every pin and native array pointer before returning. The native ABI/math test rejects five malformed requests and matches its independent reference. Core 71, archive 39 and lifecycle 6 groups pass; managed and native Release builds have zero warnings/errors. Probe-only nullable warnings are not production warnings.
+- A separate final-build run with the accelerator physically absent passes the same independent fixtures, four-player channel checks and forward/backward seeks. It confirms managed fallback is used throughout (`fallback39.log`).
+- Inspected indoor screenshots retain the baseline composition, materials and lighting. Exterior fog varies in phase between runs; pixel-identical outdoor rendering is not established. Static batching added setup/memory work without a measured gain and was not adopted. The Unity BakeMesh prototype was also not shipped; the exact numeric backend avoids its renderer-space and influence-limit differences.
+- Evidence: `artifacts/perf-02539/baseline38.log`, `final39.log`, `verified-binaries.json`, `final-*-tests.log`, `perf39-final39-*.png`; native ABI test: `tests/LCReplay.Skinning.Native.Tests/check_kernel.py`. Original recordings are unchanged.
+
 ## Native lighting and material fidelity (0.25.38)
 
 - Normal playback no longer adds the camera-relative exterior directional fill or synthetic point lights for emissive surfaces. Explicit NoShadow remains a visibility assist. Native player night vision is refreshed after its source assets load.

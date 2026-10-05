@@ -1,6 +1,6 @@
 # LC Replay
 
-LC Replay **automatically records and saves Lethal Company gameplay** and lets you watch it from a free camera through the main menu's **Replay** button or while connected to a game. The current version is the **0.25.38 development preview** for BepInEx 5.
+LC Replay **automatically records and saves Lethal Company gameplay** and lets you watch it from a free camera through the main menu's **Replay** button or while connected to a game. The current version is the **0.25.41 development preview** for BepInEx 5.
 
 New recordings reference installed moon scenery and native actor meshes, rigs and materials. They store bounded generated geometry, shader settings, world HDRP sky/fog/post-processing, lights, moving ship poses, state snapshots, transient particle/line samples and action events. Level/map/dungeon identities are stored once with the world. Player and enemy animation uses the installed Animator and IK hierarchy with changed states/parameters. Enemy visual bones, rigid model ancestors and blend-shape weights are also sampled after animation and procedural scripts, including inactive transformation forms, without a list of supported enemy classes. This covers ordinary vanilla and modded enemy rigs when their matching assets are installed; arbitrary shader deformation, runtime mesh replacement and unobserved states are not guaranteed. New default recordings do not learn player bone tracks. Game audio waveforms and voice are never recorded: playback resolves native sound clip/action identifiers against the installed game. TZP, fear and other personal screen filters are excluded. Playback uses inert scenery without executing live AI, physics or network commands. This is a state replay, not a pixel-exact video recording.
 
@@ -9,7 +9,7 @@ New recordings reference installed moon scenery and native actor meshes, rigs an
 ## Install and use
 
 1. Install **BepInEx 5** in the game or the mod-manager profile you actually launch. Previous releases were exercised with BepInEx 5.4.21 and 5.4.23.5; BepInEx 6 is not verified.
-2. Extract `artifacts/LCReplay-0.25.38.zip` and copy its `BepInEx/plugins/LCReplay` folder into that game/profile. Replace **both** `LCReplay.dll` and `LCReplay.Core.dll`, remove duplicate older copies, and restart the game.
+2. Extract `artifacts/LCReplay-0.25.41.zip` and copy its `BepInEx/plugins/LCReplay` folder into that game/profile. Copy all three files: `LCReplay.dll`, `LCReplay.Core.dll` and `LCReplay.Skinning.dll`; remove duplicate older copies and restart the game. The Windows x64 skinning accelerator is optional at runtime: an unavailable or incompatible accelerator uses the managed skinning implementation.
 3. Host or join a game. Recording starts and saves automatically without a record or save button. The top-left `AUTO REC / SAVING` indicator appears only if `Debug.ShowOverlay` is enabled.
 4. Select **Replay** below Settings on the main menu, select **Replay** in the in-game pause menu, or press **F9**. Select a run, quota and deadline recording, then **[Play]**. In-game replay takes over the local view and controls until you close it; the live session continues.
 
@@ -23,9 +23,9 @@ In-game playback blocks the game's polled action assets as well as performed cal
 
 Static ambience in new recordings uses actual source start/stop and changed gain/pitch, with native emitter positions and distance limits. Audio data is never saved. Playback no longer attaches rain, campfire or entrance sounds from generic prefab mesh/name matches or default scene templates. Older recordings lack those emitter actions, so unverified static ambience is omitted; their explicit native breaker-box fallback remains available.
 
-Files stay in the active profile's **`BepInEx/replays`** directory. Settings are created at **`BepInEx/config/io.lcreplay.recorder.cfg`**. Nothing is uploaded automatically. Recordings may contain player names and observed game state.
+Files stay in the active profile's **`BepInEx/replays`** directory. Settings are created at **`BepInEx/config/pasta.replay.cfg`**. Nothing is uploaded automatically. Recordings may contain player names and observed game state.
 
-If installing directly from a build, copy the two DLLs from `src/LCReplay.Plugin/bin/Release/netstandard2.1`. Game, Unity and BepInEx assemblies are not distributed. The game supplies Newtonsoft.Json 13.
+If installing directly from a build, copy the three DLLs from `src/LCReplay.Plugin/bin/Release/netstandard2.1`. Game, Unity and BepInEx assemblies are not distributed. The game supplies Newtonsoft.Json 13.
 
 ## Quota and deadline organization
 
@@ -151,6 +151,8 @@ powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -NoBuild
 ```
 
 If only SDK 10 is installed, add `-p:ReplayTestFramework=net10.0` to solution/test/CLI commands. The mod remains targeted at `netstandard2.1`. See [testing procedures](docs/TESTING.md) for runtime checks and the distinction between automated tests and real-game evidence.
+
+On Windows, building the plugin or solution also builds `LCReplay.Skinning.dll` into the plugin output directory and requires Visual Studio C++ x64 Build Tools. For a managed-only build without those tools, use `dotnet build LCReplay.sln -c Release -p:BuildNativeSkinning=false`; non-Windows builds skip the accelerator by default. `build-native.ps1` can also be run separately and uses precise floating-point operations and a static C++ runtime. The distributable package requires and includes the accelerator.
 
 ## Inspect and export
 

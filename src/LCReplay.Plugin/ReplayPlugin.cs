@@ -26,8 +26,8 @@ namespace LCReplay.Plugin
     [BepInDependency(ReplayBookmarkInput.InputUtilsGuid, BepInDependency.DependencyFlags.SoftDependency)]
     public sealed class ReplayPlugin : BaseUnityPlugin
     {
-        public const string Guid = "io.lcreplay.recorder";
-        public const string Version = "0.25.38";
+        public const string Guid = "pasta.replay";
+        public const string Version = "0.25.41";
         private GUIStyle? overlayLabel;
         private GUIStyle? errorNoticeLabel;
         private ConfigEntry<bool> bones = null!, world = null!, chat = null!, disableInteriorCulling = null!, noShadow = null!, showDebugOverlay = null!, cinematicMove = null!, showFog = null!;
@@ -95,6 +95,20 @@ namespace LCReplay.Plugin
 
         private void Awake()
         {
+            // Keep existing profile settings when upgrading from the old plugin ID.
+            var legacyConfigPath = Path.Combine(Paths.ConfigPath, "io.lcreplay.recorder.cfg");
+            if (!File.Exists(Config.ConfigFilePath) && File.Exists(legacyConfigPath))
+            {
+                try
+                {
+                    File.Copy(legacyConfigPath, Config.ConfigFilePath, false);
+                    Config.Reload();
+                }
+                catch (Exception exception)
+                {
+                    Logger.LogWarning($"Could not migrate legacy replay settings: {exception.Message}");
+                }
+            }
             activeInputGuard = this;
             rate = Config.Bind("Recording", "SampleRate", 10, new ConfigDescription("Automatic recording snapshots per second.", new AcceptableValueRange<int>(1, 60)));
             bones = Config.Bind("Recording", "CaptureBones", false,

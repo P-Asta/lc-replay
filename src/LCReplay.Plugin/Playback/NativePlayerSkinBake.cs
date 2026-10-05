@@ -3,6 +3,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace LCReplay.Plugin.Playback
 {
@@ -17,6 +18,8 @@ namespace LCReplay.Plugin.Playback
         private readonly Matrix4x4[] skinMatrices;
         private readonly int[] matrixIndices;
         private readonly int[] weightVertexOffsets, weightVertices, chunkMatrixOffsets;
+        private readonly int[] positionRepresentatives, positionVertexOffsets, positionVertices;
+        private readonly int[] weightPositionOffsets, weightPositions;
         private readonly bool groupedSkinChunks;
         private readonly Vector3[] vertices, normals, positions, directions;
         private readonly Vector3[] outlineNormals, outlineDirections, outlinePositions;
@@ -26,6 +29,8 @@ namespace LCReplay.Plugin.Playback
         private float outlineDepthX, outlineDepthY, outlineDepthZ, outlineDepthOffset;
         private float outlineOrthographicWidth, outlinePixelScale;
         private bool outlineOrthographic;
+        private bool bakeOutlineTogether;
+        private readonly NativeSkinKernel? nativeKernel;
         private static readonly ParallelOptions SkinWorkers = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) };
         private const int ChunkSize = 2048;
 
@@ -60,6 +65,37 @@ namespace LCReplay.Plugin.Playback
             weightVertices = new int[matrixIndices.Length];
             var writeOffsets = (int[])weightVertexOffsets.Clone();
             for (var i = 0; i < matrixIndices.Length; i++) weightVertices[writeOffsets[matrixIndices[i]]++] = i;
+            // A hard edge or UV seam can have different surface normals and
+            // tangents at the same weighted point. Its position and smoothed
+            // outline are still identical. Share only those two channels; keep
+            // every original normal/tangent and the mesh topology unchanged.
+            var pointIndices = new Dictionary<WeightedPoint, int>();
+            var pointRepresentatives = new List<int>();
+            var vertexPoints = new int[vertices.Length];
+            for (var i = 0; i < vertices.Length; i++)
+            {
+                var key = new WeightedPoint(matrixIndices[i], vertices[i]);
+                if (!pointIndices.TryGetValue(key, out var point))
+                {
+                    point = pointRepresentatives.Count;
+                    pointIndices.Add(key, point);
+                    pointRepresentatives.Add(i);
+                }
+                vertexPoints[i] = point;
+            }
+            positionRepresentatives = pointRepresentatives.ToArray();
+            positionVertexOffsets = new int[positionRepresentatives.Length + 1];
+            for (var i = 0; i < vertexPoints.Length; i++) positionVertexOffsets[vertexPoints[i] + 1]++;
+            for (var i = 1; i < positionVertexOffsets.Length; i++) positionVertexOffsets[i] += positionVertexOffsets[i - 1];
+            positionVertices = new int[vertices.Length];
+            writeOffsets = (int[])positionVertexOffsets.Clone();
+            for (var i = 0; i < vertexPoints.Length; i++) positionVertices[writeOffsets[vertexPoints[i]]++] = i;
+            weightPositionOffsets = new int[matrixWeights.Length + 1];
+            for (var i = 0; i < positionRepresentatives.Length; i++) weightPositionOffsets[matrixIndices[positionRepresentatives[i]] + 1]++;
+            for (var i = 1; i < weightPositionOffsets.Length; i++) weightPositionOffsets[i] += weightPositionOffsets[i - 1];
+            weightPositions = new int[positionRepresentatives.Length];
+            writeOffsets = (int[])weightPositionOffsets.Clone();
+            for (var i = 0; i < positionRepresentatives.Length; i++) weightPositions[writeOffsets[matrixIndices[positionRepresentatives[i]]]++] = i;
             var chunkCount = Math.Max(1, (vertices.Length + ChunkSize - 1) / ChunkSize);
             chunkMatrixOffsets = new int[chunkCount + 1];
             var totalWork = vertices.Length + matrixWeights.Length * 4;
@@ -86,24 +122,54 @@ namespace LCReplay.Plugin.Playback
             outlinePositions = new Vector3[vertices.Length];
             bakeChunk = BakeChunk;
             bakeOutlineChunk = BakeOutlineChunk;
+            nativeKernel = NativeSkinKernel.Create(matrices, skinMatrices, matrixWeights, vertices, normals, positions,
+                directions, outlineNormals, outlineDirections, outlinePositions, tangents, tangentOutput,
+                positionRepresentatives, positionVertexOffsets, positionVertices, weightPositionOffsets, weightPositions);
         }
 
         internal void Bake(Mesh target, Transform space)
+        {
+            bakeOutlineTogether = false;
+            BakeSkin(target, space);
+        }
+
+        internal void BakeWithOutline(Mesh target, Mesh outlineTarget, Transform space, Camera camera)
+        {
+            PrepareOutline(space, camera);
+            bakeOutlineTogether = true;
+            try { BakeSkin(target, space); }
+            finally { bakeOutlineTogether = false; }
+            outlineTarget.SetVertices(outlinePositions, 0, outlinePositions.Length, MeshUpdateFlags.DontRecalculateBounds);
+            outlineTarget.RecalculateBounds();
+        }
+
+        private void BakeSkin(Mesh target, Transform space)
         {
             var inverse = space.worldToLocalMatrix;
             for (var i = 0; i < bones.Length; i++) matrices[i] = inverse * bones[i].localToWorldMatrix * bind[i];
             // All Unity object access stays on the caller. Worker chunks only
             // transform owned numeric arrays, then join before mesh upload.
-            if (vertices.Length >= ChunkSize * 2 && SkinWorkers.MaxDegreeOfParallelism > 1)
+            // Native ranges share the same disjoint group partition. Pin once
+            // around the worker join, and release before any Unity mesh upload.
+            var nativeBegun = (groupedSkinChunks || vertices.Length < ChunkSize * 2 || SkinWorkers.MaxDegreeOfParallelism <= 1) &&
+                nativeKernel?.Begin(bakeOutlineTogether, outlineLocalToWorld, outlineDepthX, outlineDepthY,
+                    outlineDepthZ, outlineDepthOffset, outlineOrthographic, outlineOrthographicWidth, outlinePixelScale) == true;
+            try
             {
-                if (!groupedSkinChunks)
-                    for (var i = 0; i < matrixWeights.Length; i++) skinMatrices[i] = SkinMatrix(matrixWeights[i]);
-                Parallel.For(0, chunkMatrixOffsets.Length - 1, SkinWorkers, bakeChunk);
+                if (vertices.Length >= ChunkSize * 2 && SkinWorkers.MaxDegreeOfParallelism > 1)
+                {
+                    if (!groupedSkinChunks)
+                        for (var i = 0; i < matrixWeights.Length; i++) skinMatrices[i] = SkinMatrix(matrixWeights[i]);
+                    Parallel.For(0, chunkMatrixOffsets.Length - 1, SkinWorkers, bakeChunk);
+                }
+                else BakeWeightRange(0, matrixWeights.Length);
             }
-            else BakeWeightRange(0, matrixWeights.Length);
-            target.vertices = positions;
-            if (directions.Length != 0) target.normals = directions;
-            if (tangentOutput.Length != 0) target.tangents = tangentOutput;
+            finally { if (nativeBegun) nativeKernel!.End(); }
+            // Bounds are computed once after every channel is uploaded. Keep
+            // the normal mesh-user notifications so HDRP observes each pose.
+            target.SetVertices(positions, 0, positions.Length, MeshUpdateFlags.DontRecalculateBounds);
+            if (directions.Length != 0) target.SetNormals(directions, 0, directions.Length, MeshUpdateFlags.DontRecalculateBounds);
+            if (tangentOutput.Length != 0) target.SetTangents(tangentOutput, 0, tangentOutput.Length, MeshUpdateFlags.DontRecalculateBounds);
             target.RecalculateBounds();
         }
 
@@ -115,13 +181,29 @@ namespace LCReplay.Plugin.Playback
 
         private void BakeWeightRange(int start, int end)
         {
+            if (nativeKernel?.TryBakeRange(start, end) == true) return;
             for (var group = start; group < end; group++)
             {
                 skinMatrices[group] = SkinMatrix(matrixWeights[group]);
                 ref var matrix = ref skinMatrices[group];
-                var vertexEnd = weightVertexOffsets[group + 1];
-                for (var vertex = weightVertexOffsets[group]; vertex < vertexEnd; vertex++)
-                    BakeVertex(weightVertices[vertex], ref matrix);
+                var pointEnd = weightPositionOffsets[group + 1];
+                for (var pointIndex = weightPositionOffsets[group]; pointIndex < pointEnd; pointIndex++)
+                {
+                    var point = weightPositions[pointIndex];
+                    var representative = positionRepresentatives[point];
+                    var position = matrix.MultiplyPoint3x4(vertices[representative]);
+                    var outlineDirection = matrix.MultiplyVector(outlineNormals[representative]);
+                    var outlinePosition = bakeOutlineTogether ? OutlinePosition(position, outlineDirection) : default;
+                    var vertexEnd = positionVertexOffsets[point + 1];
+                    for (var vertex = positionVertexOffsets[point]; vertex < vertexEnd; vertex++)
+                    {
+                        var i = positionVertices[vertex];
+                        positions[i] = position;
+                        outlineDirections[i] = outlineDirection;
+                        if (bakeOutlineTogether) outlinePositions[i] = outlinePosition;
+                        BakeSurface(i, ref matrix);
+                    }
+                }
             }
         }
 
@@ -135,19 +217,36 @@ namespace LCReplay.Plugin.Playback
         private void BakeVertex(int i, ref Matrix4x4 matrix)
         {
             positions[i] = matrix.MultiplyPoint3x4(vertices[i]);
+            outlineDirections[i] = matrix.MultiplyVector(outlineNormals[i]);
+            if (bakeOutlineTogether) outlinePositions[i] = OutlinePosition(positions[i], outlineDirections[i]);
+            BakeSurface(i, ref matrix);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void BakeSurface(int i, ref Matrix4x4 matrix)
+        {
             if (directions.Length != 0) directions[i] = matrix.MultiplyVector(normals[i]).normalized;
             if (tangentOutput.Length != 0)
             {
                 var t = tangents[i]; var direction = matrix.MultiplyVector(new Vector3(t.x, t.y, t.z)).normalized;
                 tangentOutput[i] = new Vector4(direction.x, direction.y, direction.z, t.w);
             }
-            outlineDirections[i] = matrix.MultiplyVector(outlineNormals[i]);
         }
 
         // A scaled copy expands limbs away from the body center and changes the
         // silhouette when crouching. Offset along the same animated surface
         // instead, with a visible multi-pixel silhouette and a modest world-space limit.
         internal void BakeOutline(Mesh target, Transform space, Camera camera)
+        {
+            PrepareOutline(space, camera);
+            if (positions.Length >= ChunkSize * 2 && SkinWorkers.MaxDegreeOfParallelism > 1)
+                Parallel.For(0, (positions.Length + ChunkSize - 1) / ChunkSize, SkinWorkers, bakeOutlineChunk);
+            else BakeOutlineRange(0, positions.Length);
+            target.SetVertices(outlinePositions, 0, outlinePositions.Length, MeshUpdateFlags.DontRecalculateBounds);
+            target.RecalculateBounds();
+        }
+
+        private void PrepareOutline(Transform space, Camera camera)
         {
             var localToWorld = space.localToWorldMatrix;
             var view = camera.transform;
@@ -166,35 +265,39 @@ namespace LCReplay.Plugin.Playback
             outlineLocalToWorld = localToWorld;
             outlineDepthX = depthX; outlineDepthY = depthY; outlineDepthZ = depthZ; outlineDepthOffset = depthOffset;
             outlineOrthographic = orthographic; outlineOrthographicWidth = orthographicWidth; outlinePixelScale = pixelScale;
-            if (positions.Length >= ChunkSize * 2 && SkinWorkers.MaxDegreeOfParallelism > 1)
-                Parallel.For(0, (positions.Length + ChunkSize - 1) / ChunkSize, SkinWorkers, bakeOutlineChunk);
-            else BakeOutlineRange(0, positions.Length);
-            target.vertices = outlinePositions;
-            target.RecalculateBounds();
         }
 
         private void BakeOutlineChunk(int chunk) => BakeOutlineRange(chunk * ChunkSize, Math.Min(positions.Length, (chunk + 1) * ChunkSize));
 
         private void BakeOutlineRange(int start, int end)
         {
-            var localToWorld = outlineLocalToWorld;
-            var depthX = outlineDepthX; var depthY = outlineDepthY; var depthZ = outlineDepthZ; var depthOffset = outlineDepthOffset;
-            var orthographic = outlineOrthographic; var orthographicWidth = outlineOrthographicWidth; var pixelScale = outlinePixelScale;
             for (var i = start; i < end; i++)
-            {
-                var position = positions[i];
-                var depth = position.x * depthX + position.y * depthY + position.z * depthZ + depthOffset;
-                var width = Mathf.Clamp(orthographic ? orthographicWidth : depth * pixelScale, .001f, .014f);
-                var direction = outlineDirections[i];
-                var worldDirection = localToWorld.MultiplyVector(direction);
-                var length = worldDirection.magnitude;
-                // inverse(M) * normalize(M * d) = d / |M * d|.
-                // This preserves the original non-uniform-scale behavior and
-                // avoids another transform for every outline vertex.
-                var offset = length > .00001f ? width / length : 0f;
-                outlinePositions[i] = new Vector3(position.x + direction.x * offset,
-                    position.y + direction.y * offset, position.z + direction.z * offset);
-            }
+                outlinePositions[i] = OutlinePosition(positions[i], outlineDirections[i]);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Vector3 OutlinePosition(Vector3 position, Vector3 direction)
+        {
+            var depth = position.x * outlineDepthX + position.y * outlineDepthY + position.z * outlineDepthZ + outlineDepthOffset;
+            var width = Mathf.Clamp(outlineOrthographic ? outlineOrthographicWidth : depth * outlinePixelScale, .001f, .014f);
+            var worldDirection = outlineLocalToWorld.MultiplyVector(direction);
+            var length = worldDirection.magnitude;
+            // inverse(M) * normalize(M * d) = d / |M * d|.
+            // This preserves the original non-uniform-scale behavior and
+            // avoids another transform for every outline vertex.
+            var offset = length > .00001f ? width / length : 0f;
+            return new Vector3(position.x + direction.x * offset,
+                position.y + direction.y * offset, position.z + direction.z * offset);
+        }
+
+        private readonly struct WeightedPoint : IEquatable<WeightedPoint>
+        {
+            private readonly int weight;
+            private readonly Vector3 position;
+            internal WeightedPoint(int weight, Vector3 position) { this.weight = weight; this.position = position; }
+            public bool Equals(WeightedPoint other) => weight == other.weight && position.Equals(other.position);
+            public override bool Equals(object? other) => other is WeightedPoint point && Equals(point);
+            public override int GetHashCode() => unchecked(weight * 397 ^ position.GetHashCode());
         }
 
         private static Vector3[] SmoothOutlineNormals(Vector3[] vertices, Vector3[] normals)

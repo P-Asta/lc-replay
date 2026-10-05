@@ -19,4 +19,15 @@
     <Reference Include="Unity.InputSystem"><HintPath>$(GameManagedPath)/Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.Collections"><HintPath>$(GameManagedPath)/Unity.Collections.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
+  <PropertyGroup>
+    <BuildNativeSkinning Condition="'$(BuildNativeSkinning)' == '' and '$(OS)' == 'Windows_NT'">true</BuildNativeSkinning>
+    <BuildNativeSkinning Condition="'$(BuildNativeSkinning)' == ''">false</BuildNativeSkinning>
+  </PropertyGroup>
+  <Target Name="BuildNativeSkinningLibrary" AfterTargets="Build"
+          Condition="'$(BuildNativeSkinning)' == 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/build-native.ps1&quot; -Configuration &quot;$(Configuration)&quot; -OutputDirectory &quot;$(TargetDir).&quot;" />
+    <ItemGroup>
+      <FileWrites Include="$(TargetDir)LCReplay.Skinning.dll" />
+    </ItemGroup>
+  </Target>
 </Project>

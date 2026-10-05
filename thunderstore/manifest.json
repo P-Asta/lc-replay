@@ -1,0 +1,10 @@
+{
+  "name": "Replay",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/P-Asta/lc-replay",
+  "description": "Replay Game",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2305",
+    "Rune580-LethalCompany_InputUtils-0.7.13"
+  ]
+}
