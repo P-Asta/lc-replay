@@ -47,6 +47,11 @@ namespace LCReplay.Plugin.Playback
             }
         }
         private bool built;
+        private string[] recordedPaths = Array.Empty<string>();
+        private Transform[] recordedNodes = Array.Empty<Transform>();
+        private (Vec3 Position, Quat Rotation, Vec3 Scale)[] recordedValues = Array.Empty<(Vec3, Quat, Vec3)>();
+        private int recordedFrame = -1;
+        private bool recordedPoseActive;
         private readonly Dictionary<Animator, (MonoBehaviour Builder, PlayableGraph Graph, AnimatorControllerPlayable Controller, MethodInfo? Sync)> playerGraphs =
             new Dictionary<Animator, (MonoBehaviour, PlayableGraph, AnimatorControllerPlayable, MethodInfo?)>();
         private readonly SkinnedMeshRenderer[] skins;
@@ -131,6 +136,10 @@ namespace LCReplay.Plugin.Playback
                 // Animation and LOD systems can enable these again. Only the
                 // replay's own renderer copies may draw, including radar cones.
                 renderer.forceRenderingOff = true;
+                // These source skins only supply bones/blend-shape bindings.
+                // Their visible replay copies render separately. Offscreen
+                // skinning would deform an invisible duplicate every frame.
+                if (renderer is SkinnedMeshRenderer hiddenSkin) hiddenSkin.updateWhenOffscreen = false;
             }
             foreach (var collider in clone.GetComponentsInChildren<Collider>(true)) collider.enabled = false;
             foreach (var body in clone.GetComponentsInChildren<Rigidbody>(true)) { body.isKinematic = true; body.detectCollisions = false; }
@@ -268,8 +277,10 @@ namespace LCReplay.Plugin.Playback
         {
             if (!displayed || !displayed.IsChildOf(container.transform)) return;
             for (var node = displayed.parent; node && node != container.transform; node = node.parent)
-                if (!node.gameObject.activeSelf) node.gameObject.SetActive(true);
+                if (!node.gameObject.activeSelf) { node.gameObject.SetActive(true); InvalidateRecordedPose(); }
         }
+
+        internal void InvalidateRecordedPose() { recordedFrame = -1; }
 
         internal void ClearRendererBindings()
         {
@@ -363,6 +374,52 @@ namespace LCReplay.Plugin.Playback
             }
         }
 
+        internal bool TryApplyRecordedVisualPose(EntitySnapshot entity)
+        {
+            var poses = entity.Bones;
+            var changed = poses.Count != recordedPaths.Length;
+            for (var i = 0; !changed && i < poses.Count; i++)
+                changed = poses[i].Path != recordedPaths[i] || !recordedNodes[i];
+            if (changed)
+            {
+                // A different installed prefab can lack a recorded branch. Keep
+                // the existing reconstructed-bone fallback in that case.
+                foreach (var pose in poses)
+                    if (!Bones.TryGetValue(pose.Path, out var node) || !node) return false;
+                recordedPaths = new string[poses.Count]; recordedNodes = new Transform[poses.Count];
+                recordedValues = new (Vec3, Quat, Vec3)[poses.Count];
+                for (var i = 0; i < poses.Count; i++)
+                { recordedPaths[i] = poses[i].Path; recordedNodes[i] = Bones[poses[i].Path]; }
+                recordedPoseActive = false;
+            }
+            var reuse = recordedPoseActive && recordedFrame == UnityEngine.Time.frameCount - 1;
+            if (!recordedPoseActive)
+            {
+                ResetPose(); // Also freezes automatically advancing native graphs.
+                recordedPoseActive = true;
+            }
+            // OnEnable can recreate a RigBuilder graph when a cached actor is
+            // shown again. Never let it advance after the recorded pose.
+            FreezeAutomaticGraphs();
+            for (var i = 0; i < poses.Count; i++)
+            {
+                var pose = poses[i]; var node = recordedNodes[i];
+                // Only consecutive playback frames can reuse unchanged values.
+                // Seeks, hidden-branch activation, parked viewers and graph
+                // resets invalidate the cache before an authoritative rewrite.
+                var previous = recordedValues[i];
+                var p = pose.Position; var q = pose.Rotation; var s = pose.Scale;
+                if (!reuse || p.X != previous.Position.X || p.Y != previous.Position.Y || p.Z != previous.Position.Z ||
+                    q.X != previous.Rotation.X || q.Y != previous.Rotation.Y || q.Z != previous.Rotation.Z || q.W != previous.Rotation.W)
+                    node.SetLocalPositionAndRotation(new Vector3(p.X, p.Y, p.Z), new Quaternion(q.X, q.Y, q.Z, q.W));
+                if (!reuse || s.X != previous.Scale.X || s.Y != previous.Scale.Y || s.Z != previous.Scale.Z)
+                    node.localScale = new Vector3(s.X, s.Y, s.Z);
+                recordedValues[i] = (p, q, s);
+            }
+            recordedFrame = UnityEngine.Time.frameCount;
+            return true;
+        }
+
         public void Dispose()
         {
             foreach (var entry in playerGraphs.Values) if (entry.Graph.IsValid()) entry.Graph.Destroy();
@@ -413,6 +470,7 @@ namespace LCReplay.Plugin.Playback
 
         internal void ResetPose()
         {
+            recordedPoseActive = false;
             // Full bone recordings bypass animation sampling/Prepare. Native
             // Animator or RigBuilder graphs must still never advance after the
             // authoritative recorded pose has been applied.

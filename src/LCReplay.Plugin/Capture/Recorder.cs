@@ -120,6 +120,7 @@ namespace LCReplay.Plugin.Capture
             header.Capabilities.AddRange(new[] { "entity-transforms", "child-renderer-poses", "sparse-entity-renderer-poses", "primitive-game-fields", "state-transitions", "observed-method-calls", "round-state", "custom-provider-api" });
             header.Capabilities.Add("actor-animation-state-events");
             header.Capabilities.Add("enemy-visual-bone-poses");
+            header.Capabilities.Add("ship-furniture-poses");
             if (!captureBones) header.Capabilities.Add("actor-animation-parameter-events");
             if (captureBones) header.Capabilities.Add("actor-bone-poses");
             if (captureWorld) header.Capabilities.AddRange(new[] { "render-geometry-and-bounds", "embedded-render-assets",

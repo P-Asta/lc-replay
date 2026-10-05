@@ -1,5 +1,40 @@
 # Verification status and runtime checks
 
+## October 5 playback optimization (0.25.43)
+
+The 120 FPS target remains unmet in the supplied crowded recording. Final binaries were measured in the same isolated v81 fixture, on the i5-13600KF / RTX 3060, at 860×520, neutral gamma, fog and shadows on, with VSync/frame cap off. Three fixed cameras each warm up for 90 frames, then measure 600 frames over replay 411–417 seconds. The probe instruments both versions; these results do not measure live recording performance or guarantee a rate in the full mod profile.
+
+| View | 0.25.42 mean FPS | 0.25.43 mean FPS | New median / p95 frame time |
+| --- | ---: | ---: | ---: |
+| Crowd, first camera | 70.04 | 100.39 | 8.98 / 14.43 ms |
+| Crowd, second camera | 68.23 | 111.84 | 8.27 / 12.27 ms |
+| Crowd, alternate direction | 68.50 | 97.00 | 9.21 / 14.81 ms |
+
+- Evidence: `artifacts/perf-02543/release43b.log` and `release43b-binaries.json`. Earlier candidate runs varied roughly 83–103 FPS; the final run is not a 120 FPS lock. Reducing resolution, fog quality, shadow quality, static batching or replacing the player renderer did not establish a reliable additional gain. Those quality/rendering experiments are not shipped.
+- Immutable playback plans reuse interpolation bindings within a capture interval. Differential tests compare the complete sampled frame with the general sampler through forward/backward seeks, teleports, capture gaps, changing hierarchy order, inactive renderers, held items, blend shapes and particle/line fallback. Tests also cover transient inferred-vehicle entities, caller-adjusted roots, window refresh and binding-layout invalidation.
+- Native checks retain player skin/outline vertices, authoritative enemy bones, held items and owned geometry through 10 → 90 → 5 → 180 → 90 → 411 seconds. The crowded frame checks 22 enemies and 771 bone poses. A new paused park/resume check exposed Animator activation resetting a MouthDog pose; reopening now reapplies the frame and the check passes.
+- Hidden source skins no longer perform duplicate offscreen skinning; visible enemy skins retain their original update policy. Hidden dead-player animation is suspended only while its display meshes are inactive, and animation history is reset before evaluation resumes. Resolution, recorded textures, atmospheric haze and shadow settings remain unchanged.
+- Automated verification: 74 Core, 39 Archive and 6 Lifecycle groups pass (119 total); Release build has zero warnings/errors. The arbitrary two-Animator changing-form fixture also passes forward/backward replay with zero rotation error and no gameplay scripts executing.
+- Final native fixtures also pass furniture capture → file write/read → playback at 0 → 1 → 2 → 1 → 0, including repositioned children and storage visibility, plus the posterization/fog checks. Evidence: `furniture43.log`, `custom43.log`, and `effects43final.log` under the same artifact directory.
+
+## October 5 Artifice capture, furniture and appearance (0.25.42)
+
+- Supplied file: `Lobby-성인,마필-b296fdf06ba4/3725/2.lcr`, started October 5 at 17:13 KST, about 543 seconds, 5,337 frames, 57,064 events and 17 world records. Three early capture gaps of about 2.8–3.9 seconds already exist in this file; their missing observations cannot be recovered.
+- Compare 0.25.41 against 0.25.42 in the isolated v81 fixture on the same machine, at 860×520, neutral gamma, fog/shadows on, VSync/frame cap off. Each view uses the same fixed camera, 90 warm-up frames and 600 measured frames over replay 411–417 seconds. Instrumentation is present in both runs. The final version also restores native posterization and indoor fog. These measurements cover this crowded playback segment, not live recording FPS or every mod profile.
+
+| View | 0.25.41 mean FPS | 0.25.42 mean FPS | Old → new p95 frame time |
+| --- | ---: | ---: | ---: |
+| Crowd, first camera | 51.81 | 70.04 | 30.66 → 20.89 ms |
+| Crowd, second camera | 49.18 | 68.23 | 32.13 → 22.32 ms |
+| Crowd, alternate direction | 52.31 | 68.50 | 27.65 → 22.37 ms |
+
+- A separate matching capture fixture with 95 mechanisms, three renderers each and 100 samples reduces median capture CPU time from 1.053 to 0.716 ms (p95 1.902 → 1.682 ms). Renderer membership is refreshed during discovery; sampling no longer repeats hierarchy walks and debug-renderer filtering. This is a component workload measurement, not a live multiplayer FPS result. Neither test establishes 120 FPS.
+- Complete enemy visual recordings bypass redundant native controller/IK evaluation while still writing every recorded bone transform. An attempted unchanged-value cache failed after actor reactivation and was removed. The final build checks 22 enemy rigs / 771 recorded transforms in the crowded segment, including position, rotation and scale, and passes 10 → 90 → 5 → 180 → 90 → 411 second seeks. Existing native player skin and owned geometry checks also pass. The arbitrary-name, two-Animator changing-form fixture retains visibility, procedural rotations and blend shapes across backward seeks, without running gameplay scripts.
+- `AutoParentToShip` objects now receive moving furniture entity identities. The capture fixture verifies translated/rotated roots, independently moved decoration children, storage visibility and world-mesh ownership. It then saves/reads a real `.lcr` and verifies displayed positions and storage state at 0 → 1 → 2 → 1 → 0 seconds. This addresses objects moved manually by the game's ship script instead of parented under the ship. Old files without these entity poses cannot reconstruct their historical placement changes.
+- Restore the captured `FullScreen/SpongePosterizeNew` custom pass and keep HDRP fog enabled in generated interiors, where its global switch also controls local volumetrics. Inspected final mansion and ship images retain native surface grain/edge shading; the mansion regains haze similar to the user's live-game reference. The screenshot angles and frame timing differ, so pixel equality is not claimed. Missing baked lighting and arbitrary custom effect resources remain existing format limitations.
+- Managed/native Release builds pass with zero warnings/errors. Core 73, archive 39 and lifecycle 6 test groups pass (118 total). New sampler coverage checks reordered/missing bones and renderers, discrete activation, reverse seeking and source immutability.
+- Evidence: `artifacts/perf-02542/baseline41.log`, `release42.log`, `release42-binaries.json`, `verify42b.log`, `custom42.log`, `furniture-final42.log`, `capture-baseline41.log`, `capture-final42.log`, the three managed test logs, and `artifacts/animation-native-game/mansion42-release42.png` / `ship42-release42-5.png`. Original recordings remain unchanged.
+
 ## Ship free camera and turret targeting (0.25.40)
 
 - Ship camera checks cover translation, rotation, nonuniform scale, 100 stationary updates, leaving/reentering the cabin, backward ship motion and exclusion while following a player. The camera stays under its existing independent parent. The actual Offense file supplies a `ship-elevator` cabin anchor; cabin membership uses the same ship-local volume as replay interior lighting.

@@ -15,22 +15,22 @@ namespace LCReplay.Plugin.Playback
     {
         private readonly NativeReplayUi _ui;
         private readonly TextMeshProUGUI _title, _clock, _pauseLabel, _speedLabel, _cameraLabel, _detailsText, _visualLabel, _fogLabel;
-        private readonly TextMeshProUGUI _resolutionValue, _gammaValue, _cullingLabel, _noShadowLabel,
+        private readonly TextMeshProUGUI _resolutionValue, _gammaValue, _noShadowLabel,
             _cinematicLabel, _cameraSpeedValue;
         private readonly Slider _timeline;
         private readonly RectTransform _details, _players, _settings, _cameraChoices;
-        private readonly RectTransform _deathBookmark;
+        private readonly RectTransform _deathBookmark, _spawnBookmark, _enemies;
+        private bool _showEnemies;
+        private string _enemySignature = "";
         private readonly Action<double> _seek;
         private readonly List<RectTransform> _bookmarks = new List<RectTransform>();
         private RectTransform _loadingOverlay = null!, _loadingFill = null!;
         private TextMeshProUGUI _loadingText = null!;
         private readonly Slider _resolutionSlider, _gammaSlider, _cameraSpeedSlider;
         private readonly Action<string> _selectCamera;
-        private readonly Action<bool> _setDisableInteriorCulling;
         private readonly Action<bool> _setNoShadow;
         private readonly Action<bool> _setCinematicMove;
         private readonly Action<bool> _setFog;
-        private bool _disableInteriorCulling;
         private bool _noShadow;
         private bool _cinematicMove;
         private bool _fog;
@@ -45,15 +45,12 @@ namespace LCReplay.Plugin.Playback
         internal NativePlaybackHud(ReplaySession session, Action togglePause, Action<double> seek, Action cycleSpeed,
             Action<string> selectCamera, Action toggleVisuals, Action close,
             float resolutionScale, float gamma, Action<float> setResolution, Action<float> setGamma,
-            bool disableInteriorCulling, Action<bool> setDisableInteriorCulling,
             bool noShadow, Action<bool> setNoShadow,
             bool cinematicMove, Action<bool> setCinematicMove, float cameraSpeed, Action<float> setCameraSpeed,
             bool fog, Action<bool> setFog)
         {
             _seek = seek;
             _selectCamera = selectCamera;
-            _disableInteriorCulling = disableInteriorCulling;
-            _setDisableInteriorCulling = setDisableInteriorCulling;
             _noShadow = noShadow;
             _setNoShadow = setNoShadow;
             _cinematicMove = cinematicMove;
@@ -94,6 +91,9 @@ namespace LCReplay.Plugin.Playback
             _deathBookmark = _ui.CreatePanel(_timeline.transform, "Focused player death", NativeReplayUi.Orange).rectTransform;
             _deathBookmark.GetComponent<Image>().raycastTarget = false;
             _deathBookmark.gameObject.SetActive(false);
+            _spawnBookmark = _ui.CreatePanel(_timeline.transform, "Focused enemy spawn", new Color(.3f, .85f, .4f, 1f)).rectTransform;
+            _spawnBookmark.GetComponent<Image>().raycastTarget = false;
+            _spawnBookmark.gameObject.SetActive(false);
             _pauseLabel = Button(bottom.transform, "Pause", 24, 91, 205, togglePause);
             _speedLabel = Button(bottom.transform, "1x", 237, 91, 135, cycleSpeed);
             _cameraLabel = Button(bottom.transform, "Camera: Freecam", 380, 91, 420, ToggleCameraChoices);
@@ -106,14 +106,18 @@ namespace LCReplay.Plugin.Playback
             NativeReplayUi.SetRect(_details, new Vector2(1, 0), Vector2.one, new Vector2(-566, 208), new Vector2(-28, -94));
             _ui.CreateScroll(_details, "Players", out _players);
             NativeReplayUi.Place((RectTransform)_players.parent.parent, 18, 62, 502, 134);
-            Button(_details, "State", 18, 208, 150, () => { _showEvents = false; _nextUpdate = 0; });
-            Button(_details, "Events", 176, 208, 150, () => { _showEvents = true; _nextUpdate = 0; });
-            _visualLabel = Button(_details, "Labels: off", 334, 208, 186, toggleVisuals);
+            Button(_details, "State", 18, 208, 105, () => { _showEnemies = false; _showEvents = false; _nextUpdate = 0; });
+            Button(_details, "Events", 129, 208, 105, () => { _showEnemies = false; _showEvents = true; _nextUpdate = 0; });
+            Button(_details, "Enemies", 240, 208, 120, () => { _showEnemies = true; _nextUpdate = 0; });
+            _visualLabel = Button(_details, "Labels: off", 366, 208, 154, toggleVisuals);
             _ui.CreateScroll(_details, "Recorded information", out var detailContent);
             NativeReplayUi.SetRect((RectTransform)detailContent.parent.parent, Vector2.zero, Vector2.one, new Vector2(18, 18), new Vector2(-18, -269));
             _detailsText = _ui.CreateText(detailContent, "", 21);
             NativeReplayUi.SetRect(_detailsText.rectTransform, new Vector2(0, 1), Vector2.one, new Vector2(0, -1800), Vector2.zero);
             detailContent.sizeDelta = new Vector2(0, 1800);
+            _ui.CreateScroll(_details, "All enemies", out _enemies);
+            NativeReplayUi.SetRect((RectTransform)_enemies.parent.parent, Vector2.zero, Vector2.one, new Vector2(18, 18), new Vector2(-18, -269));
+            _enemies.parent.parent.gameObject.SetActive(false);
             _details.gameObject.SetActive(false);
 
             _settings = _ui.CreateWindow(Root.transform, "Replay settings", "Replay Settings", 52);
@@ -121,7 +125,7 @@ namespace LCReplay.Plugin.Playback
             var settingsScroll = _ui.CreateScroll(_settings, "Settings controls", out var settingsContent);
             NativeReplayUi.SetRect((RectTransform)settingsScroll.transform, Vector2.zero, Vector2.one,
                 new Vector2(0, 14), new Vector2(0, -62));
-            settingsContent.sizeDelta = new Vector2(0, 578);
+            settingsContent.sizeDelta = new Vector2(0, 526);
             var resolutionTitle = _ui.CreateText(settingsContent, "Resolution (1x = vanilla)", 23);
             NativeReplayUi.Place(resolutionTitle.rectTransform, 18, 70, 320, 38);
             _resolutionValue = _ui.CreateText(settingsContent, "", 22, alignment: TextAlignmentOptions.MidlineRight);
@@ -135,20 +139,18 @@ namespace LCReplay.Plugin.Playback
             NativeReplayUi.Place(_gammaValue.rectTransform, 330, 160, 188, 38);
             _gammaSlider = _ui.CreateSlider(settingsContent, "Gamma", .5f, 2f, gamma, setGamma);
             NativeReplayUi.Place((RectTransform)_gammaSlider.transform, 18, 198, 500, 42);
-            _cullingLabel = Button(settingsContent, "", 18, 258, 500, ToggleInteriorCulling);
-            UpdateCullingLabel();
-            _noShadowLabel = Button(settingsContent, "", 18, 310, 500, ToggleNoShadow);
+            _noShadowLabel = Button(settingsContent, "", 18, 258, 500, ToggleNoShadow);
             UpdateNoShadowLabel();
-            _cinematicLabel = Button(settingsContent, "", 18, 362, 500, ToggleCinematicMove);
+            _cinematicLabel = Button(settingsContent, "", 18, 310, 500, ToggleCinematicMove);
             SetCinematicMove(cinematicMove);
-            _fogLabel = Button(settingsContent, "", 18, 505, 500, ToggleFog);
+            _fogLabel = Button(settingsContent, "", 18, 453, 500, ToggleFog);
             UpdateFogLabel();
             var cameraSpeedTitle = _ui.CreateText(settingsContent, "Camera speed", 23);
-            NativeReplayUi.Place(cameraSpeedTitle.rectTransform, 18, 415, 320, 38);
+            NativeReplayUi.Place(cameraSpeedTitle.rectTransform, 18, 363, 320, 38);
             _cameraSpeedValue = _ui.CreateText(settingsContent, "", 22, alignment: TextAlignmentOptions.MidlineRight);
-            NativeReplayUi.Place(_cameraSpeedValue.rectTransform, 330, 415, 188, 38);
+            NativeReplayUi.Place(_cameraSpeedValue.rectTransform, 330, 363, 188, 38);
             _cameraSpeedSlider = _ui.CreateSlider(settingsContent, "Camera speed", 1f, 30f, cameraSpeed, setCameraSpeed);
-            NativeReplayUi.Place((RectTransform)_cameraSpeedSlider.transform, 18, 451, 500, 42);
+            NativeReplayUi.Place((RectTransform)_cameraSpeedSlider.transform, 18, 399, 500, 42);
             _settings.gameObject.SetActive(false);
             _loadingOverlay = _ui.CreateWindow(Root.transform, "Replay loading", "Loading Replay", 48);
             NativeReplayUi.SetRect(_loadingOverlay, new Vector2(.5f, .5f), new Vector2(.5f, .5f),
@@ -213,16 +215,6 @@ namespace LCReplay.Plugin.Playback
 
         private void UpdateFogLabel() => _fogLabel.text = _fog ? "[x] Fog / Fake Fog" : "[ ] Fog / Fake Fog";
 
-        private void ToggleInteriorCulling()
-        {
-            _disableInteriorCulling = !_disableInteriorCulling;
-            UpdateCullingLabel();
-            _setDisableInteriorCulling(_disableInteriorCulling);
-        }
-
-        private void UpdateCullingLabel() => _cullingLabel.text =
-            _disableInteriorCulling ? "[x] Disable culling" : "[ ] Disable culling";
-
         private void ToggleNoShadow()
         {
             _noShadow = !_noShadow;
@@ -268,7 +260,8 @@ namespace LCReplay.Plugin.Playback
         internal void Update(ReplaySession session, ReplayFrame frame, IReadOnlyList<EntitySnapshot> players, string selectedId,
             string scene, double time, bool playing, float speed, bool follow, bool diagnostics,
             double? totalDuration = null, double localTime = 0, bool buffering = false, double? deathTime = null,
-            string? focusName = null)
+            string? focusName = null, IReadOnlyList<ReplayEnemyLife>? enemies = null, double? spawnTime = null,
+            Action<ReplayEnemyLife, bool>? selectEnemy = null, string enemyStatus = "")
         {
             if (UnityEngine.Time.unscaledTime < _nextUpdate) return;
             _nextUpdate = UnityEngine.Time.unscaledTime + 0.1f;
@@ -291,6 +284,12 @@ namespace LCReplay.Plugin.Playback
                 NativeReplayUi.SetRect(_deathBookmark, new Vector2((float)Math.Max(0, Math.Min(1, deathTime.Value / duration)), .5f),
                     new Vector2((float)Math.Max(0, Math.Min(1, deathTime.Value / duration)), .5f),
                     new Vector2(-3, -17), new Vector2(3, 17));
+            _spawnBookmark.gameObject.SetActive(spawnTime.HasValue);
+            if (spawnTime.HasValue)
+            {
+                var anchor = new Vector2((float)Math.Max(0, Math.Min(1, spawnTime.Value / duration)), .5f);
+                NativeReplayUi.SetRect(_spawnBookmark, anchor, anchor, new Vector2(-3, -17), new Vector2(3, 17));
+            }
             _pauseLabel.text = playing ? "Pause" : "Play";
             _speedLabel.text = speed.ToString("0.##", CultureInfo.InvariantCulture) + "x";
             var player = players.FirstOrDefault(value => value.Id == selectedId);
@@ -347,7 +346,34 @@ namespace LCReplay.Plugin.Playback
                 }
                 _players.sizeDelta = new Vector2(0, y);
             }
-            if (_showEvents)
+            _enemies.parent.parent.gameObject.SetActive(_showEnemies);
+            _detailsText.transform.parent.parent.parent.gameObject.SetActive(!_showEnemies);
+            if (_showEnemies)
+            {
+                var enemySignature = enemyStatus + string.Join("|", (enemies ?? Array.Empty<ReplayEnemyLife>()).Select(life =>
+                    life.EntityId + ":" + life.SpawnTime + ":" + life.DeathTime));
+                if (_enemySignature != enemySignature || _enemies.childCount == 0)
+                {
+                    _enemySignature = enemySignature;
+                    NativeReplayUi.Clear(_enemies);
+                    var y = 0f;
+                    var note = _ui.CreateText(_enemies, enemyStatus.Length != 0 ? enemyStatus :
+                        "Green: spawn / Orange: death\nSpawn = first recorded appearance", 18);
+                    NativeReplayUi.Place(note.rectTransform, 0, y, 475, 52); y += 58;
+                    foreach (var life in enemies ?? Array.Empty<ReplayEnemyLife>())
+                    {
+                        var title = _ui.CreateText(_enemies, life.Name + "  [" + life.EntityId + "]", 20);
+                        NativeReplayUi.Place(title.rectTransform, 0, y, 475, 30); y += 32;
+                        Button(_enemies, "Spawn " + Stamp(life.SpawnTime), 0, y, 230, () => selectEnemy?.Invoke(life, false));
+                        var death = Button(_enemies, life.DeathTime.HasValue ? "Death " + Stamp(life.DeathTime.Value) : "No death recorded",
+                            238, y, 237, () => selectEnemy?.Invoke(life, true));
+                        death.transform.parent.GetComponent<Button>().interactable = life.DeathTime.HasValue;
+                        y += 50;
+                    }
+                    _enemies.sizeDelta = new Vector2(0, y);
+                }
+            }
+            else if (_showEvents)
                 _detailsText.text = string.Join("\n\n", session.Events.Where(value => value.Time <= localTime).Reverse().Take(30)
                     .Select(value => Stamp(Math.Max(0, time - localTime) + value.Time) + "  " + value.Category + " / " + value.Name));
             else

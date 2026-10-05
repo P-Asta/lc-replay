@@ -80,6 +80,9 @@ namespace LCReplay.Plugin.Playback
         private readonly List<InstancedGeometry> _instancedGeometry = new List<InstancedGeometry>();
         private readonly List<Renderer> _proceduralGrassRenderers = new List<Renderer>();
         private readonly List<ParticleSystem> _worldParticles = new List<ParticleSystem>();
+        private int _particleSpeedCount = -1;
+        private float _particleSpeed = float.NaN;
+        private bool _emptyParticleFrameApplied;
         private readonly Dictionary<string, GeometrySnapshot> _renderGeometrySources = new Dictionary<string, GeometrySnapshot>();
         private readonly List<KeyValuePair<Renderer, string>> _interiorRenderers = new List<KeyValuePair<Renderer, string>>();
         private readonly List<Renderer> _exteriorRenderers = new List<Renderer>();
@@ -119,7 +122,14 @@ namespace LCReplay.Plugin.Playback
         private RawImage? _displayImage;
         private float _resolutionScale;
         private float _gamma;
-        private bool _disableInteriorCulling;
+        private const bool _disableInteriorCulling = true;
+        private bool _initialFocusPending = true;
+        private List<ReplayEnemyLife> _enemyHistory = new List<ReplayEnemyLife>();
+        private Task<List<ReplayEnemyLife>>? _enemyHistoryLoad;
+        private ReplayEnemyLife? _bookmarkedEnemy;
+        private ReplayEnemyLife? _pendingEnemyFocus;
+        private bool _pendingEnemyDeath;
+        private bool _enemyHistoryFailed;
         private bool _mutePlayerAudio;
         private bool _fogEnabled = true;
         private bool _appliedFogVisible = true;
@@ -128,7 +138,6 @@ namespace LCReplay.Plugin.Playback
         private readonly Dictionary<Light, LightShadows> _nativeShadowModes = new Dictionary<Light, LightShadows>();
         private readonly Action<float>? _saveResolution;
         private readonly Action<float>? _saveGamma;
-        private readonly Action<bool>? _saveDisableInteriorCulling;
         private readonly Action<bool>? _saveMutePlayerAudio;
         private readonly Action<bool>? _saveFogEnabled;
         private Transform? _shipCabinAnchor;
@@ -136,6 +145,9 @@ namespace LCReplay.Plugin.Playback
         private int _screenWidth, _screenHeight;
         private readonly Dictionary<string, GameObject> _geometryObjects = new Dictionary<string, GameObject>();
         private readonly Dictionary<string, OwnedGeometryPose> _ownedGeometryPoses = new Dictionary<string, OwnedGeometryPose>(StringComparer.Ordinal);
+        private readonly List<DynamicRendererBinding> _dynamicRendererBindings = new List<DynamicRendererBinding>();
+        private int _dynamicRendererBindingCount = -1;
+        private long _rendererPoseLayout = -1;
         private readonly Dictionary<string, Renderer> _geometryRenderers = new Dictionary<string, Renderer>(StringComparer.Ordinal);
         private readonly Dictionary<string, EntitySnapshot> _frameEntities = new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
         private readonly Dictionary<string, List<GameObject>> _maskEyesObjects = new Dictionary<string, List<GameObject>>();
@@ -274,11 +286,10 @@ namespace LCReplay.Plugin.Playback
 
         public ReplayViewer(ReplaySession session, ReplayRecordingTimeline? recording = null, int partIndex = 0,
             float resolutionScale = 1f, float gamma = 1f, Action<float>? saveResolution = null, Action<float>? saveGamma = null)
-            : this(session, recording, partIndex, resolutionScale, gamma, saveResolution, saveGamma, false, null, false, null) { }
+            : this(session, recording, partIndex, resolutionScale, gamma, saveResolution, saveGamma, false, null) { }
 
         public ReplayViewer(ReplaySession session, ReplayRecordingTimeline? recording, int partIndex,
             float resolutionScale, float gamma, Action<float>? saveResolution, Action<float>? saveGamma,
-            bool disableInteriorCulling, Action<bool>? saveDisableInteriorCulling,
             bool mutePlayerAudio, Action<bool>? saveMutePlayerAudio,
             bool cinematicMove = false, float cameraSpeed = 8f,
             Action<bool>? saveCinematicMove = null, Action<float>? saveCameraSpeed = null,
@@ -309,6 +320,18 @@ namespace LCReplay.Plugin.Playback
                         .Select(death => new ReplayPlayerDeath { Time = death.Time + offset,
                             EntityId = death.EntityId, Name = death.Name, Position = death.Position });
                 }).OrderBy(death => death.Time).ToList(), _playerDeathCancellation.Token);
+            _enemyHistory.AddRange(EnemyHistoryInSession(session, _recording.Parts[Math.Max(0, Math.Min(_recording.Parts.Count - 1, partIndex))].Offset));
+            if (deathSources.Length != 0)
+                _enemyHistoryLoad = Task.Run(() => deathSources.SelectMany(part =>
+                {
+                    var offset = part.Offset - part.Window!.Start;
+                    return ReplayReader.ReadEnemyHistory(part.Window.Index, _playerDeathCancellation.Token).Select(life =>
+                    {
+                        life.SpawnTime += offset;
+                        if (life.DeathTime.HasValue) life.DeathTime += offset;
+                        return life;
+                    });
+                }).OrderBy(life => life.SpawnTime).ToList(), _playerDeathCancellation.Token);
             _partIndex = Math.Max(0, Math.Min(_recording.Parts.Count - 1, partIndex));
             AlignLandingMap(_session, _partIndex);
             _hasRendererPoseCapability = session.Header.Capabilities.Contains("child-renderer-poses");
@@ -317,13 +340,11 @@ namespace LCReplay.Plugin.Playback
             _savedCursorVisible = Cursor.visible;
             _resolutionScale = Mathf.Clamp(resolutionScale, 0.25f, 4.5f);
             _gamma = Mathf.Clamp(gamma, 0.5f, 2f);
-            _disableInteriorCulling = disableInteriorCulling;
             _mutePlayerAudio = mutePlayerAudio;
             _fogEnabled = fogEnabled;
             _saveFogEnabled = saveFogEnabled;
             _saveResolution = saveResolution;
             _saveGamma = saveGamma;
-            _saveDisableInteriorCulling = saveDisableInteriorCulling;
             _saveMutePlayerAudio = saveMutePlayerAudio;
             _cinematicMove = cinematicMove;
             _cameraSpeed = Mathf.Clamp(cameraSpeed, 1f, 30f);
@@ -395,16 +416,9 @@ namespace LCReplay.Plugin.Playback
                 Seek(_recording.Parts[_partIndex].Offset);
                 PreloadNextMap();
                 RebuildAudio();
-                if (_players.Count != 0) { _selectedId = _players[0].Id; Focus(_players[0]); }
-                else
-                {
-                    var visible = _frame.Entities.FirstOrDefault(entity => entity.Active && IsVisualKind(entity.Kind));
-                    if (visible != null) Focus(visible);
-                }
                 _hud = new NativePlaybackHud(session, TogglePause, SeekFromHud, CycleSpeed,
                     SelectCamera, ToggleDiagnostics, () => CloseRequested = true,
                     _resolutionScale, _gamma, SetResolutionScale, SetGamma,
-                    _disableInteriorCulling, SetDisableInteriorCulling,
                     _noShadow, SetNoShadow,
                     _cinematicMove, SetCinematicMove, _cameraSpeed, SetCameraSpeed,
                     _fogEnabled, SetFogEnabled);
@@ -429,6 +443,12 @@ namespace LCReplay.Plugin.Playback
         {
             if (_disposed || _parked || _camera == null) return;
             CompletePlayerDeaths();
+            if (_enemyHistoryLoad != null && _enemyHistoryLoad.IsCompleted)
+            {
+                if (_enemyHistoryLoad.IsCompletedSuccessfully) _enemyHistory = _enemyHistoryLoad.Result;
+                else { _ = _enemyHistoryLoad.Exception; _enemyHistoryFailed = true; }
+                _enemyHistoryLoad = null;
+            }
             if (ReplayInput.WasPressed("L")) ToggleReplayUi();
             if (Screen.width != _screenWidth || Screen.height != _screenHeight) ResizeDisplay();
             var hudSeekApplied = false;
@@ -631,7 +651,12 @@ namespace LCReplay.Plugin.Playback
             ApplyBurstParticles();
             ApplyLines();
             UpdatePlayerBodyOcclusion();
-            foreach (var effect in _worldParticles) if (effect) { var main = effect.main; main.simulationSpeed = IsPlaying ? Speed : 0f; }
+            var particleSpeed = IsPlaying ? Speed : 0f;
+            if (_particleSpeed != particleSpeed || _particleSpeedCount != _worldParticles.Count)
+            {
+                foreach (var effect in _worldParticles) if (effect) { var main = effect.main; main.simulationSpeed = particleSpeed; }
+                _particleSpeed = particleSpeed; _particleSpeedCount = _worldParticles.Count;
+            }
             SyncAudio();
             SyncItemImpacts();
             if (_nativeSounds != null) _nativeSounds.ListenerPosition = _preserveLiveAudio && _liveListener
@@ -639,9 +664,28 @@ namespace LCReplay.Plugin.Playback
             _nativeSounds?.Sync(LocalTime, IsPlaying && !IsBuffering, Speed, _mutePlayerAudio,
                 ResolveSoundParent,
                 id => _audioEntities.TryGetValue(id, out var entity) ? entity : null);
+            if (_pendingEnemyFocus != null && !IsBuffering && !_pendingHudSeek.HasValue)
+            {
+                var pending = _pendingEnemyFocus;
+                _pendingEnemyFocus = null;
+                if (_pendingEnemyDeath && _camera != null)
+                {
+                    _camera.transform.position = ToVector(pending.DeathPosition) + Vector3.up * .9f - _camera.transform.forward * 2.5f;
+                    UpdateInteriorVisibility();
+                }
+                else SelectCamera(pending.EntityId);
+            }
+            if (_initialFocusPending && !IsBuffering)
+            {
+                var target = _frame.Entities.FirstOrDefault(entity => entity.Active && entity.Kind == "player" && !IsUnavailableTarget(entity)) ??
+                    _frame.Entities.FirstOrDefault(entity => entity.Active && entity.Kind == "enemy" && !IsUnavailableTarget(entity));
+                if (target != null) { SelectCamera(target.Id); _initialFocusPending = false; }
+            }
             _hud?.Update(_session, _frame, _players, _selectedId, _sceneName, Time, IsPlaying, Speed, _follow, _showSkeletons,
                 Duration, LocalTime, IsBuffering && _showWorldLoading, DeathBookmarkTime(),
-                _follow && SelectedPlayer() == null ? SelectedTarget()?.Name : null);
+                _follow && SelectedPlayer() == null ? SelectedTarget()?.Name : null,
+                _enemyHistory, SelectedEnemyLife()?.SpawnTime, SelectEnemyHistory,
+                _enemyHistoryLoad != null ? "Loading enemy history..." : _enemyHistoryFailed ? "Enemy history could not be fully loaded." : "");
         }
 
         private void SeekFromHud(double time)
@@ -1189,21 +1233,51 @@ namespace LCReplay.Plugin.Playback
             {
                 var visual = GetEntity(entity.Id);
                 _inactiveEntities.Remove(entity.Id);
+                if (visual.NativeRig != null && (!visual.Root.activeSelf || visual.AnimationSeekGeneration != _animationSeekGeneration))
+                    visual.NativeRig.InvalidateRecordedPose();
                 SetActiveIfChanged(visual.Root, entity.Active && IsVisualKind(entity.Kind));
                 if (!entity.PoseFromItemEvents || !ApplyItemMotion(visual, entity.Id, LocalTime))
-                    SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
+                    SetEntityTransform(visual, entity.Position, entity.Rotation, entity.Scale);
                 ConfigureProxy(visual, entity);
                 ConfigureSwarm(visual, entity);
-                if (!double.IsNaN(visual.LastAnimationTime) &&
+                // Death bodies have their own recorded entities. Do not keep
+                // evaluating the hidden living-player controller and IK rig.
+                // A visible custom attachment or diagnostics retains evaluation.
+                if (visual.NativeRig != null && entity.Kind == "player" && IsDead(entity) &&
+                    !_showSkeletons && _worldBuild == null && _entityGeometryRenderers.TryGetValue(entity.Id, out var playerMeshes) &&
+                    !playerMeshes.Any(renderer => renderer && renderer.enabled && renderer.gameObject.activeInHierarchy))
+                {
+                    visual.AnimationSuspended = true;
+                    if (entity.Active) _players.Add(entity);
+                    continue;
+                }
+                if (visual.AnimationSuspended)
+                {
+                    visual.NativeRig?.ResetAnimationHistory();
+                    visual.AnimationSuspended = false;
+                }
+                // Complete enemy visual samples are the final Animator/IK output.
+                // Evaluating every native controller first only overwrites those
+                // same transforms, then immediately replaces them again.
+                var recordedVisual = visual.NativeRig != null && entity.Kind == "enemy" && entity.Bones.Count != 0 &&
+                    _session.Header.Capabilities.Contains("enemy-visual-bone-poses") && !entity.State.ContainsKey("$omittedBones") &&
+                    visual.NativeRig.TryApplyRecordedVisualPose(entity);
+                if (!recordedVisual && !double.IsNaN(visual.LastAnimationTime) &&
                     (visual.AnimationSeekGeneration != _animationSeekGeneration || Time + .000001 < visual.LastAnimationTime))
                     visual.NativeRig?.ResetAnimationHistory();
                 visual.AnimationSeekGeneration = _animationSeekGeneration;
                 visual.LastAnimationTime = Time;
+                if (recordedVisual)
+                {
+                    if (_showSkeletons || visual.Skeleton != null) UpdateBones(visual, entity.Bones);
+                    visual.NativeRig!.ApplyBlendShapes(entity);
+                    continue;
+                }
                 visual.NativeRig?.ResetPose();
                 visual.NativeRig?.ApplyView(entity.ViewRotation);
-                if (!_session.Header.Capabilities.Contains("actor-bone-poses"))
+                if (!_session.Header.Capabilities.Contains("actor-bone-poses") && _animationPaths.ContainsKey(entity.Id))
                     ApplyAnimation(visual, entity.Id, LocalTime);
-                UpdateBones(visual, entity.Bones);
+                if (entity.Bones.Count != 0 || visual.Skeleton != null) UpdateBones(visual, entity.Bones);
                 visual.NativeRig?.ApplyPlayerState(entity);
                 visual.NativeRig?.Evaluate();
                 if (visual.NativeRig != null)
@@ -1330,7 +1404,10 @@ namespace LCReplay.Plugin.Playback
                 var position = selected!.position + selected.rotation * positionOffset;
                 var rotation = selected.rotation * rotationOffset;
                 if (GameAccess.Finite(position) && GameAccess.Finite(rotation))
-                    itemVisual.Root.transform.SetPositionAndRotation(position, rotation);
+                {
+                    itemVisual.RootPoseValid = false;
+                    itemVisual.RootTransform.SetPositionAndRotation(position, rotation);
+                }
             }
             // The local game's held object follows LocalItemHolder on the
             // first-person rig. Remote objects follow ServerItemHolder on the
@@ -1374,7 +1451,7 @@ namespace LCReplay.Plugin.Playback
                 {
                     // Restore the captured view-model pose immediately when
                     // the camera crosses from follow into first person.
-                    SetTransform(itemVisual.Root.transform, item.Position, item.Rotation, item.Scale);
+                    SetEntityTransform(itemVisual, item.Position, item.Rotation, item.Scale);
                     continue;
                 }
                 if (!TryHeldItemPose(item, out var positionOffset, out var rotationOffset) ||
@@ -1402,7 +1479,10 @@ namespace LCReplay.Plugin.Playback
                     hand.TransformPoint(holderPosition) + hand.rotation * positionOffset;
                 var targetRotation = (nativeHolder ? nativeHolder!.rotation : hand.rotation) * rotationOffset;
                 if (GameAccess.Finite(targetPosition) && GameAccess.Finite(targetRotation))
-                    itemVisual.Root.transform.SetPositionAndRotation(targetPosition, targetRotation);
+                {
+                    itemVisual.RootPoseValid = false;
+                    itemVisual.RootTransform.SetPositionAndRotation(targetPosition, targetRotation);
+                }
             }
         }
 
@@ -1465,58 +1545,84 @@ namespace LCReplay.Plugin.Playback
 
         private void ApplyRendererPoses()
         {
-            _completeRendererLists.Clear();
-            _currentRendererPoses.Clear();
-            _currentSceneRendererPoses.Clear();
-            _frameEntities.Clear();
-            foreach (var entity in _frame.Entities)
+            if (_dynamicRendererBindingCount != _dynamicGeometry.Count)
             {
-                _frameEntities[entity.Id] = entity;
-                if (!_sparseRendererPoses && (_hasRendererPoseCapability || entity.Renderers.Count != 0) &&
-                    !entity.State.ContainsKey("$omittedRenderers"))
-                    _completeRendererLists.Add(entity.Id);
-                foreach (var pose in entity.Renderers)
-                    if (_dynamicGeometry.TryGetValue(pose.Id, out var geometry) && geometry.EntityId == entity.Id)
-                        _currentRendererPoses[pose.Id] = pose;
+                _rendererPoseLayout = -1;
+                _dynamicRendererBindings.Clear();
+                foreach (var pair in _dynamicGeometry)
+                {
+                    if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || !obj) continue;
+                    _entities.TryGetValue(pair.Value.EntityId, out var actor);
+                    var rigid = _nativeRigidParts.TryGetValue(pair.Key, out var native);
+                    _dynamicRendererBindings.Add(new DynamicRendererBinding {
+                        Pair = pair, Object = obj, Actor = actor, HasNativePart = rigid,
+                        NativePart = native, NativeSkin = _nativeSkinIds.Contains(pair.Key), Active = obj.activeSelf
+                    });
+                }
+                _dynamicRendererBindingCount = _dynamicGeometry.Count;
             }
-            foreach (var pose in _frame.SceneRenderers)
-                _currentSceneRendererPoses[pose.Id] = pose;
+            if (_rendererPoseLayout != _sampler.PoseLayoutVersion)
+            {
+                _rendererPoseLayout = _sampler.PoseLayoutVersion;
+                _completeRendererLists.Clear();
+                _currentRendererPoses.Clear();
+                _currentSceneRendererPoses.Clear();
+                _frameEntities.Clear();
+                foreach (var entity in _frame.Entities)
+                {
+                    _frameEntities[entity.Id] = entity;
+                    if (!_sparseRendererPoses && (_hasRendererPoseCapability || entity.Renderers.Count != 0) &&
+                        !entity.State.ContainsKey("$omittedRenderers"))
+                        _completeRendererLists.Add(entity.Id);
+                    foreach (var pose in entity.Renderers)
+                        if (_dynamicGeometry.TryGetValue(pose.Id, out var geometry) && geometry.EntityId == entity.Id)
+                            _currentRendererPoses[pose.Id] = pose;
+                }
+                foreach (var pose in _frame.SceneRenderers)
+                    _currentSceneRendererPoses[pose.Id] = pose;
+                foreach (var binding in _dynamicRendererBindings)
+                {
+                    _currentRendererPoses.TryGetValue(binding.Pair.Key, out binding.Pose);
+                    binding.PreferredLod = binding.Actor?.NativeRig?.IsPreferredLod(binding.Pair.Key) ?? true;
+                }
+            }
             // Apply each renderer's final state once. Resetting all to the snapshot
             // first toggled active geometry twice on every playback frame.
-            foreach (var pair in _dynamicGeometry)
+            foreach (var binding in _dynamicRendererBindings)
             {
-                if (!_geometryObjects.TryGetValue(pair.Key, out var obj) || obj == null) continue;
+                var pair = binding.Pair; var obj = binding.Object;
                 var baseline = pair.Value;
-                _entities.TryGetValue(baseline.EntityId, out var actor);
-                var preferredLod = actor?.NativeRig?.IsPreferredLod(pair.Key) ?? true;
-                if (_currentRendererPoses.TryGetValue(pair.Key, out var pose))
+                var actor = binding.Actor;
+                var preferredLod = binding.PreferredLod;
+                var pose = binding.Pose;
+                if (pose != null)
                 {
-                    if (_nativeRigidParts.TryGetValue(pair.Key, out var nativePart) && nativePart && actor?.Kind == "enemy")
+                    if (binding.HasNativePart && binding.NativePart && actor?.Kind == "enemy")
                     {
                         // Flattened renderer snapshots in old files can describe
                         // a different animation phase from the reconstructed skin.
                         // Keep attached eyes/jaws on the same evaluated hierarchy.
                         // New captures already apply procedural local bone poses
                         // to this hierarchy after the Animator has evaluated.
-                        AttachNativeRigidPart(obj.transform, nativePart);
+                        AttachNativeRigidPart(obj.transform, binding.NativePart!);
                     }
-                    else if (_nativeRigidParts.ContainsKey(pair.Key) && actor != null)
+                    else if (binding.HasNativePart && actor != null)
                     {
                         // Runtime-driven head/face movement is authoritative
                         // when the recorder sampled it outside the Animator.
                         if (obj.transform.parent != actor.Root.transform) obj.transform.SetParent(actor.Root.transform, false);
                         SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale);
                     }
-                    else if (!_nativeSkinIds.Contains(pair.Key)) SetOwnedGeometryTransform(pair.Key, obj, pose.Position, pose.Rotation, pose.Scale);
-                    SetActiveIfChanged(obj, pose.Active && preferredLod);
+                    else if (!binding.NativeSkin) SetOwnedGeometryTransform(pair.Key, obj, pose.Position, pose.Rotation, pose.Scale);
+                    binding.SetActive(pose.Active && preferredLod);
                 }
                 else
                 {
-                    if (_nativeRigidParts.TryGetValue(pair.Key, out var animatedPart) && animatedPart)
+                    if (binding.HasNativePart && binding.NativePart)
                     {
-                        AttachNativeRigidPart(obj.transform, animatedPart);
+                        AttachNativeRigidPart(obj.transform, binding.NativePart!);
                     }
-                    else if (!_nativeSkinIds.Contains(pair.Key)) SetOwnedGeometryTransform(pair.Key, obj, baseline.Position, baseline.Rotation, baseline.Scale);
+                    else if (!binding.NativeSkin) SetOwnedGeometryTransform(pair.Key, obj, baseline.Position, baseline.Rotation, baseline.Scale);
                     // Older files use complete lists: a missing ID marks a
                     // destroyed child. Sparse files store explicit tombstones.
                     var active = baseline.AttachedBonePath.Length != 0 || _sparseRendererPoses ? baseline.Active :
@@ -1531,19 +1637,20 @@ namespace LCReplay.Plugin.Playback
                             vehicle.State.TryGetValue("carDestroyed", out var destroyed) && bool.TryParse(destroyed, out var wrecked))
                             active = baseline.Name == "MainBodyDestroyed" ? wrecked : !wrecked;
                     }
-                    SetActiveIfChanged(obj, preferredLod && active);
+                    binding.SetActive(preferredLod && active);
                 }
                 // Player LOD restoration belongs to this same renderer pass;
                 // scanning the whole geometry table once per player repeats it.
                 if (actor?.Kind == "player" && preferredLod && baseline.Name.StartsWith("LOD", StringComparison.Ordinal) &&
                     _frameEntities.TryGetValue(baseline.EntityId, out var player) && player.Active && !IsDead(player))
                 {
-                    SetActiveIfChanged(obj, true);
+                    binding.SetActive(true);
                     if (_geometryRenderers.TryGetValue(pair.Key, out var skin) && skin && !skin.enabled) skin.enabled = true;
                 }
                 // An active hierarchy already proves every ancestor is active.
                 // Only traverse the native rig when an animation hid a branch.
-                if (obj.activeSelf && !obj.activeInHierarchy) actor?.NativeRig?.EnsureVisibleBranch(obj.transform);
+                if (actor?.NativeRig != null && binding.Active && !obj.activeInHierarchy)
+                    actor.NativeRig.EnsureVisibleBranch(obj.transform);
             }
             foreach (var pair in _movingSceneGeometry)
             {
@@ -1564,9 +1671,9 @@ namespace LCReplay.Plugin.Playback
                     }
                 }
                 if (_currentSceneRendererPoses.TryGetValue(pair.Key, out var pose))
-                { SetTransform(obj.transform, pose.Position, pose.Rotation, pose.Scale); SetActiveIfChanged(obj, pose.Active); }
+                { SetOwnedGeometryTransform(pair.Key, obj, pose.Position, pose.Rotation, pose.Scale); SetActiveIfChanged(obj, pose.Active); }
                 else
-                { SetTransform(obj.transform, pair.Value.Position, pair.Value.Rotation, pair.Value.Scale); SetActiveIfChanged(obj, pair.Value.Active); }
+                { SetOwnedGeometryTransform(pair.Key, obj, pair.Value.Position, pair.Value.Rotation, pair.Value.Scale); SetActiveIfChanged(obj, pair.Value.Active); }
             }
         }
 
@@ -1598,6 +1705,22 @@ namespace LCReplay.Plugin.Playback
             internal GameObject Object;
             internal Vec3 Position, Scale;
             internal Quat Rotation;
+        }
+
+        private sealed class DynamicRendererBinding
+        {
+            internal KeyValuePair<string, GeometrySnapshot> Pair;
+            internal GameObject Object = null!;
+            internal EntityVisual? Actor;
+            internal Transform? NativePart;
+            internal RenderPose? Pose;
+            internal bool PreferredLod;
+            internal bool HasNativePart, NativeSkin, Active;
+            internal void SetActive(bool active)
+            {
+                if (Active == active) return;
+                Object.SetActive(active); Active = active;
+            }
         }
 
         private void SetOwnedGeometryTransform(string id, GameObject obj, Vec3 position, Quat rotation, Vec3 scale)
@@ -1799,7 +1922,7 @@ namespace LCReplay.Plugin.Playback
             foreach (var visual in _entities.Values)
             { visual.NativeTransitions.Clear(); visual.ActiveNativeTransitions.Clear(); }
             _transitionSession.Events = _session.Events;
-            _sampler.PrepareEvents(_session);
+            _sampler.PreparePlayback(_session);
             _transitionSampler.PrepareEvents(_transitionSession);
             _transitionSession.Frames.Clear();
             _transitionLeft.Entities.Clear();
@@ -1934,7 +2057,12 @@ namespace LCReplay.Plugin.Playback
             if (_vehicleCargo?.TrySample(evt, low < events.Count ? events[low] : null, time, _frame,
                 out var cargoPosition, out var cargoRotation) == true)
             {
-                SetTransform(visual.Root.transform, cargoPosition, cargoRotation, motion.Scale);
+                SetEntityTransform(visual, cargoPosition, cargoRotation, motion.Scale);
+                return true;
+            }
+            if (motion.Mode != "fall" && motion.AnchorId.Length == 0)
+            {
+                SetEntityTransform(visual, motion.Position, motion.Rotation, motion.Scale);
                 return true;
             }
             var position = ToVector(motion.Position);
@@ -1947,10 +2075,12 @@ namespace LCReplay.Plugin.Playback
                 var fraction = clamped * 16f - index;
                 var amount = Mathf.LerpUnclamped(motion.Curve[index], motion.Curve[index + 1], fraction);
                 position = Vector3.Lerp(position, ToVector(motion.Target), amount);
-                var rotationAmount = Mathf.Clamp01(1f - Mathf.Exp(-2.3333333f *
-                    Mathf.Max(0f, phase - motion.FallTime)));
-                rotation = phase >= 1f ? ToQuaternion(motion.TargetRotation) :
-                    Quaternion.Slerp(rotation, ToQuaternion(motion.TargetRotation), rotationAmount);
+                if (phase >= 1f) rotation = ToQuaternion(motion.TargetRotation);
+                else
+                {
+                    var rotationAmount = Mathf.Clamp01(1f - Mathf.Exp(-2.3333333f * Mathf.Max(0f, phase - motion.FallTime)));
+                    rotation = Quaternion.Slerp(rotation, ToQuaternion(motion.TargetRotation), rotationAmount);
+                }
             }
             if (motion.AnchorId.Length != 0)
             {
@@ -1973,7 +2103,7 @@ namespace LCReplay.Plugin.Playback
                     rotation = anchorRotation * rotation;
                 }
             }
-            SetTransform(visual.Root.transform, GameAccess.Vec(position), GameAccess.Rot(rotation), motion.Scale);
+            SetEntityTransform(visual, GameAccess.Vec(position), GameAccess.Rot(rotation), motion.Scale);
             return true;
         }
 
@@ -2288,7 +2418,7 @@ namespace LCReplay.Plugin.Playback
 
         private void SampleNativeTransitionPose(EntityVisual visual, EntitySnapshot entity, double time)
         {
-            SetTransform(visual.Root.transform, entity.Position, entity.Rotation, entity.Scale);
+            SetEntityTransform(visual, entity.Position, entity.Rotation, entity.Scale);
             visual.NativeRig!.ResetPose();
             visual.NativeRig.ApplyView(entity.ViewRotation);
             ApplyAnimation(visual, entity.Id, time);
@@ -2849,13 +2979,6 @@ namespace LCReplay.Plugin.Playback
             _saveGamma?.Invoke(_gamma);
         }
 
-        private void SetDisableInteriorCulling(bool value)
-        {
-            _disableInteriorCulling = value;
-            _saveDisableInteriorCulling?.Invoke(value);
-            UpdateInteriorVisibility();
-        }
-
         private void CyclePlayer()
         {
             var index = _players.FindIndex(player => player.Id == _selectedId);
@@ -2967,6 +3090,7 @@ namespace LCReplay.Plugin.Playback
             _hazardsWithModel.Clear();
             ClearHazardRendererIndex();
             _dynamicGeometry.Clear();
+            _dynamicRendererBindings.Clear(); _dynamicRendererBindingCount = -1;
             _movingSceneGeometry.Clear();
             _doorMeshLinks.Clear();
             _firstDoorPoses.Clear();
@@ -3608,7 +3732,10 @@ namespace LCReplay.Plugin.Playback
             var shipFogExclusion = inShipCabin && _localFogs.Any(entry => entry.Key && entry.Key.enabled &&
                 entry.Value.Name.IndexOf("FogExclusionZone", StringComparison.OrdinalIgnoreCase) >= 0 &&
                 new Bounds(entry.Key.transform.position, ToVector(entry.Value.Size)).Contains(position));
-            _environment?.SetIndoor(indoor || inShipCabin && !shipFogExclusion, preLandingOrbit);
+            // Fog.enabled gates local volumetrics too. Dungeon rooms must keep
+            // their recorded global fog; only a sheltered cabin without its
+            // captured exclusion volume retains the legacy suppression.
+            _environment?.SetIndoor(inShipCabin && !shipFogExclusion, preLandingOrbit);
             foreach (var entry in _deferredWorldRenderers)
                 if (entry.Key && Time + 1e-6 < entry.Value) entry.Key.forceRenderingOff = true;
             foreach (var entry in _deferredWorldLights)
@@ -3851,6 +3978,9 @@ namespace LCReplay.Plugin.Playback
                 _worldMeshes.Add(bakedMesh);
                 _worldMeshes.Add(outlineMesh);
                 renderer.forceRenderingOff = true;
+                // The CPU baker reads bone matrices directly. Unity need not
+                // also deform this hidden skinned source on the render thread.
+                renderer.updateWhenOffscreen = false;
             }
             if (!owner.Animators.ContainsKey(geometry.AnimatorPath) && geometry.AnimatorController.Length != 0 &&
                 !_session.Header.Capabilities.Contains("actor-bone-poses"))
@@ -4024,6 +4154,9 @@ namespace LCReplay.Plugin.Playback
         private void ApplyBurstParticles()
         {
             if (!_burstParticles) return;
+            var empty = _frame.Particles.Count == 0 && _frame.ParticleStyles.Count == 0;
+            if (empty && _emptyParticleFrameApplied) return;
+            _emptyParticleFrameApplied = empty;
             foreach (var list in _emitterSamples.Values) list.Clear();
             _activeEmitters.Clear();
             var nativeBullets = _entities.Values.Any(entity => entity.Root.activeInHierarchy && entity.NativeTurret?.Bullets);
@@ -4099,6 +4232,8 @@ namespace LCReplay.Plugin.Playback
 
         private void ClearSampledParticles()
         {
+            _emptyParticleFrameApplied = false;
+            _particleSpeedCount = -1;
             foreach (var effect in _emitterBursts.Values)
                 if (effect) { effect.gameObject.SetActive(false); Object.Destroy(effect.gameObject); }
             _emitterBursts.Clear();
@@ -4513,12 +4648,15 @@ namespace LCReplay.Plugin.Playback
             {
                 _follow = false;
                 _bookmarkPlayerName = _bookmarkPlayerId = "";
+                _bookmarkedEnemy = null;
                 UpdatePlayerBodyOcclusion();
                 return;
             }
             var player = _frame.Entities.FirstOrDefault(candidate => candidate.Id == id && candidate.Active &&
                 (candidate.Kind == "player" || candidate.Kind == "enemy"));
             if (player == null || IsUnavailableTarget(player)) return;
+            _bookmarkedEnemy = player.Kind == "enemy" ? _enemyHistory.Where(life => life.EntityId == id && life.SpawnTime <= Time + .001)
+                .OrderByDescending(life => life.SpawnTime).FirstOrDefault() : null;
             _selectedId = id;
             _followTargetId = id;
             _followTargetName = player.Name;
@@ -4534,6 +4672,33 @@ namespace LCReplay.Plugin.Playback
         private EntitySnapshot? SelectedTarget() => _frame.Entities.FirstOrDefault(entity => entity.Id == _selectedId &&
             (entity.Kind == "player" || entity.Kind == "enemy"));
         private void FocusSelected() { var selected = SelectedPlayer(); if (selected != null && !IsDead(selected)) Focus(selected); }
+
+        private static IEnumerable<ReplayEnemyLife> EnemyHistoryInSession(ReplaySession session, double offset)
+        {
+            var records = session.Frames.Select(frame => new ReplayRecord { Time = frame.Time, Frame = frame })
+                .Concat(session.Events.Select(evt => new ReplayRecord { Time = evt.Time, Event = evt })).OrderBy(record => record.Time);
+            foreach (var life in ReplayReader.EnemyHistory(records))
+            {
+                life.SpawnTime += offset;
+                if (life.DeathTime.HasValue) life.DeathTime += offset;
+                yield return life;
+            }
+        }
+
+        private ReplayEnemyLife? SelectedEnemyLife() => _bookmarkedEnemy == null ? null :
+            _enemyHistory.Where(life => life.EntityId == _bookmarkedEnemy.EntityId && life.SpawnTime <= _bookmarkedEnemy.SpawnTime + .001)
+                .OrderByDescending(life => life.SpawnTime).FirstOrDefault() ?? _bookmarkedEnemy;
+
+        private void SelectEnemyHistory(ReplayEnemyLife life, bool death)
+        {
+            IsPlaying = false;
+            _initialFocusPending = false;
+            _bookmarkedEnemy = life;
+            _pendingEnemyFocus = life;
+            _pendingEnemyDeath = death;
+            _follow = false;
+            SeekFromHud(death ? life.DeathTime ?? life.SpawnTime : life.SpawnTime);
+        }
 
         private static IEnumerable<ReplayPlayerDeath> DeathsInSession(ReplaySession session, double offset)
         {
@@ -4573,6 +4738,7 @@ namespace LCReplay.Plugin.Playback
 
         private double? DeathBookmarkTime()
         {
+            if (_bookmarkedEnemy != null) return SelectedEnemyLife()?.DeathTime;
             if (_bookmarkPlayerName.Length == 0) return null;
             return _playerDeaths.Where(death => death.EntityId == _bookmarkPlayerId ||
                     _bookmarkPlayerId.Length == 0 && death.Name == _bookmarkPlayerName)
@@ -4582,7 +4748,8 @@ namespace LCReplay.Plugin.Playback
         private void StopFollowingAtDeath(EntitySnapshot? player)
         {
             var death = player?.Kind == "player" ? PlayerDeath(_followTargetId, _followTargetName, Time) : null;
-            var position = death != null ? ToVector(death.Position) : _hasLastFollowPosition ? _lastFollowPosition :
+            var enemyDeath = SelectedEnemyLife();
+            var position = death != null ? ToVector(death.Position) : enemyDeath?.DeathTime <= Time + .001 ? ToVector(enemyDeath.DeathPosition) : _hasLastFollowPosition ? _lastFollowPosition :
                 player != null ? ToVector(player.Position) : _camera!.transform.position;
             _camera!.transform.position = position + Vector3.up * (player?.Kind == "enemy" ? .9f : 1.65f) -
                 _camera.transform.forward * 2.5f;
@@ -5085,6 +5252,21 @@ namespace LCReplay.Plugin.Playback
             }
         }
 
+        private static void SetEntityTransform(EntityVisual visual, Vec3 position, Quat rotation, Vec3 scale)
+        {
+            // These roots are owned by playback. Native actor graphs animate
+            // their children; held-item placement explicitly invalidates this
+            // cache. Legacy Animators on the root retain authoritative writes.
+            var p = visual.RootPosition; var q = visual.RootRotation; var s = visual.RootScale;
+            if (visual.RootPoseValid && (visual.NativeRig != null || !visual.Animator) &&
+                p.X == position.X && p.Y == position.Y && p.Z == position.Z &&
+                q.X == rotation.X && q.Y == rotation.Y && q.Z == rotation.Z && q.W == rotation.W &&
+                s.X == scale.X && s.Y == scale.Y && s.Z == scale.Z) return;
+            SetTransform(visual.RootTransform, position, rotation, scale);
+            visual.RootPosition = position; visual.RootRotation = rotation; visual.RootScale = scale;
+            visual.RootPoseValid = true;
+        }
+
         private static void SetTransform(Transform transform, Vec3 position, Quat rotation, Vec3 scale)
         {
             var point = ToVector(position);
@@ -5149,11 +5331,18 @@ namespace LCReplay.Plugin.Playback
             _savedCursorVisible = Cursor.visible;
             SuspendOtherViews();
             _root!.SetActive(true);
+            foreach (var visual in _entities.Values) visual.NativeRig?.InvalidateRecordedPose();
             _assetScene?.SetSuspended(false);
             if (_hud != null) { _hud.AcquireInput(); _hud.Root.SetActive(_resumeHudVisible); }
             _parked = false;
             CloseRequested = false;
             IsPlaying = _resumePlaying && Time < Duration;
+            // OnEnable restores Animator defaults even for a paused replay.
+            // Reapply the saved frame now; paused Tick does not sample again.
+            unchecked { _animationSeekGeneration++; }
+            ApplyFrame();
+            ApplyHeldItemPlacement();
+            UpdatePlayerBodyOcclusion();
             Application.onBeforeRender += RefreshCursor;
             SetLooking(Application.isFocused && !_uiCursor);
         }
@@ -5279,6 +5468,7 @@ namespace LCReplay.Plugin.Playback
                 _hazardsWithModel.Clear();
                 ClearHazardRendererIndex();
                 _dynamicGeometry.Clear();
+                _dynamicRendererBindings.Clear(); _dynamicRendererBindingCount = -1;
                 _movingSceneGeometry.Clear();
                 _completeRendererLists.Clear();
                 _interiorRenderers.Clear();
@@ -5303,10 +5493,15 @@ namespace LCReplay.Plugin.Playback
         private sealed class EntityVisual
         {
             internal readonly GameObject Root;
+            internal readonly Transform RootTransform;
+            internal Vec3 RootPosition, RootScale;
+            internal Quat RootRotation;
+            internal bool RootPoseValid;
             internal readonly GameObject Proxy;
             internal GameObject? NativeHazard;
             internal NativeActorRig? NativeRig;
             internal bool NativeRigFailed;
+            internal bool AnimationSuspended;
             internal double LastAnimationTime = double.NaN;
             internal int AnimationSeekGeneration;
             internal readonly List<NativeTransitionPose> NativeTransitions = new List<NativeTransitionPose>();
@@ -5331,7 +5526,7 @@ namespace LCReplay.Plugin.Playback
             internal bool TurretAttempted;
             internal NativeSwarmEffect? NativeSwarm;
             internal bool SwarmAttempted;
-            internal EntityVisual(GameObject root, GameObject proxy) { Root = root; Proxy = proxy; }
+            internal EntityVisual(GameObject root, GameObject proxy) { Root = root; RootTransform = root.transform; Proxy = proxy; }
         }
 
         private sealed class BakedPlayerBody

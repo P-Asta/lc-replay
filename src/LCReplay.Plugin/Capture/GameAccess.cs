@@ -53,6 +53,7 @@ namespace LCReplay.Plugin.Capture
             ["hazard"] = Set("hasExploded", "mineActivated", "turretMode", "turretActive", "enteringBerserkMode"),
             ["vehicle"] = Set("carHP", "carDestroyed", "gear", "speed", "magnetedToShip"),
             ["mechanism"] = Set("isPoweredOn", "isDoorOpen"),
+            ["furniture"] = Set("disableObject", "unlockableID"),
             ["round"] = Set("inShipPhase", "shipHasLanded"),
             ["time"] = Set("currentDayTime", "normalizedTimeOfDay", "profitQuota", "quotaFulfilled", "daysUntilDeadline", "timeUntilDeadline"),
             ["terminal"] = Set("groupCredits")

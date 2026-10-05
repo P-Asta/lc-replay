@@ -27,6 +27,9 @@ if (args.Length == 2 && args[0] == "--inspect-audio")
 
 var suite = new (string Name, Action Run)[]
 {
+    ("ordered poses and changed hierarchy identities", PoseOrderTests.Run),
+    ("prepared playback matches mutable reference through seeks and effects", PreparedPlaybackTests.Run),
+    ("Enemy history spans windows and distinguishes death from disappearance", EnemyHistoryIndex),
     ("Material keyword completeness and explicit renderer overrides preserve legacy compatibility", MaterialCaptureMetadataTests.Run),
     ("Bounded native light pipeline settings round trip and account for queue memory", LightPipelineTests.Run),
     ("Animation clocks avoid double speed and preserve phase continuity and restarts", AnimationClockTests.Run),
@@ -2408,6 +2411,47 @@ static void MeshReferences()
             var skin = AppearanceWorld().Geometry.Single(); skin.Id = "source"; skin.MaterialIds.Clear();
             w.Geometry[0] = skin;
         });
+    });
+}
+
+static void EnemyHistoryIndex()
+{
+    WithTemp(dir =>
+    {
+        EntitySnapshot Enemy(string id, float x, bool dead = false)
+        {
+            var enemy = Entity(id, x); enemy.Kind = "enemy"; enemy.Name = "Crawler";
+            enemy.State["isEnemyDead"] = dead.ToString(); return enemy;
+        }
+        var records = new[] {
+            Frame(1, Enemy("a", 3), Enemy("b", 4)),
+            Frame(3, Enemy("a", 6)), // b vanished: this is not a death.
+            new ReplayRecord { Kind = "event", Time = 3.5,
+                Event = new ReplayEvent { Time = 3.5, Category = "state", Name = "isEnemyDead", EntityId = "a",
+                    Data = new() { ["to"] = "True" } } },
+            Frame(4, Enemy("a", 8, true), Enemy("c", 9)),
+            Frame(8, Enemy("c", 10, true))
+        };
+        var path = Path.Combine(dir, "enemies.lcr");
+        using (var writer = new ReplayWriter(path, Header(), indexed: true))
+        {
+            foreach (var record in records) Check(writer.TryWrite(record), "enemy record accepted");
+            writer.Dispose(); Check(writer.Error == null, "enemy writer error");
+        }
+        var index = ReplayReader.IndexSingleFile(path, windowExpandedBytes: 1024);
+        foreach (var history in new[] { ReplayReader.EnemyHistory(records), ReplayReader.ReadEnemyHistory(index) })
+        {
+            Check(history.Count == 3, "all enemies across recording");
+            var a = history.Single(life => life.EntityId == "a");
+            Near(a.SpawnTime, 1); Near(a.SpawnPosition.X, 3);
+            Near(a.DeathTime!.Value, 3.5); Near(a.DeathPosition.X, 6);
+            Check(!history.Single(life => life.EntityId == "b").DeathTime.HasValue, "disappearance is not death");
+            var c = history.Single(life => life.EntityId == "c");
+            Near(c.SpawnTime, 4); Near(c.DeathTime!.Value, 8);
+        }
+        using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
+        try { ReplayReader.ReadEnemyHistory(index, cancelled.Token); throw new Exception("Ignored cancellation"); }
+        catch (OperationCanceledException) { }
     });
 }
 

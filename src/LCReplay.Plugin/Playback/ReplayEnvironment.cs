@@ -146,11 +146,9 @@ namespace LCReplay.Plugin.Playback
         {
             this.indoor = indoor;
             this.preLandingOrbit = preLandingOrbit;
-            // The captured global height fog belongs to the exterior. Generated
-            // rooms can sit hundreds of metres below its base height, making it
-            // far denser there than in the actual game. Before the ship departs,
-            // the same moon fog also washes out an exterior free camera in orbit.
-            // Recorded local indoor fog remains active independently in ReplayViewer.
+            // The caller only suppresses fog for a sheltered ship cabin. HDRP's
+            // enabled switch also gates local volumetric fog, so using it to
+            // suppress all generated rooms removes their haze as well.
             if (fogEnabled != null) SetValue(fogEnabled, showFog && recordedFog && !indoor && !preLandingOrbit);
         }
 
@@ -253,10 +251,9 @@ namespace LCReplay.Plugin.Playback
                 if (list == null) { Object.Destroy(host); continue; }
                 foreach (var snapshot in group)
                 {
-                    // This game pass reads scene buffers that the detached replay camera
-                    // cannot reproduce. Running it here paints large black patches across
-                    // otherwise correctly lit ship and facility surfaces.
-                    if (snapshot.ShaderName == "FullScreen/SpongePosterizeNew") continue;
+                    // Preserve the native depth/color posterization as well as
+                    // material textures. Suppressing LethalSponge removes the
+                    // game's characteristic surface grain and edge shading.
                     var shader = Shader.Find(snapshot.ShaderName) ?? Resources.FindObjectsOfTypeAll<Shader>()
                         .FirstOrDefault(item => item && item.name == snapshot.ShaderName);
                     if (!shader || !shader!.isSupported) continue;

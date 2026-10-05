@@ -27,10 +27,10 @@ namespace LCReplay.Plugin
     public sealed class ReplayPlugin : BaseUnityPlugin
     {
         public const string Guid = "pasta.replay";
-        public const string Version = "0.25.41";
+        public const string Version = "1.0.0";
         private GUIStyle? overlayLabel;
         private GUIStyle? errorNoticeLabel;
-        private ConfigEntry<bool> bones = null!, world = null!, chat = null!, disableInteriorCulling = null!, noShadow = null!, showDebugOverlay = null!, cinematicMove = null!, showFog = null!;
+        private ConfigEntry<bool> bones = null!, world = null!, chat = null!, noShadow = null!, showDebugOverlay = null!, cinematicMove = null!, showFog = null!;
         private ConfigEntry<int> rate = null!, maxFields = null!, maxObjects = null!, maxVertices = null!;
         private ConfigEntry<float> replayResolution = null!, replayGamma = null!, cameraSpeed = null!;
         private ConfigEntry<string> folder = null!, extraTypes = null!;
@@ -144,8 +144,6 @@ namespace LCReplay.Plugin
                 "Internal playback defaults migration version.");
             replayGamma = Config.Bind("Playback", "Gamma", 1f,
                 new ConfigDescription("Replay image gamma; 1.0 is neutral.", new AcceptableValueRange<float>(0.5f, 2f)));
-            disableInteriorCulling = Config.Bind("Playback", "DisableInteriorCulling", false,
-                "Show every recorded interior tile from both outside and inside. This can reduce playback performance.");
             noShadow = Config.Bind("Playback", "NoShadow", false,
                 "Keep outside illumination inside the facility and disable replay light shadows.");
             showFog = Config.Bind("Playback", "ShowFog", true,
@@ -156,7 +154,6 @@ namespace LCReplay.Plugin
                 // in replay Settings survive reopening playback and restarting.
                 replayResolution.Value = 1f;
                 replayGamma.Value = 1f;
-                disableInteriorCulling.Value = false;
                 noShadow.Value = false;
                 showFog.Value = true;
                 playbackSettingsVersion.Value = 3;
@@ -858,7 +855,6 @@ namespace LCReplay.Plugin
                     viewer = new ReplayViewer(task.Result.Session, task.Result.Timeline, task.Result.PartIndex,
                         replayResolution.Value, replayGamma.Value,
                         value => replayResolution.Value = value, value => replayGamma.Value = value,
-                        disableInteriorCulling.Value, value => disableInteriorCulling.Value = value,
                         false, null,
                         cinematicMove.Value, cameraSpeed.Value,
                         value => cinematicMove.Value = value, value => cameraSpeed.Value = value,

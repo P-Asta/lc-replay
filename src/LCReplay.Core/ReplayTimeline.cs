@@ -4,7 +4,7 @@ using System.Globalization;
 
 namespace LCReplay.Core
 {
-    public static class ReplayTimeline
+    public static partial class ReplayTimeline
     {
         /// <summary>
         /// Samples a full-state timeline. Spawn, despawn, activation and discrete state change exactly
@@ -36,11 +36,14 @@ namespace LCReplay.Core
             }
             int leftIndex = Math.Max(0, low - 1);
             var left = frames[leftIndex];
+            ReplayFrame? right = leftIndex + 1 < frames.Count && time > left.Time ? frames[leftIndex + 1] : null;
+            var plan = reusePoses ? scratch!.PlaybackFor(session) : null;
+            if (plan != null && plan.Matches(left, right)) return plan.Sample(time, scratch!);
             var result = reusePoses ? scratch!.BeginFrame() : new ReplayFrame();
+            plan?.Begin(left, right, result);
             result.Time = time;
             result.State = scratch == null ? Copy(left.State) : left.State;
             var eventIndex = scratch?.EventsFor(session);
-            ReplayFrame? right = leftIndex + 1 < frames.Count && time > left.Time ? frames[leftIndex + 1] : null;
             double amount = right == null ? 0 : Math.Max(0, Math.Min(1, (time - left.Time) / (right.Time - left.Time)));
             var sampleGap = right != null && right.Time - left.Time > .25 && HasSampleGap(session, eventIndex, left.Time, right.Time);
             SampleParticles(left, right, result, amount, Math.Max(0, time - left.Time), scratch);
@@ -75,6 +78,7 @@ namespace LCReplay.Core
                 pose.Rotation = other == null ? anchor.Rotation : Slerp(anchor.Rotation, other.Rotation, amount);
                 pose.Scale = other == null ? anchor.Scale : Lerp(anchor.Scale, other.Scale, amount);
                 result.Anchors.Add(pose);
+                plan?.Add(pose, anchor, other);
             }
             var rightSceneRenderers = scratch?.RightSceneRenderers ?? new Dictionary<string, RenderPose>(StringComparer.Ordinal);
             rightSceneRenderers.Clear();
@@ -88,6 +92,7 @@ namespace LCReplay.Core
                 pose.Rotation = match ? Slerp(renderer.Rotation, other!.Rotation, amount) : renderer.Rotation;
                 pose.Scale = match ? Lerp(renderer.Scale, other!.Scale, amount) : renderer.Scale;
                 result.SceneRenderers.Add(pose);
+                plan?.Add(pose, renderer, match ? other : null);
             }
             var rightEntities = scratch?.RightEntities ?? new Dictionary<string, EntitySnapshot>(StringComparer.Ordinal);
             rightEntities.Clear();
@@ -131,36 +136,75 @@ namespace LCReplay.Core
                 sampled.State = scratch == null ? Copy(entity.State) : entity.State;
                 if (other != null)
                     sampled.State = ReplayBlendShapes.Interpolate(entity, other, amount, scratch?.BlendShapes) ?? sampled.State;
+                plan?.Add(sampled, entity, other);
                 var rightBones = scratch?.RightBones ?? new Dictionary<string, BonePose>(StringComparer.Ordinal);
-                rightBones.Clear();
-                if (other != null) foreach (var bone in other.Bones) rightBones[bone.Path] = bone;
-                foreach (var bone in entity.Bones)
+                var bonesIndexed = false;
+                for (var boneIndex = 0; boneIndex < entity.Bones.Count; boneIndex++)
                 {
-                    bool match = rightBones.TryGetValue(bone.Path, out var otherBone);
+                    var bone = entity.Bones[boneIndex];
+                    BonePose? otherBone = null;
+                    // Capture retains hierarchy order. Avoid hashing every long
+                    // bone path twice on every rendered frame; changed forms and
+                    // legacy reordered lists still use the identity lookup.
+                    if (other != null)
+                    {
+                        if (boneIndex < other.Bones.Count && other.Bones[boneIndex].Path == bone.Path)
+                            otherBone = other.Bones[boneIndex];
+                        else
+                        {
+                            if (!bonesIndexed)
+                            {
+                                rightBones.Clear();
+                                foreach (var candidateBone in other.Bones) rightBones[candidateBone.Path] = candidateBone;
+                                bonesIndexed = true;
+                            }
+                            rightBones.TryGetValue(bone.Path, out otherBone);
+                        }
+                    }
+                    bool match = otherBone != null;
                     var pose = reusePoses ? scratch!.NextBone() : new BonePose();
                     pose.Path = bone.Path;
                     pose.Position = match ? Lerp(bone.Position, otherBone!.Position, amount) : bone.Position;
                     pose.Rotation = match ? Slerp(bone.Rotation, otherBone!.Rotation, amount) : bone.Rotation;
                     pose.Scale = match ? Lerp(bone.Scale, otherBone!.Scale, amount) : bone.Scale;
                     sampled.Bones.Add(pose);
+                    plan?.Add(pose, bone, otherBone);
                 }
                 var rightRenderers = scratch?.RightRenderers ?? new Dictionary<string, RenderPose>(StringComparer.Ordinal);
-                rightRenderers.Clear();
-                if (other != null) foreach (var renderer in other.Renderers) rightRenderers[renderer.Id] = renderer;
-                foreach (var renderer in entity.Renderers)
+                var renderersIndexed = false;
+                for (var rendererIndex = 0; rendererIndex < entity.Renderers.Count; rendererIndex++)
                 {
-                    bool match = rightRenderers.TryGetValue(renderer.Id, out var otherRenderer) && renderer.Active && otherRenderer.Active;
+                    var renderer = entity.Renderers[rendererIndex];
+                    RenderPose? otherRenderer = null;
+                    if (other != null)
+                    {
+                        if (rendererIndex < other.Renderers.Count && other.Renderers[rendererIndex].Id == renderer.Id)
+                            otherRenderer = other.Renderers[rendererIndex];
+                        else
+                        {
+                            if (!renderersIndexed)
+                            {
+                                rightRenderers.Clear();
+                                foreach (var candidateRenderer in other.Renderers) rightRenderers[candidateRenderer.Id] = candidateRenderer;
+                                renderersIndexed = true;
+                            }
+                            rightRenderers.TryGetValue(renderer.Id, out otherRenderer);
+                        }
+                    }
+                    bool match = otherRenderer != null && renderer.Active && otherRenderer.Active;
                     var pose = reusePoses ? scratch!.NextRenderer() : new RenderPose();
                     pose.Id = renderer.Id; pose.Active = renderer.Active;
                     pose.Position = match ? Lerp(renderer.Position, otherRenderer!.Position, amount) : renderer.Position;
                     pose.Rotation = match ? Slerp(renderer.Rotation, otherRenderer!.Rotation, amount) : renderer.Rotation;
                     pose.Scale = match ? Lerp(renderer.Scale, otherRenderer!.Scale, amount) : renderer.Scale;
                     sampled.Renderers.Add(pose);
+                    plan?.Add(pose, renderer, match ? otherRenderer : null);
                 }
                 result.Entities.Add(sampled);
             }
             if (right != null && amount > 0 && amount < 1)
                 AttachHeldItems(left, right, result, amount, scratch);
+            plan?.Commit();
             return result;
         }
 
@@ -470,6 +514,28 @@ namespace LCReplay.Core
     public sealed class ReplayTimelineSampler
     {
         private ReplayTimelineEventIndex? eventIndex;
+        private ReplaySession? playback;
+        private ReplayTimeline.PlaybackPlan? playbackPlan;
+
+        /// <summary>Changes when reusable pose identities or discrete metadata may change.</summary>
+        public long PoseLayoutVersion { get; private set; }
+
+        /// <summary>
+        /// Prepares an immutable playback window. All input records must remain unchanged;
+        /// call again when replacing or editing the window. Returned pose lists and metadata
+        /// are read-only until the next sample; entity root poses may be adjusted by playback.
+        /// General Sample/SampleReusable calls without this opt-in retain mutable-input behavior.
+        /// </summary>
+        public void PreparePlayback(ReplaySession session)
+        {
+            PrepareEvents(session);
+            playback = session;
+            playbackPlan ??= new ReplayTimeline.PlaybackPlan();
+            playbackPlan.Invalidate();
+        }
+
+        internal ReplayTimeline.PlaybackPlan? PlaybackFor(ReplaySession session) =>
+            ReferenceEquals(session, playback) ? playbackPlan : null;
 
         /// <summary>
         /// Indexes a read-only playback window's teleport and capture-gap events.
@@ -480,6 +546,8 @@ namespace LCReplay.Core
         public void PrepareEvents(ReplaySession session)
         {
             if (session == null) throw new ArgumentNullException(nameof(session));
+            playback = null;
+            playbackPlan?.Invalidate();
             eventIndex = new ReplayTimelineEventIndex(session.Events);
         }
 
@@ -514,6 +582,8 @@ namespace LCReplay.Core
 
         internal ReplayFrame BeginFrame()
         {
+            PoseLayoutVersion++;
+            playbackPlan?.Invalidate();
             reusableFrame.Entities.Clear(); reusableFrame.Anchors.Clear(); reusableFrame.SceneRenderers.Clear();
             reusableFrame.Particles.Clear(); reusableFrame.ParticleStyles.Clear(); reusableFrame.Lines.Clear();
             reusableFrame.State = emptyState;

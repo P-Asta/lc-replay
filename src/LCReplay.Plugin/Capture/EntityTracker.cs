@@ -16,6 +16,7 @@ namespace LCReplay.Plugin.Capture
             Pair("TerminalAccessibleObject", "facility"), Pair("Landmine", "hazard"),
             Pair("SandSpiderWebTrap", "web"),
             Pair("Turret", "hazard"), Pair("ShipTeleporter", "ship"),
+            Pair("AutoParentToShip", "furniture"),
             Pair("DeadBodyInfo", "body"), Pair("AnimatedObjectTrigger", "mechanism"),
             Pair("ItemDropship", "ship"), Pair("MineshaftElevatorController", "mechanism"),
             Pair("StartOfRound", "round"), Pair("RoundManager", "round"),
@@ -34,6 +35,9 @@ namespace LCReplay.Plugin.Capture
         internal bool WorldDiscoveryReady { get; private set; }
         private readonly Dictionary<string, List<Transform>> bones = new Dictionary<string, List<Transform>>();
         private readonly Dictionary<string, Renderer[]> renderers = new Dictionary<string, Renderer[]>();
+        // Mechanisms and ship furniture need poses before world export finishes.
+        // Refresh membership during discovery, never walk hierarchies per sample.
+        private readonly Dictionary<string, Renderer[]> earlyRenderers = new Dictionary<string, Renderer[]>();
         private readonly Dictionary<string, List<EntityRendererBaseline>> entityRendererBaselines =
             new Dictionary<string, List<EntityRendererBaseline>>(StringComparer.Ordinal);
         private sealed class EntityRendererBaseline
@@ -194,6 +198,7 @@ namespace LCReplay.Plugin.Capture
             foreach (var entry in tracked) trackedIds.Add(entry.Component.GetInstanceID());
             foreach (var id in identities.Where(p => !p.Value.Component).Select(p => p.Key).ToArray())
             { bones.Remove(identities[id].Id); renderers.Remove(identities[id].Id);
+              earlyRenderers.Remove(identities[id].Id);
               entityRendererBaselines.Remove(identities[id].Id); capturedBones.Remove(identities[id].Id);
               animationTracks.Forget(identities[id].Id);
               enemyVisualPoses.Forget(identities[id].Id);
@@ -266,6 +271,10 @@ namespace LCReplay.Plugin.Capture
                     { animators.Remove(key); animatorOwners.Remove(key); animatorPaths.Remove(key);
                       animationStates.Remove(key); animatorParameters.Remove(key); animationParameterValues.Remove(key); }
                 }
+                if (entry.Kind == "mechanism" || entry.Kind == "furniture")
+                    earlyRenderers[entry.Id] = component.GetComponentsInChildren<Renderer>(true)
+                        .Where(renderer => (renderer is MeshRenderer || renderer is SkinnedMeshRenderer) &&
+                            !CaptureVisibility.IsDebugRenderer(renderer)).Take(512).ToArray();
                 if (!captureBonesEnabled || !CaptureRendererPoses(entry.Kind)) continue;
                 if (!isNew && entry.Kind != "player" && entry.Kind != "enemy" &&
                     renderers.TryGetValue(entry.Id, out var previousRenderers) && previousRenderers.Any(renderer => renderer)) continue;
@@ -555,6 +564,7 @@ namespace LCReplay.Plugin.Capture
                     }
                 }
                 else if (entry.Kind == "item") CaptureHeldAttachment(component, entity);
+                else if (entry.Kind == "furniture") entity.Active &= !GameAccess.Bool(component, "disableObject");
                 if (entry.Kind == "enemy")
                     enemyVisualPoses.Capture(entry, entity, Visibility);
                 else if (captureBones && (entry.Kind == "player" ||
@@ -895,13 +905,13 @@ namespace LCReplay.Plugin.Capture
         {
             // Moving platforms can be used before their mesh export completes.
             // Their first ride must not depend on a late, already-lowered baseline.
-            if (entry.Kind == "mechanism")
+            if (entry.Kind == "mechanism" || entry.Kind == "furniture")
             {
                 var mechanismRoot = entry.Component.transform;
-                foreach (var renderer in entry.Component.GetComponentsInChildren<Renderer>(true)
-                    .Where(value => value is MeshRenderer || value is SkinnedMeshRenderer).Take(512))
+                if (!earlyRenderers.TryGetValue(entry.Id, out var members)) return;
+                foreach (var renderer in members)
                 {
-                    if (!renderer || CaptureVisibility.IsDebugRenderer(renderer)) continue;
+                    if (!renderer) continue;
                     var node = renderer.transform;
                     var position = mechanismRoot.InverseTransformPoint(node.position);
                     var rotation = Quaternion.Inverse(mechanismRoot.rotation) * node.rotation;

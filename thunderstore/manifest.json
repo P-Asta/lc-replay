@@ -1,8 +1,8 @@
 {
   "name": "Replay",
-  "version_number": "0.1.0",
+  "version_number": "1.0.0",
   "website_url": "https://github.com/P-Asta/lc-replay",
-  "description": "Replay Game",
+  "description": "Automatically record your runs and replay them with a free camera, player following, bookmarks, and timeline controls.",
   "dependencies": [
     "BepInEx-BepInExPack-5.4.2305",
     "Rune580-LethalCompany_InputUtils-0.7.13"
